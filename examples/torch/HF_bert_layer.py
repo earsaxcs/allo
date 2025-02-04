@@ -26,7 +26,9 @@ def test_bert_module(module):
     np.testing.assert_allclose(res, golden[0].detach().numpy(), atol=1e-3)
 
 
-config = AutoConfig.from_pretrained("bert-base-uncased")
+# config = AutoConfig.from_pretrained("bert-base-uncased")
+from transformers import BertConfig
+config = BertConfig()
 bert_layer_module = BertLayer(config).eval()
 test_bert_module(bert_layer_module)
 del bert_layer_module

@@ -1905,6 +1905,7 @@ class ASTTransformer(ASTBuilder):
                 "sub",
                 "div",
                 "relu",
+                "tanh",
                 "conv2d",
                 "maxpool",
                 "sumpool",
@@ -2133,24 +2134,47 @@ class ASTTransformer(ASTBuilder):
                             shape=shape,
                         )
                     return op
-                op = {
-                    "matmul": linalg_d.matmul,
-                    "bmm": linalg_d.batch_matmul,
-                    "add": linalg_d.add,
-                    "sub": linalg_d.sub,
-                    "mul": linalg_d.mul,
-                    "div": linalg_d.div,
-                    "conv2d": linalg_d.conv_2d_nchw_fchw,
-                    "maxpool": linalg_d.pooling_nchw_max,
-                    "sumpool": linalg_d.pooling_nchw_sum,
-                }.get(attr)(
-                    new_args[0].result, new_args[1].result, outs=[result_tensor]
-                )
+                if attr == "conv2d":
+                    # new_args[2] is just a list-like object
+                    true_stride = [x.val for x in new_args[2]]
+                    conv2d = linalg_d.conv_2d_nchw_fchw(new_args[0].result, new_args[1].result, outs=[result_tensor], strides=true_stride)
+                    # bias = True
+                    # new_args len needs to be aligned to dsl.conv2d
+                    if len(new_args) >= 4 and (
+                        not isinstance(node.args[3], ast.Constant)
+                        or node.args[3].value is not None
+                    ):
+                        dims = [0,2,3]
+                        bias = ASTTransformer.build_broadcast_op(
+                            ctx, new_args[3], node.dtype, node.shape[1:2], node.shape, dims
+                        )
+                        op = ASTTransformer.build_library_op(
+                            ctx, node, "add", [conv2d.owner.outputs[0].owner, bias]
+                        )
+                    # bias = False
+                    else:
+                        op = conv2d.owner.outputs[0].owner
+                    return op
+                else:
+                    op = {
+                        "matmul": linalg_d.matmul,
+                        "bmm": linalg_d.batch_matmul,
+                        "add": linalg_d.add,
+                        "sub": linalg_d.sub,
+                        "mul": linalg_d.mul,
+                        "div": linalg_d.div,
+                        # "conv2d": linalg_d.conv_2d_nchw_fchw,
+                        "maxpool": linalg_d.pooling_nchw_max,
+                        "sumpool": linalg_d.pooling_nchw_sum,
+                    }.get(attr)(
+                        new_args[0].result, new_args[1].result, outs=[result_tensor]
+                    )
                 op = op.owner
-            elif attr in {"exp", "log", "abs", "copy"}:
+            elif attr in {"exp", "log", "tanh", "abs", "copy"}:
                 op = {
                     "exp": linalg_d.exp,
                     "log": linalg_d.log,
+                    "tanh": linalg_d.tanh,
                     "abs": linalg_d.abs,
                     "copy": linalg_d.copy,
                 }.get(attr)(new_args[0].result, outs=[result_tensor])

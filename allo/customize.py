@@ -904,6 +904,7 @@ def customize(
     # Get Python AST
     if isinstance(fn, str):
         src = fn
+        starting_line_no = 1
     else:
         src, starting_line_no = getsourcelines(fn)
         src = [textwrap.fill(line, tabsize=4, width=9999) for line in src]

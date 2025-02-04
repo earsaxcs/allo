@@ -874,6 +874,7 @@ class TypeInferer(ASTVisitor):
     def visit_library_op(ctx, node, op_name, new_args):
         if op_name in {
             "exp",
+            "tanh",
             "softmax",
             "abs",
             "log",
@@ -894,13 +895,15 @@ class TypeInferer(ASTVisitor):
         if op_name in {"matmul", "bmm", "linear", "conv2d", "sumpool", "maxpool"}:
             argAshape = new_args[0].shape
             argBshape = new_args[1].shape
+            if op_name == "conv2d":
+                convStride = [int(x.value) for x in new_args[2].elts]
             node.dtype = new_args[0].dtype
             if op_name == "conv2d":
                 node.shape = (
                     argAshape[0],
                     argBshape[0],
-                    argAshape[2] - argBshape[2] + 1,
-                    argAshape[3] - argBshape[3] + 1,
+                    (argAshape[2] - argBshape[2]) // convStride[0] + 1, # (H - KH) / S + 1
+                    (argAshape[3] - argBshape[3]) // convStride[1] + 1, # (W - KW) / S + 1
                 )
             elif op_name in {"maxpool", "sumpool"}:
                 node.shape = (

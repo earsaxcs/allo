@@ -15,7 +15,7 @@ try:
     from .tracer import AlloTracer
 except ImportError:
     pass
-from .library import CoreAttention_lib, KVCache_lib, ViTGetFirstToken_lib, ViTTokenExpand_lib
+from .library import CoreAttention_lib, KVCache_lib
 from .. import dsl
 from ..ir import types
 from ..customize import customize
@@ -27,9 +27,6 @@ def from_pytorch(
     leaf_modules=None,
     verbose=False,
     enable_tensor=False,
-    target="llvm",
-    mode="csim",
-    project="top.prj",
 ):
     sig = inspect.signature(model.forward)
     input_names = [
@@ -63,13 +60,15 @@ def from_pytorch(
         global_vars.update({new_name: param.detach().numpy()})
 
     builder = TorchBuilder(gm, example_inputs, leaf_modules)
+    print(builder)
     code = builder.build()
+    print(code)
     s = customize(
         code, verbose=verbose, global_vars=global_vars, enable_tensor=enable_tensor
     )
-    mod = s.build(target=target, mode=mode, project=project)
+    mod = s.build(target='vhls')
     if verbose:
-        print(s.module)
+        print(s)
     return mod
 
 
@@ -149,34 +148,23 @@ class TorchBuilder:
     def build_getattr(self, node):
         pass
 
-    def build_get_attr(self, node):
-        pass
-
     def build_call_module(self, node):
         module = self.get_module(node.target)
         op = {
             torch.nn.Linear: "linear",
             torch.nn.Dropout: "identity",
             torch.nn.GELU: "gelu",
-            torch.nn.Tanh: "tanh",
             torch.nn.LayerNorm: "layernorm",
-            torch.nn.Conv2d: "conv2d",
         }.get(type(module), None)
         if self.leaf_modules:
             for leaf_module in self.leaf_modules:
                 if isinstance(module, leaf_module):
-                    if module.__class__.__name__ == "ViTGetFirstToken":
-                        return getattr(self, f"build_{module.__class__.__name__}")(node, module.shape)
-                    elif module.__class__.__name__ == "ViTTokenExpand":
-                        return getattr(self, f"build_{module.__class__.__name__}")(node, module.token_shape)
+                    return getattr(self, f"build_{module.__class__.__name__}")(node)
         if op is None:
             raise NotImplementedError("Unsupported module")
         if op == "linear":
             bias = True if module.bias is not None else None
             return getattr(self, "build_linear")(node, bias)
-        if op == "conv2d":
-            bias = True if module.bias is not None else None
-            return getattr(self, "build_conv2d")(node, module.stride, bias)
         return getattr(self, f"build_{op}")(node)
 
     def build_call_function(self, node):
@@ -304,23 +292,10 @@ class TorchBuilder:
             bias = get_var_name(target_name + "_bias")
             return f"{node.name} = dsl.linear({inp}, {weight}, {bias})"
         return f"{node.name} = dsl.linear({inp}, {weight})"
-    
-    def build_conv2d(self, node, stride, bias):
-        target_name = node.target.replace(".", "_")
-        inp = get_var_name(node.args[0])
-        weight = get_var_name(target_name + "_weight")
-        if bias:
-            bias = get_var_name(target_name + "_bias")
-            return f"{node.name} = dsl.conv2d({inp}, {weight}, {stride}, {bias})"
-        return f"{node.name} = dsl.conv2d({inp}, {weight}, {stride})"
 
     def build_gelu(self, node):
         inp = get_var_name(node.args[0])
         return f"{node.name} = dsl.gelu({inp})"
-    
-    def build_tanh(self, node):
-        inp = get_var_name(node.args[0])
-        return f"{node.name} = dsl.tanh({inp})"
 
     def build_layernorm(self, node):
         target_name = node.target.replace(".", "_")
@@ -333,11 +308,6 @@ class TorchBuilder:
         inp = get_var_name(node.args[0])
         shape = tuple(node.meta["tensor_meta"].shape)
         return f"{node.name} = dsl.view({inp}, {shape})"
-    
-    def build_expand(self, node):
-        inp = get_var_name(node.args[0])
-        shape = tuple(node.meta["tensor_meta"].shape)
-        return f"{node.name} = dsl.expand({inp}, {shape})"
 
     def build_reshape(self, node):
         return self.build_view(node)
@@ -391,31 +361,6 @@ class TorchBuilder:
         tensor_B = get_var_name(node.args[0][1])
         dim = node.kwargs["dim"] + (node.kwargs["dim"] < 0) * shape_len
         return f"{node.name} = dsl.concat({tensor_A}, {tensor_B}, axis={dim})"
-    
-    def build_ViTGetFirstToken(self, node, shape):
-        shape = (self.example_inputs[0].shape[0], shape[1], shape[2])
-        src = inspect.getsource(ViTGetFirstToken_lib(*shape))
-        src = (
-            src.replace("s_0", str(shape[0]))
-            .replace("s_1", str(shape[1]))
-            .replace("s_2", str(shape[2]))
-        )
-        if src not in self.subfunctions:
-            self.subfunctions.append(src)
-        return f"{node.name} = ViTGetFirstToken({', '.join([get_var_name(arg) for arg in node.args])})"
-    
-    def build_ViTTokenExpand(self, node, shape):
-        shape = (self.example_inputs[0].shape[0], shape[1], shape[2])
-        src = inspect.getsource(ViTTokenExpand_lib(*shape))
-        src = (
-            src.replace("s_0", str(shape[0]))
-            .replace("s_1", str(shape[1]))
-            .replace("s_2", str(shape[2]))
-            .replace("ViTTokenExpand", f"ViTTokenExpand_{node.name}")
-        )
-        if src not in self.subfunctions:
-            self.subfunctions.append(src)
-        return f"{node.name} = ViTTokenExpand_{node.name}({', '.join([get_var_name(arg) for arg in node.args][:1])})"
 
     def build_CoreAttention(self, node):
         shape = tuple(self.example_inputs[1][0].shape)

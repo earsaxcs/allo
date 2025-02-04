@@ -94,15 +94,17 @@ def relu(x, name=None):
     return np.maximum(x, 0)
 
 
-def conv2d(inp, filter, name=None):
+def conv2d(inp, filter, _stride, bias=None, name=None):
     view_shape = (
-        tuple(inp.shape[:2])
-        + tuple(np.subtract(inp.shape[2:], filter.shape[2:]) + 1)
-        + filter.shape[2:]
+        tuple(inp.shape[:2]) # B, IC
+        + tuple(np.subtract(inp.shape[2:], filter.shape[2:]) // _stride + 1) # (H - KH) / S + 1, (W - KW) / S + 1
+        + filter.shape[2:] # KH, KW
     )
-    strides = inp.strides[:2] + inp.strides[2:] + inp.strides[2:]
+    strides = inp.strides[:2] + tuple([x * int(_stride[idx]) for idx, x in enumerate(inp.strides[2:])]) + inp.strides[2:]
     sub_matrices = np.lib.stride_tricks.as_strided(inp, view_shape, strides)
-    return np.einsum("fcij,nchwij->nfhw", filter, sub_matrices)
+    if bias is None: 
+        return np.einsum("fcij,nchwij->nfhw", filter, sub_matrices)
+    return np.einsum("fcij,nchwij->nfhw", filter, sub_matrices) + np.broadcast_to(bias, shape=sub_matrices.shape[:1] + sub_matrices.shape[2:4] + bias.shape).transpose(0, 3, 1, 2)
 
 
 def maxpool(inp, filter, name=None):
@@ -136,6 +138,8 @@ def linear(X, A, bias=None, name=None):
 def view(x, shape, name=None):
     return np.reshape(x, shape)
 
+def expand(x, shape, name=None):
+    return np.broadcast_to(x, shape)
 
 def layernorm(x, gamma, beta, eps: float = 1e-5):
     mean = np.mean(x, axis=-1, keepdims=True)

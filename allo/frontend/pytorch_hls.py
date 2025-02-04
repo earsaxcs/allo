@@ -67,7 +67,8 @@ def from_pytorch(
     s = customize(
         code, verbose=verbose, global_vars=global_vars, enable_tensor=enable_tensor
     )
-    mod = s.build(target=target, mode=mode, project=project)
+    mod = s.build(target='vhls')
+    print(mod)
     if verbose:
         print(s.module)
     return mod

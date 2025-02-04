@@ -45,3 +45,21 @@ def CoreAttention_lib(s_0, s_1, s_2, s_3):
         return Attn
 
     return CoreAttention
+
+def ViTGetFirstToken_lib(s_0, s_1, s_2):
+    def ViTGetFirstToken(x: float32[s_0, s_1, s_2]) -> float32[s_0, s_2]:
+        first_token: float32[s_0, s_2] = 0.0
+        for i, j in dsl.grid(s_0, s_2):
+            first_token[i, j] = x[i, 0, j]
+        return first_token
+    
+    return ViTGetFirstToken
+
+def ViTTokenExpand_lib(s_0, s_1, s_2):
+    def ViTTokenExpand(token: float32[1, s_1, s_2]) -> float32[s_0, s_1, s_2]:
+        tokens: float32[s_0, s_1, s_2] = 0.0
+        for i, j, k in dsl.grid(s_0, s_1, s_2):
+            tokens[i, j, k] = token[0, j, k]
+        return tokens
+    
+    return ViTTokenExpand
