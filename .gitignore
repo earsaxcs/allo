@@ -61,6 +61,7 @@ rapidjson
 
 build
 .vscode
+compile_commands.json
 
 # MLIR intermediate results
 *.opt

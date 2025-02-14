@@ -151,7 +151,7 @@ class MultiHeadAttention(nn.Module):
 
 n_embd = 768
 n_head = 12
-n_layers = 12
+n_layers = 2 # 12
 n_channels = 3
 batch_size = 2
 patch_size = (16, 16)
@@ -162,15 +162,15 @@ img_size = (224, 224)
 # module = ViTEmbedding(n_embd, n_channels, patch_size, img_size).eval()
 
 # Correct!
-example_inputs = [torch.rand(batch_size, n_channels, img_size[0], img_size[1])]
-class ConvTest(nn.Module):
-    def __init__(self, n_channels, n_embd, patch_size):
-        super(ConvTest, self).__init__()
-        self.conv2d = nn.Conv2d(n_channels, n_embd, kernel_size=patch_size, stride=patch_size, bias=False)
+# example_inputs = [torch.rand(batch_size, n_channels, img_size[0], img_size[1])]
+# class ConvTest(nn.Module):
+#     def __init__(self, n_channels, n_embd, patch_size):
+#         super(ConvTest, self).__init__()
+#         self.conv2d = nn.Conv2d(n_channels, n_embd, kernel_size=patch_size, stride=patch_size, bias=False)
     
-    def forward(self, x):
-        return self.conv2d(x)
-module = ConvTest(n_channels, n_embd, patch_size).eval()
+#     def forward(self, x):
+#         return self.conv2d(x)
+# module = ConvTest(n_channels, n_embd, patch_size).eval()
 
 # int64
 # module.conv2d.weight.requires_grad = False
@@ -192,7 +192,9 @@ module = ConvTest(n_channels, n_embd, patch_size).eval()
 # example_inputs = [torch.rand(batch_size, seq_len + 1, n_embd)]
 
 # Fault! 0.02? no Correct! just because the bias not added in conv2d originally
-# module = ViTModel(n_embd, n_head, n_layers, n_channels, patch_size, img_size).eval()
+# Ok Correct, the reason is that the bias not added in the llvm process
+example_inputs = [torch.rand(batch_size, n_channels, img_size[0], img_size[1])]
+module = ViTModel(n_embd, n_head, n_layers, n_channels, patch_size, img_size).eval()
 
 golden = module(*example_inputs)
 llvm_mod = allo.frontend.from_pytorch(
@@ -201,7 +203,7 @@ llvm_mod = allo.frontend.from_pytorch(
     leaf_modules=[ViTGetFirstToken, ViTTokenExpand],
     verbose=False,
 )
-# exit(0)
+exit(0)
 
 golden = module(*example_inputs)
 np_inputs = [x.detach().numpy() for x in example_inputs]

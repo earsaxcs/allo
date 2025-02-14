@@ -323,6 +323,7 @@ public:
   bool visitOp(memref::GlobalOp op) { return emitter.emitGlobal(op), true; }
   bool visitOp(memref::DeallocOp op) { return true; }
   bool visitOp(memref::SubViewOp op) { return emitter.emitSubView(op), true; }
+  bool visitOp(memref::ReshapeOp op) { return true; }
 
   /// Tensor-related statements.
   bool visitOp(tensor::ExtractOp op) {
