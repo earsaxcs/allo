@@ -7,6 +7,7 @@ cmake_policy(SET CMP0116 NEW)
 project(allo-dialect LANGUAGES CXX C)
 
 set(CMAKE_BUILD_WITH_INSTALL_NAME_DIR ON)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 set(CMAKE_CXX_STANDARD 17 CACHE STRING "C++ standard to conform to")
 set(CMAKE_CXX_FLAGS "-Wfatal-errors -std=c++17")

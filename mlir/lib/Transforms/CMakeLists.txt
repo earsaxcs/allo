@@ -11,6 +11,7 @@ add_mlir_library(MLIRAlloPasses
     MemRefDCE.cpp
     DataPlacement.cpp
     UnifyKernels.cpp
+    MergeSubviewAndCopy.cpp
 
     ADDITIONAL_HEADER_DIRS
     ${PROJECT_SOURCE_DIR}/include/allo

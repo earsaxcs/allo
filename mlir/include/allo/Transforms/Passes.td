@@ -43,4 +43,9 @@ def MemRefDCE : Pass<"memref-dce", "ModuleOp"> {
   let constructor = "mlir::allo::createMemRefDCEPass()";
 }
 
+def MergeSubviewAndCopy : Pass<"merge-subview-and-copy", "ModuleOp"> {
+  let summary = "Merge subview and copy operations for dual Concat";
+  let constructor = "mlir::allo::createMergeSubviewAndCopyPass()";
+}
+
 #endif // ALLO_MLIR_PASSES

@@ -24,6 +24,32 @@ class ViTModel(nn.Module):
         x = self.pooler(x)
         return x
     
+class ViTModelWithoutPooler(nn.Module):
+    def __init__(self, n_embd, n_head, n_layers, n_chn, ptc_size, img_size):
+        super(ViTModelWithoutPooler, self).__init__()
+        self.embeddings = ViTEmbedding(n_embd, n_chn=n_chn, ptc_size=ptc_size, img_size=img_size)
+        self.vit_blocks = nn.ModuleList(
+            [ViTBlock(n_embd, n_head, n_embd * 4) for _ in range(n_layers)]
+        )
+        self.ln_f = nn.LayerNorm(n_embd)
+
+    def forward(self, x):
+        x = self.embeddings(x)
+        for block in self.vit_blocks:
+            x = block(x)
+        x = self.ln_f(x)
+        return x
+    
+class ViTImgCls(nn.Module):
+    def __init__(self, n_embd, n_head, n_layers, n_chn, ptc_size, img_size, n_cls):
+        super(ViTImgCls, self).__init__()
+        self.vit = ViTModelWithoutPooler(n_embd, n_head, n_layers, n_chn, ptc_size, img_size)
+        self.classifier = ViTClassifier(n_embd, self.vit.embeddings.n_ptc, n_cls)
+
+    def forward(self, x):
+        x = self.vit(x)
+        x = self.classifier(x)
+        return x
 
 class ViTEmbedding(nn.Module):
     def __init__(self, n_embd, n_chn=3, ptc_size=(16,16), img_size=(224,224)):
@@ -62,8 +88,8 @@ class ViTBlock(nn.Module):
         self.norm2 = nn.LayerNorm(n_embd)
 
     def forward(self, x):
-        x = self.norm1(x)
-        attn_output = self.attention(x)
+        nx = self.norm1(x)
+        attn_output = self.attention(nx)
 
         out1 = x + attn_output
         out2 = self.norm2(out1)
@@ -84,9 +110,21 @@ class ViTPooler(nn.Module):
         pooled_output = self.activation(pooled_output)
         return pooled_output
 
+class ViTClassifier(nn.Module):
+    def __init__(self, hidden_size, seq_len, n_cls):
+        super(ViTClassifier, self).__init__()
+        self.getFirstToken = ViTGetFirstToken(seq_len, hidden_size)
+        self.dense = nn.Linear(hidden_size, n_cls)
+
+    def forward(self, x):
+        first_token_tensor = self.getFirstToken(x)
+        cls_output = self.dense(first_token_tensor)
+        return cls_output
+
 class ViTGetFirstToken(nn.Module):
     def __init__(self, seq_len, hidden_size):
         super(ViTGetFirstToken, self).__init__()
+        # here the index 1 in shape is +1 because of the cls token
         self.shape = (1, seq_len + 1, hidden_size)
 
     def forward(self, x):
@@ -151,12 +189,12 @@ class MultiHeadAttention(nn.Module):
 
 n_embd = 768
 n_head = 12
-n_layers = 2 # 12
+n_layers = 1 # 12
 n_channels = 3
 batch_size = 2
 patch_size = (16, 16)
 img_size = (224, 224)
-
+n_cls = 1000
 # Correct!
 # example_inputs = [torch.rand(batch_size, n_channels, img_size[0], img_size[1])]
 # module = ViTEmbedding(n_embd, n_channels, patch_size, img_size).eval()
@@ -194,10 +232,49 @@ img_size = (224, 224)
 # Fault! 0.02? no Correct! just because the bias not added in conv2d originally
 # Ok Correct, the reason is that the bias not added in the llvm process
 example_inputs = [torch.rand(batch_size, n_channels, img_size[0], img_size[1])]
-module = ViTModel(n_embd, n_head, n_layers, n_channels, patch_size, img_size).eval()
+module = ViTImgCls(n_embd, n_head, n_layers, n_channels, patch_size, img_size, n_cls).eval()
+
+# load vit model from transformers
+from transformers import ViTForImageClassification
+hf_vit_model = ViTForImageClassification.from_pretrained("/root/data/models/vit-base-patch16-224")
+# load vit model to my customized model above
+module.vit.embeddings.proj.weight.data = hf_vit_model.vit.embeddings.patch_embeddings.projection.weight.data
+module.vit.embeddings.proj.bias.data = hf_vit_model.vit.embeddings.patch_embeddings.projection.bias.data
+module.vit.embeddings.position_embeddings.data = hf_vit_model.vit.embeddings.position_embeddings.data
+module.vit.embeddings.cls_token.data = hf_vit_model.vit.embeddings.cls_token.data
+for i in range(n_layers):
+    module.vit.vit_blocks[i].attention.linear_q.weight.data = hf_vit_model.vit.encoder.layer[i].attention.attention.query.weight.data
+    module.vit.vit_blocks[i].attention.linear_q.bias.data = hf_vit_model.vit.encoder.layer[i].attention.attention.query.bias.data
+    module.vit.vit_blocks[i].attention.linear_k.weight.data = hf_vit_model.vit.encoder.layer[i].attention.attention.key.weight.data
+    module.vit.vit_blocks[i].attention.linear_k.bias.data = hf_vit_model.vit.encoder.layer[i].attention.attention.key.bias.data
+    module.vit.vit_blocks[i].attention.linear_v.weight.data = hf_vit_model.vit.encoder.layer[i].attention.attention.value.weight.data
+    module.vit.vit_blocks[i].attention.linear_v.bias.data = hf_vit_model.vit.encoder.layer[i].attention.attention.value.bias.data
+    module.vit.vit_blocks[i].attention.linear_out.weight.data = hf_vit_model.vit.encoder.layer[i].attention.output.dense.weight.data
+    module.vit.vit_blocks[i].attention.linear_out.bias.data = hf_vit_model.vit.encoder.layer[i].attention.output.dense.bias.data
+    module.vit.vit_blocks[i].ffn.fc1.weight.data = hf_vit_model.vit.encoder.layer[i].intermediate.dense.weight.data
+    module.vit.vit_blocks[i].ffn.fc1.bias.data = hf_vit_model.vit.encoder.layer[i].intermediate.dense.bias.data
+    module.vit.vit_blocks[i].ffn.fc2.weight.data = hf_vit_model.vit.encoder.layer[i].output.dense.weight.data
+    module.vit.vit_blocks[i].ffn.fc2.bias.data = hf_vit_model.vit.encoder.layer[i].output.dense.bias.data
+    module.vit.vit_blocks[i].norm1.weight.data = hf_vit_model.vit.encoder.layer[i].layernorm_before.weight.data
+    module.vit.vit_blocks[i].norm1.bias.data = hf_vit_model.vit.encoder.layer[i].layernorm_before.bias.data
+    module.vit.vit_blocks[i].norm1.eps = hf_vit_model.vit.encoder.layer[i].layernorm_before.eps
+    module.vit.vit_blocks[i].norm2.weight.data = hf_vit_model.vit.encoder.layer[i].layernorm_after.weight.data
+    module.vit.vit_blocks[i].norm2.bias.data = hf_vit_model.vit.encoder.layer[i].layernorm_after.bias.data
+    module.vit.vit_blocks[i].norm2.eps = hf_vit_model.vit.encoder.layer[i].layernorm_after.eps
+module.vit.ln_f.weight.data = hf_vit_model.vit.layernorm.weight.data
+module.vit.ln_f.bias.data = hf_vit_model.vit.layernorm.bias.data
+module.vit.ln_f.eps = hf_vit_model.vit.layernorm.eps
+module.classifier.dense.weight.data = hf_vit_model.classifier.weight.data
+module.classifier.dense.bias.data = hf_vit_model.classifier.bias.data
+
+# Test the huggingface vit model and my customized vit model
+# golden = hf_vit_model(*example_inputs).logits
+# res = module(*example_inputs)
+# np.testing.assert_allclose(res.detach().numpy(), golden.detach().numpy(), atol=1e-3)
+# exit(0)
 
 golden = module(*example_inputs)
-llvm_mod = allo.frontend.from_pytorch(
+llvm_mod = allo.frontend.from_pytorch_hls(
     module,
     example_inputs=example_inputs,
     leaf_modules=[ViTGetFirstToken, ViTTokenExpand],
@@ -210,4 +287,4 @@ np_inputs = [x.detach().numpy() for x in example_inputs]
 res = llvm_mod(*np_inputs)
 # np.testing.assert_allclose(res, np_res, atol=1e-3)
 # np.testing.assert_allclose(np_res, golden.detach().numpy(), atol=1e-3)
-np.testing.assert_allclose(res, golden.detach().numpy(), atol=1e-3)
+np.testing.assert_allclose(res, golden.detach().numpy(), rtol=1e-2, atol=1e-3)

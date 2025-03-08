@@ -145,6 +145,7 @@ public:
   HANDLE(memref::SubViewOp);
   HANDLE(memref::ReinterpretCastOp);
   HANDLE(memref::ReshapeOp);
+  HANDLE(memref::CopyOp);
 
   // Tensor-related statements.
   HANDLE(tensor::ExtractOp);

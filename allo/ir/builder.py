@@ -851,7 +851,7 @@ class ASTTransformer(ASTBuilder):
             if hasattr(node, "target"):
                 name = node.target.id
             else:
-                name = f"const_{hash(str(node) + str(np_values))}"
+                name = f"const_{abs(hash(str(node) + str(np_values)))}" # use abs to avoid negative hash value for var name
             sym_name = StringAttr.get(name)
             sym_visibility = StringAttr.get("private")
             memref_type = MemRefType.get(shape, dtype.build())

@@ -12,7 +12,9 @@
 #include "mlir/Dialect/Affine/IR/AffineValueMap.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/AffineExprVisitor.h"
+#include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/IntegerSet.h"
+#include "mlir/IR/Value.h"
 #include "mlir/InitAllDialects.h"
 #include "mlir/Tools/mlir-translate/Translation.h"
 #include "llvm/Support/raw_ostream.h"
@@ -134,6 +136,7 @@ public:
   void emitGetGlobalFixed(allo::GetGlobalFixedOp op);
   void emitGlobal(memref::GlobalOp op);
   void emitSubView(memref::SubViewOp op);
+  void emitCopy(memref::CopyOp op);
 
   /// Tensor-related statement emitters.
   void emitTensorExtract(tensor::ExtractOp op);
@@ -172,6 +175,7 @@ private:
   /// C++ component emitters.
   void emitValue(Value val, unsigned rank = 0, bool isPtr = false,
                  std::string name = "");
+  void emitPtrDecl(Value ptr, ArrayRef<int64_t> ptr_shape = {}, std::string name = "");
   void emitArrayDecl(Value array, bool isFunc = false, std::string name = "");
   unsigned emitNestedLoopHead(Value val);
   void emitNestedLoopTail(unsigned rank);
@@ -324,6 +328,7 @@ public:
   bool visitOp(memref::DeallocOp op) { return true; }
   bool visitOp(memref::SubViewOp op) { return emitter.emitSubView(op), true; }
   bool visitOp(memref::ReshapeOp op) { return true; }
+  bool visitOp(memref::CopyOp op) { return emitter.emitCopy(op), true; }
 
   /// Tensor-related statements.
   bool visitOp(tensor::ExtractOp op) {
@@ -1309,16 +1314,58 @@ void ModuleEmitter::emitGlobal(memref::GlobalOp op) {
   }
 }
 
+// TODO: Need a more flexible subview
 void ModuleEmitter::emitSubView(memref::SubViewOp op) {
+  // indent();
+  // emitArrayDecl(op.getResult(), true);
+  // os << " = ";
+  // emitValue(op.getSource());
+  // // dynamic offsets
+  // for (auto index : op.getOffsets()) {
+  //   os << "[";
+  //   emitValue(index);
+  //   os << "]";
+  // }
+  // os << ";";
+  // emitInfoAndNewLine(op);
+
   indent();
   emitArrayDecl(op.getResult(), true);
   os << " = ";
   emitValue(op.getSource());
-  for (auto index : op.getOffsets()) {
+  // static offsets
+  for (auto index : op.getStaticOffsets()) {
     os << "[";
-    emitValue(index);
+    os << index;
     os << "]";
   }
+  os << ";";
+  emitInfoAndNewLine(op);
+
+  // Deprecated, but can be used to do C Test
+  // indent();
+  // emitPtrDecl(op.getResult(), op.getSource().getType().cast<MemRefType>().getShape());
+  // os << " = ";
+  // os << "&";
+  // emitValue(op.getSource());
+  // // static offsets
+  // for (auto index : op.getStaticOffsets()) {
+  //   os << "[";
+  //   os << index;
+  //   os << "]";
+  // }
+  // os << ";";
+  // emitInfoAndNewLine(op);
+}
+
+// TODO: Not finished
+void ModuleEmitter::emitCopy(memref::CopyOp op) {
+  indent();
+  os << "// copy\n";
+  indent();
+  emitValue(op.getSource());
+  os << ";";
+  // emitValue(op.getODSResults());
   os << ";";
   emitInfoAndNewLine(op);
 }
@@ -1851,6 +1898,38 @@ void ModuleEmitter::emitValue(Value val, unsigned rank, bool isPtr,
   }
 }
 
+// Deprecated, just used to test
+void ModuleEmitter::emitPtrDecl(Value ptr, ArrayRef<int64_t> ptr_shape, std::string name) {
+  assert(!isDeclared(ptr) && "has been declared before.");
+
+  auto ptrType = ptr.getType().cast<ShapedType>();
+  if (ptrType.hasStaticShape()) {
+    os << "// shape: ";
+    for (auto &shape : ptrType.getShape())
+      os << "[" << shape << "]";
+    os << "\n";
+    indent();
+  }
+  if (ptr_shape.size() > 0) {
+    // copy and modify from emitValue
+    os << getTypeName(ptr) << " ";
+    os << "(";
+    if (name == "") {
+      // Add the new value to nameTable and emit its name.
+      os << addName(ptr, true);
+    } 
+    else {
+      os << addName(ptr, true, name);
+    }
+    os << ")";
+    for (int i = 1; i < ptr_shape.size(); ++i)
+      os << "[" << ptr_shape[i] << "]";
+  } 
+  else {
+    emitValue(ptr, /*rank=*/0, /*isPtr=*/true, name);
+  }
+}
+
 void ModuleEmitter::emitArrayDecl(Value array, bool isFunc, std::string name) {
   assert(!isDeclared(array) && "has been declared before.");
 
@@ -2007,6 +2086,9 @@ void ModuleEmitter::emitLoopDirectives(Operation *op) {
   }
 }
 
+// This function is used to emit array directives for a memref.
+// It emits the streaming attribute if the memref is a stream.
+// It emits the array_partition attribute if the memref is not fully partitioned.
 void ModuleEmitter::emitArrayDirectives(Value memref) {
   bool emitPragmaFlag = false;
   auto type = memref.getType().cast<MemRefType>();
