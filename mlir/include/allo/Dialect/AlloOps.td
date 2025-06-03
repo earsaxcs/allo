@@ -1029,4 +1029,29 @@ def StreamPutOp : Allo_Op<"stream_put"> {
   }];
 }
 
+//===----------------------------------------------------------------------===//
+// Custom operations
+//===----------------------------------------------------------------------===//
+
+def CopyToSubviewOp : Allo_Op<"copy_to_subview"> {
+    let summary = "Copy data to a sub-view of a memref operator";
+    let arguments = (ins Arg<AnyRankedOrUnrankedMemRef, "the memref to copy from",
+                           [MemReadAt<0, FullEffect>]>:$source,
+                       Arg<AnyRankedOrUnrankedMemRef, "the memref to copy to",
+                           [MemWriteAt<0, FullEffect>]>:$target,
+                       DenseI64ArrayAttr:$static_offsets,
+                       DenseI64ArrayAttr:$static_sizes,
+                       DenseI64ArrayAttr:$static_strides);
+    let assemblyFormat = [{
+        $source 
+        `,` 
+        $target attr-dict 
+        $static_offsets 
+        $static_sizes 
+        $static_strides 
+        `:` 
+        type($source) `to` type($target)
+    }];
+}
+
 #endif // ALLO_OPS

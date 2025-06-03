@@ -28,7 +28,7 @@ bool applyLegalizeCast(ModuleOp &module);
 bool applyRemoveStrideMap(ModuleOp &module);
 bool applyMemRefDCE(ModuleOp &module);
 bool applyDataPlacement(ModuleOp &module);
-bool applyMergeSubviewAndCopy(ModuleOp &module);
+bool applyMergeSubviewAndCopy(ModuleOp &module, MLIRContext* ctxPtr);
 ModuleOp applyUnifyKernels(ModuleOp &module1, ModuleOp &module2, int loop_num);
 
 /// Registers all Allo transformation passes

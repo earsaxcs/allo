@@ -942,7 +942,7 @@ def customize(
         enable_tensor=enable_tensor,
         verbose=verbose,
     )
-    file_name = inspect.getfile(fn)
+    file_name = inspect.getfile(fn) if not isinstance(fn, str) else None
     module = ASTTransformer()(ctx, tree, file_name)
     if lower_linalg:
         lower_linalg_and_attach_names(module)

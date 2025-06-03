@@ -64,7 +64,7 @@ def from_pytorch_hls(
         code, verbose=verbose, global_vars=global_vars, enable_tensor=enable_tensor
     )
     mod = s.build(target='vhls')
-    print(mod)
+    # print(mod)
     if verbose:
         print(s.module)
     return mod

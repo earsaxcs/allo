@@ -230,6 +230,7 @@ class HLSModule:
                 # "one-shot-bufferize{bufferize-function-boundaries},"
                 # common lowering passes
                 "func.func(convert-linalg-to-affine-loops)"
+                ",merge-subview-and-copy"
                 # DO NOT LOWER AFFINE DIALECT
                 ")"
             )

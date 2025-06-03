@@ -94,8 +94,8 @@ class ViTBlock(nn.Module):
         out1 = x + attn_output
         out2 = self.norm2(out1)
 
-        ffn_output = self.ffn(out2, out1)
-        return ffn_output
+        ffn_output = self.ffn(out2)
+        return ffn_output + out1
 
 class ViTPooler(nn.Module):
     def __init__(self, hidden_size, seq_len):
@@ -137,11 +137,10 @@ class FFN(nn.Module):
         self.fc2 = nn.Linear(hidden_dim, output_dim)
         self.activation = nn.GELU()
 
-    def forward(self, x, o):
+    def forward(self, x):
         x = self.fc1(x)
         x = self.activation(x)
         x = self.fc2(x)
-        x = x + o
         return x
 
 class MultiHeadAttention(nn.Module):

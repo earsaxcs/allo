@@ -166,3 +166,43 @@ def tril(x):
 
 def concat(x, y, axis=0):
     return np.concatenate((x, y), axis=axis)
+
+# quant op
+# TODO: here just remain as placeholder
+
+def qlinear(X, A, coe, iscl, oscl, wscl, bscl, izr=None, ozr=None, bias=None, name=None):
+    if bias is None:
+        return matmul(X, A.T)
+    return matmul(X, A.T) + bias
+
+def qconv2d(inp, filter, _stride, iscl, oscl, wscl, bscl, izr=None, ozr=None, bias=None, name=None):
+    view_shape = (
+        tuple(inp.shape[:2]) # B, IC
+        + tuple(np.subtract(inp.shape[2:], filter.shape[2:]) // _stride + 1) # (H - KH) / S + 1, (W - KW) / S + 1
+        + filter.shape[2:] # KH, KW
+    )
+    strides = inp.strides[:2] + tuple([x * int(_stride[idx]) for idx, x in enumerate(inp.strides[2:])]) + inp.strides[2:]
+    sub_matrices = np.lib.stride_tricks.as_strided(inp, view_shape, strides)
+    if bias is None: 
+        return np.einsum("fcij,nchwij->nfhw", filter, sub_matrices)
+    return np.einsum("fcij,nchwij->nfhw", filter, sub_matrices) + np.broadcast_to(bias, shape=sub_matrices.shape[:1] + sub_matrices.shape[2:4] + bias.shape).transpose(0, 3, 1, 2)
+
+def igelu(x, coe, iscl, oscl, izr=None, ozr=None, name=None):
+    return 0.5 * x * (1 + np.tanh(np.sqrt(2 / np.pi) * (x + 0.044715 * x**3)))
+
+def isoftmax(x, coe, iscl, oscl, izr=None, ozr=None, name=None):
+    exp_x = np.exp(x - np.max(x, axis=-1, keepdims=True))
+    return exp_x / np.sum(exp_x, axis=-1, keepdims=True)
+
+def ilayernorm(x, gamma, beta, coe, iscl, oscl, izr=None, ozr=None, eps: float = 1e-5):
+    mean = np.mean(x, axis=-1, keepdims=True)
+    variance = np.var(x, axis=-1, keepdims=True)
+    x = gamma * (x - mean) / np.sqrt(variance + eps) + beta
+    return x
+
+def qmatmul(lhs, rhs, coe, iscl, oscl, izr=None, ozr=None, name=None):
+    # coe can either carry or not carry isqrtd, just depends on whether it comes from (x * w / o) / sqrtd? 
+    return np.matmul(lhs, rhs)
+
+def qadd(lhs, rhs, lcoe, rcoe, iscl, oscl, izr=None, ozr=None, name=None):
+    return lhs + rhs
