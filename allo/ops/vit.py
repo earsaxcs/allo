@@ -62,13 +62,14 @@ class ViTEmbedding(nn.Module):
         self.n_embd = n_embd
         self.expand1 = ViTTokenExpand(self.cls_token.shape)
         self.expand2 = ViTTokenExpand(self.position_embeddings.shape)
+        self.add = Add()
 
     def forward(self, x):
         embeddings = self.proj(x).view(x.shape[0], self.n_embd, -1).transpose(1, 2)
         # cls_tokens = self.cls_token.expand(x.shape[0], -1, -1)
         cls_tokens = self.expand1(self.cls_token, x)
         embeddings = torch.cat((cls_tokens, embeddings), dim=1)
-        embeddings += self.expand2(self.position_embeddings, x)
+        embeddings = self.add(embeddings, self.expand2(self.position_embeddings, x))
         return embeddings
 
 class ViTTokenExpand(nn.Module):
@@ -86,16 +87,18 @@ class ViTBlock(nn.Module):
         self.norm1 = nn.LayerNorm(n_embd)
         self.ffn = FFN(n_embd, ffn_hidden_dim, n_embd)
         self.norm2 = nn.LayerNorm(n_embd)
+        self.add1 = Add()
+        self.add2 = Add()
 
     def forward(self, x):
         nx = self.norm1(x)
         attn_output = self.attention(nx)
 
-        out1 = x + attn_output
+        out1 = self.add1(x, attn_output)
         out2 = self.norm2(out1)
 
         ffn_output = self.ffn(out2)
-        return ffn_output + out1
+        return self.add2(ffn_output, out1)
 
 class ViTPooler(nn.Module):
     def __init__(self, hidden_size, seq_len):
@@ -155,6 +158,11 @@ class MultiHeadAttention(nn.Module):
 
         self.linear_out = nn.Linear(n_embd, n_embd)
 
+        self.softmax = nn.Softmax(dim=-1)
+
+        self.matmul1 = MatMulIsqrtD(self.head_dim)
+        self.matmul2 = MatMul()
+
     def split_heads(self, x):
         # x: (batch_size, seq_len, hidden_size)
         new_shape = x.shape[:-1] + (self.num_heads, -1)
@@ -164,13 +172,12 @@ class MultiHeadAttention(nn.Module):
 
     def scaled_dot_product(self, q, k, v, x):
         # (bs, head, seq, hs // head)
-        attn_score = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(
-            self.head_dim
-        )
+        sqrt_dim = math.sqrt(self.head_dim)
+        attn_score = self.matmul1(q, k.transpose(-2, -1)) # attn_score = torch.matmul(q, k.transpose(-2, -1)) / sqrt_dim
         # (bs, head, seq, seq)
-        attn_probs = F.softmax(attn_score, dim=-1)
+        attn_probs = self.softmax(attn_score)
         # (bs, head, seq, hs // head)
-        attn = torch.matmul(attn_probs, v)
+        attn = self.matmul2(attn_probs, v)
         return attn
 
     def forward(self, x):
@@ -185,105 +192,102 @@ class MultiHeadAttention(nn.Module):
         output = output.reshape(output.shape[0], output.shape[1], -1)
         output = self.linear_out(output)
         return output
-
-n_embd = 768
-n_head = 12
-n_layers = 1 # 12
-n_channels = 3
-batch_size = 2
-patch_size = (16, 16)
-img_size = (224, 224)
-n_cls = 1000
-# Correct!
-# example_inputs = [torch.rand(batch_size, n_channels, img_size[0], img_size[1])]
-# module = ViTEmbedding(n_embd, n_channels, patch_size, img_size).eval()
-
-# Correct!
-# example_inputs = [torch.rand(batch_size, n_channels, img_size[0], img_size[1])]
-# class ConvTest(nn.Module):
-#     def __init__(self, n_channels, n_embd, patch_size):
-#         super(ConvTest, self).__init__()
-#         self.conv2d = nn.Conv2d(n_channels, n_embd, kernel_size=patch_size, stride=patch_size, bias=False)
     
-#     def forward(self, x):
-#         return self.conv2d(x)
-# module = ConvTest(n_channels, n_embd, patch_size).eval()
+class Add(nn.Module):
+    def __init__(self):
+        super(Add, self).__init__()
 
-# int64
-# module.conv2d.weight.requires_grad = False
-# module.conv2d.bias.requires_grad = False
-# module.conv2d.weight.data = torch.randint(-2, 2, (n_embd, n_channels, patch_size[0], patch_size[1])).type(torch.int8).detach()
-# module.conv2d.bias.data = torch.randint(-100, 100, (n_embd,)).type(torch.int8).detach()
-# example_inputs = [torch.randint(-2, 2, (batch_size, n_channels, img_size[0], img_size[1])).type(torch.int8)]
-# module.conv2d.weight.data = torch.ones((n_embd, n_channels, patch_size[0], patch_size[1])).detach()
-# module.conv2d.bias.data = torch.ones((n_embd,), dtype=torch.int8).detach() * 100
-# example_inputs = [torch.ones((batch_size, n_channels, img_size[0], img_size[1]), dtype=torch.int8)]
+    def forward(self, x, y):
+        return x + y
+    
+class MatMul(nn.Module):
+    def __init__(self):
+        super(MatMul, self).__init__()
 
-# dsl conv2d
-# import allo.dsl as dsl
-# np_res = dsl.conv2d(example_inputs[0].detach().numpy(), module.conv2d.weight.data.detach().numpy(), module.conv2d.stride, module.conv2d.bias.data.detach().numpy())
+    def forward(self, x, y):
+        return x @ y
 
-# Correct!
-# seq_len = int(torch.prod(torch.Tensor(img_size) // torch.Tensor(patch_size)).item())
-# module = ViTBlock(n_embd, n_head, n_embd * 4).eval()
-# example_inputs = [torch.rand(batch_size, seq_len + 1, n_embd)]
+class MatMulIsqrtD(MatMul):
+    def __init__(self, dim):
+        super(MatMul, self).__init__()
+        self.sqrt_dim = torch.sqrt(torch.Tensor([dim]))
 
-# Fault! 0.02? no Correct! just because the bias not added in conv2d originally
-# Ok Correct, the reason is that the bias not added in the llvm process
-example_inputs = [torch.rand(batch_size, n_channels, img_size[0], img_size[1])]
-module = ViTImgCls(n_embd, n_head, n_layers, n_channels, patch_size, img_size, n_cls).eval()
+    def forward(self, x, y):
+        return super().forward(x, y) / self.sqrt_dim
 
-# load vit model from transformers
-from transformers import ViTForImageClassification
-hf_vit_model = ViTForImageClassification.from_pretrained("/root/data/models/vit-base-patch16-224")
-# load vit model to my customized model above
-module.vit.embeddings.proj.weight.data = hf_vit_model.vit.embeddings.patch_embeddings.projection.weight.data
-module.vit.embeddings.proj.bias.data = hf_vit_model.vit.embeddings.patch_embeddings.projection.bias.data
-module.vit.embeddings.position_embeddings.data = hf_vit_model.vit.embeddings.position_embeddings.data
-module.vit.embeddings.cls_token.data = hf_vit_model.vit.embeddings.cls_token.data
-for i in range(n_layers):
-    module.vit.vit_blocks[i].attention.linear_q.weight.data = hf_vit_model.vit.encoder.layer[i].attention.attention.query.weight.data
-    module.vit.vit_blocks[i].attention.linear_q.bias.data = hf_vit_model.vit.encoder.layer[i].attention.attention.query.bias.data
-    module.vit.vit_blocks[i].attention.linear_k.weight.data = hf_vit_model.vit.encoder.layer[i].attention.attention.key.weight.data
-    module.vit.vit_blocks[i].attention.linear_k.bias.data = hf_vit_model.vit.encoder.layer[i].attention.attention.key.bias.data
-    module.vit.vit_blocks[i].attention.linear_v.weight.data = hf_vit_model.vit.encoder.layer[i].attention.attention.value.weight.data
-    module.vit.vit_blocks[i].attention.linear_v.bias.data = hf_vit_model.vit.encoder.layer[i].attention.attention.value.bias.data
-    module.vit.vit_blocks[i].attention.linear_out.weight.data = hf_vit_model.vit.encoder.layer[i].attention.output.dense.weight.data
-    module.vit.vit_blocks[i].attention.linear_out.bias.data = hf_vit_model.vit.encoder.layer[i].attention.output.dense.bias.data
-    module.vit.vit_blocks[i].ffn.fc1.weight.data = hf_vit_model.vit.encoder.layer[i].intermediate.dense.weight.data
-    module.vit.vit_blocks[i].ffn.fc1.bias.data = hf_vit_model.vit.encoder.layer[i].intermediate.dense.bias.data
-    module.vit.vit_blocks[i].ffn.fc2.weight.data = hf_vit_model.vit.encoder.layer[i].output.dense.weight.data
-    module.vit.vit_blocks[i].ffn.fc2.bias.data = hf_vit_model.vit.encoder.layer[i].output.dense.bias.data
-    module.vit.vit_blocks[i].norm1.weight.data = hf_vit_model.vit.encoder.layer[i].layernorm_before.weight.data
-    module.vit.vit_blocks[i].norm1.bias.data = hf_vit_model.vit.encoder.layer[i].layernorm_before.bias.data
-    module.vit.vit_blocks[i].norm1.eps = hf_vit_model.vit.encoder.layer[i].layernorm_before.eps
-    module.vit.vit_blocks[i].norm2.weight.data = hf_vit_model.vit.encoder.layer[i].layernorm_after.weight.data
-    module.vit.vit_blocks[i].norm2.bias.data = hf_vit_model.vit.encoder.layer[i].layernorm_after.bias.data
-    module.vit.vit_blocks[i].norm2.eps = hf_vit_model.vit.encoder.layer[i].layernorm_after.eps
-module.vit.ln_f.weight.data = hf_vit_model.vit.layernorm.weight.data
-module.vit.ln_f.bias.data = hf_vit_model.vit.layernorm.bias.data
-module.vit.ln_f.eps = hf_vit_model.vit.layernorm.eps
-module.classifier.dense.weight.data = hf_vit_model.classifier.weight.data
-module.classifier.dense.bias.data = hf_vit_model.classifier.bias.data
+if __name__ == "__main__":
+    n_embd = 768
+    n_head = 12
+    n_layers = 1 # 12
+    n_channels = 3
+    batch_size = 2
+    patch_size = (16, 16)
+    img_size = (224, 224)
+    n_cls = 1000
+    # Correct!
+    # example_inputs = [torch.rand(batch_size, n_channels, img_size[0], img_size[1])]
+    # module = ViTEmbedding(n_embd, n_channels, patch_size, img_size).eval()
 
-# Test the huggingface vit model and my customized vit model
-# golden = hf_vit_model(*example_inputs).logits
-# res = module(*example_inputs)
-# np.testing.assert_allclose(res.detach().numpy(), golden.detach().numpy(), atol=1e-3)
-# exit(0)
+    # Correct!
+    # example_inputs = [torch.rand(batch_size, n_channels, img_size[0], img_size[1])]
+    # class ConvTest(nn.Module):
+    #     def __init__(self, n_channels, n_embd, patch_size):
+    #         super(ConvTest, self).__init__()
+    #         self.conv2d = nn.Conv2d(n_channels, n_embd, kernel_size=patch_size, stride=patch_size, bias=False)
+        
+    #     def forward(self, x):
+    #         return self.conv2d(x)
+    # module = ConvTest(n_channels, n_embd, patch_size).eval()
 
-golden = module(*example_inputs)
-llvm_mod = allo.frontend.from_pytorch_hls(
-    module,
-    example_inputs=example_inputs,
-    leaf_modules=[ViTGetFirstToken, ViTTokenExpand],
-    verbose=False,
-)
-exit(0)
+    # int64
+    # module.conv2d.weight.requires_grad = False
+    # module.conv2d.bias.requires_grad = False
+    # module.conv2d.weight.data = torch.randint(-2, 2, (n_embd, n_channels, patch_size[0], patch_size[1])).type(torch.int8).detach()
+    # module.conv2d.bias.data = torch.randint(-100, 100, (n_embd,)).type(torch.int8).detach()
+    # example_inputs = [torch.randint(-2, 2, (batch_size, n_channels, img_size[0], img_size[1])).type(torch.int8)]
+    # module.conv2d.weight.data = torch.ones((n_embd, n_channels, patch_size[0], patch_size[1])).detach()
+    # module.conv2d.bias.data = torch.ones((n_embd,), dtype=torch.int8).detach() * 100
+    # example_inputs = [torch.ones((batch_size, n_channels, img_size[0], img_size[1]), dtype=torch.int8)]
 
-golden = module(*example_inputs)
-np_inputs = [x.detach().numpy() for x in example_inputs]
-res = llvm_mod(*np_inputs)
-# np.testing.assert_allclose(res, np_res, atol=1e-3)
-# np.testing.assert_allclose(np_res, golden.detach().numpy(), atol=1e-3)
-np.testing.assert_allclose(res, golden.detach().numpy(), rtol=1e-2, atol=1e-3)
+    # dsl conv2d
+    # import allo.dsl as dsl
+    # np_res = dsl.conv2d(example_inputs[0].detach().numpy(), module.conv2d.weight.data.detach().numpy(), module.conv2d.stride, module.conv2d.bias.data.detach().numpy())
+
+    # Correct!
+    # seq_len = int(torch.prod(torch.Tensor(img_size) // torch.Tensor(patch_size)).item())
+    # module = ViTBlock(n_embd, n_head, n_embd * 4).eval()
+    # example_inputs = [torch.rand(batch_size, seq_len + 1, n_embd)]
+
+    # Fault! 0.02? no Correct! just because the bias not added in conv2d originally
+    # Ok Correct, the reason is that the bias not added in the llvm process
+    example_inputs = [torch.rand(batch_size, n_channels, img_size[0], img_size[1])]
+    module = ViTImgCls(n_embd, n_head, n_layers, n_channels, patch_size, img_size, n_cls).eval()
+
+    # load vit model from transformers
+    from transformers import ViTForImageClassification
+    hf_vit_model = ViTForImageClassification.from_pretrained("/root/data/models/vit-base-patch16-224")
+    # load vit model to my customized model above
+    from utils import replace_vit_with_hf_vit
+    replace_vit_with_hf_vit(module, hf_vit_model)
+
+    # Test the huggingface vit model and my customized vit model
+    # golden = hf_vit_model(*example_inputs).logits
+    # res = module(*example_inputs)
+    # np.testing.assert_allclose(res.detach().numpy(), golden.detach().numpy(), atol=1e-3)
+    # exit(0)
+
+    golden = module(*example_inputs)
+    llvm_mod = allo.frontend.from_pytorch_hls(
+        module,
+        example_inputs=example_inputs,
+        leaf_modules=[ViTGetFirstToken, ViTTokenExpand],
+        verbose=False,
+    )
+    exit(0)
+
+    golden = module(*example_inputs)
+    np_inputs = [x.detach().numpy() for x in example_inputs]
+    res = llvm_mod(*np_inputs)
+    # np.testing.assert_allclose(res, np_res, atol=1e-3)
+    # np.testing.assert_allclose(np_res, golden.detach().numpy(), atol=1e-3)
+    np.testing.assert_allclose(res, golden.detach().numpy(), rtol=1e-2, atol=1e-3)

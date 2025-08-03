@@ -25,6 +25,7 @@ project_*
 # Generated files
 project
 rapidjson
+*.npy
 
 # Prerequisites
 *.d

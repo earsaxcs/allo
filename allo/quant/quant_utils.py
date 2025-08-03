@@ -10,6 +10,7 @@ def max_min_quantize_params(
     quant_mode: str = 'sym', # 'sym' or 'asym'
     per_channel: bool = False,
     is_weight: bool = True,       # New: Indicate if the tensor is a weight
+    is_seq_x: bool = False,        # When `input_tensor` is 4D, False means that `input_tensor` is conv feature, True means that `input_tensor` is multi-hhead sequence attention score in Transformer
     channel_dim: int | None = None, # Optional: Manually specify channel dimension. If None and per_channel is True, infer based on ndim and is_weight.
     dtype: torch.dtype = torch.float32 # Dtype for scale and zero_point
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
@@ -58,6 +59,7 @@ def max_min_quantize_params(
     # 确定 Per-Channel 量化维度和 Reduction 维度
     actual_channel_dim = None
     _per_channel_effective = per_channel # Use an internal flag for effective per_channel state
+    _is_seq_x_effective = is_seq_x # Use an internal flag for effective is_seq_x state
 
     if ndim == 1:
         # 1D 张量 (Bias, Norm Weight) 不支持 Per-Channel
@@ -78,15 +80,22 @@ def max_min_quantize_params(
                 actual_channel_dim = 0 if is_weight else 1
                 print(f"Info: Inferring channel_dim={actual_channel_dim} for {ndim}D tensor based on is_weight={is_weight}.")
             elif ndim == 3:
-                # Typical for Transformer/RNN Activation [B, S, E] (dim 2)
-                actual_channel_dim = 2
+                # NOTICE: is_weight==False means its per-token currently
+                actual_channel_dim = 1
                 print(f"Info: Inferring channel_dim={actual_channel_dim} for {ndim}D tensor.")
                 if is_weight:
+                    # Typical for Transformer/RNN Activation [B, S, E] (dim 2)
+                     actual_channel_dim = 2
                      print("Info: Assuming 3D tensor is activation-like for per-channel inference. If it's a 3D weight, manually set channel_dim.")
             elif ndim == 4:
-                # Conv Weight [O, I, K, K] (dim 0) vs Conv Activation [B, C, H, W] (dim 1)
-                actual_channel_dim = 0 if is_weight else 1
-                print(f"Info: Inferring channel_dim={actual_channel_dim} for {ndim}D tensor based on is_weight={is_weight} (assuming channels-first for activations). For channels-last activation ([B, H, W, C]), manually set channel_dim=3.")
+                if _is_seq_x_effective and not is_weight:
+                    # Transformer Attention Score [B, H, L, L]
+                    actual_channel_dim = 2
+                    print(f"Info: Inferring channel_dim={actual_channel_dim} for {ndim}D tensor based on is_weight={is_weight}. It's Transformer Attention Score")
+                else:
+                    # Conv Weight [O, I, K, K] (dim 0) vs Conv Activation [B, C, H, W] (dim 1)
+                    actual_channel_dim = 0 if is_weight else 1
+                    print(f"Info: Inferring channel_dim={actual_channel_dim} for {ndim}D tensor based on is_weight={is_weight} (assuming channels-first for activations). For channels-last activation ([B, H, W, C]), please manually set channel_dim=3.")
 
         # 验证确定的维度是否有效
         if actual_channel_dim < 0 or actual_channel_dim >= ndim:
@@ -110,8 +119,8 @@ def max_min_quantize_params(
 
     else: # Per-tensor quantization
         # 计算整个张量的 Min 和 Max (Scalar)
-        min_val = torch.min(input_tensor.detach())
-        max_val = torch.max(input_tensor.detach())
+        min_val = torch.min(input_tensor.detach()).unsqueeze(0)
+        max_val = torch.max(input_tensor.detach()).unsqueeze(0)
 
     # 将 min_val 和 max_val 转换为目标 dtype
     min_val = min_val.to(dtype)
@@ -166,6 +175,7 @@ def max_min_quantize_params(
 
     return scale, zero_point
 
+# TODO: follow max_min_quantize_params set seq_int_x
 def mean_std_quantize_params(
     input_tensor: torch.Tensor | None,
     bitwidth: int = 8,

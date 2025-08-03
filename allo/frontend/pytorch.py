@@ -16,6 +16,7 @@ try:
 except ImportError:
     pass
 from .library import CoreAttention_lib, KVCache_lib, ViTGetFirstToken_lib, ViTTokenExpand_lib
+from ..quant.quant_modules import *
 from .. import dsl
 from ..ir import types
 from ..customize import customize
@@ -167,6 +168,9 @@ class TorchBuilder:
                 if isinstance(module, leaf_module):
                     if module.__class__.__name__ == "ViTGetFirstToken":
                         return getattr(self, f"build_{module.__class__.__name__}")(node, module.shape)
+                    elif module.__class__.__name__ == "QConv2d":
+                        # TODO
+                        pass
                     elif module.__class__.__name__ == "ViTTokenExpand":
                         return getattr(self, f"build_{module.__class__.__name__}")(node, module.token_shape)
         if op is None:
@@ -197,7 +201,10 @@ class TorchBuilder:
             F.dropout: "identity",
             torch.tril: "tril",
             torch.cat: "concat",
+            torch.round: "round",
+            torch.clamp: "clamp",
         }.get(node.target)
+        print(node.target)
         # Only nodes with shape need to be built.
         return (
             getattr(self, f"build_{opcls}")(node)
@@ -285,6 +292,14 @@ class TorchBuilder:
         lhs = get_var_name(node.args[0])
         rhs = get_var_name(node.args[1])
         return f"{node.name} = {lhs} / {rhs}"
+    
+    def build_round(self, node):
+        inp = get_var_name(node.args[0])
+        return f"{node.name} = round({inp})"
+    
+    def build_clamp(self, node):
+        # TODO
+        return f"{node.name} = clamp()"
 
     def build_softmax(self, node):
         if node.kwargs.get("dim") != -1:

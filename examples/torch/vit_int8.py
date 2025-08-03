@@ -4,8 +4,62 @@ import math
 import numpy as np
 import torch.nn as nn
 import torch.nn.functional as F
-from quant_modules import *
-from quant_utils import *
+from allo.ops.vit import *
+from allo.quant.quant_modules import *
+from allo.quant.quant_utils import *
+from utils import *
+import inspect, ast
+
+quant_modules = {
+    nn.Linear: QLinear,
+    nn.Conv2d: QConv2d,
+    nn.GELU: IntGELU,
+    nn.Softmax: IntSoftmax,
+    nn.LayerNorm: IntLayerNorm,
+    Add: QAdd, # TODO: Make Add
+    MatMul: QMatMul, # TODO: Make Matmul
+    MatMulIsqrtD: QMatMulIsqrtD,
+    # nn.FFN: QFFN,
+}
+
+quant_modules_list = list(quant_modules.values())
+
+def replace_module_with_quantized(model):
+    import copy
+    qmodel = copy.deepcopy(model)
+
+    def dfs_and_replace(model, qmodel):
+        # notice name_modules() is dfs
+        for name, module in model.named_modules():
+            level = len(name.split("."))
+            if name == "" or level > 1:
+                continue
+            # remove the first layer to increase the accuracy
+            if name in [str(x) for x in range(0, 0)] or name in []:
+                continue
+            
+            last_name = name.split(".")[-1]
+            # TODO IMPORTANT: fix the traverse
+            next_qmodel = getattr(qmodel, name)
+            dfs_and_replace(module, next_qmodel)
+            if type(module) in quant_modules:
+                if type(module) in [nn.Linear, nn.Conv2d]:
+                    qmodule = quant_modules[type(module)].struct_module(module, wgt_per_channel=True)
+                elif type(module) in [nn.GELU, nn.Softmax, Add, MatMul, MatMulIsqrtD]:
+                    qmodule = quant_modules[type(module)].struct_module(module, act_per_token=True)
+                elif type(module) in [nn.LayerNorm]:
+                    qmodule = quant_modules[type(module)].struct_module(module, act_per_channel=True)
+                # smooth quant
+                # if name in ["fc1", "linear_q", "linear_k", "linear_v", "dense"]:
+                #     qmodule.weight.data = qmodule.weight * 4
+                # elif name in ["norm1", "norm2", "ln_f"]:
+                #     qmodule.weight.data = qmodule.weight / 4
+                #     qmodule.bias.data = qmodule.bias / 4
+                setattr(qmodel, name, qmodule)
+    
+    dfs_and_replace(model, qmodel)
+
+    return qmodel
 
 class Calibrator:
     def __init__(
@@ -17,24 +71,39 @@ class Calibrator:
         self.example_inputs = example_inputs
 
     def calibrate(self):
-        self.calibrate_module(
-            qmodel=self.qmodel,
-            x=self.example_inputs,
-            pre_scale=torch.Tensor([1]),
-            pre_zero=torch.Tensor([0]),
-        )
-        
-    def calibrate_module(
-        self, 
-        qmodel: nn.Module,
-        x: torch.Tensor,
-        pre_scale: torch.Tensor,
-        pre_zero: torch.Tensor | None = None,
-    ):
-        for name, module in self.qmodel.named_modules():
-            if isinstance(module, QLinear):
-                self.calib_linear(module, self.example_inputs, pre_scale, pre_zero)
+        self.enable_calibrate()
+        self.qmodel(self.example_inputs)
+        self.disable_calibrate()
 
+    def enable_calibrate(self):
+        for name, module in self.qmodel.named_modules():
+            if type(module) in quant_modules_list:
+                module.start_calibrate()
+            else:
+                pass
+
+    def disable_calibrate(self):
+        for name, module in self.qmodel.named_modules():
+            if type(module) in quant_modules_list:
+                module.stop_calibrate()
+            else:
+                pass
+
+    def enable_fakequant(self):
+        for name, module in self.qmodel.named_modules():
+            if type(module) in quant_modules_list:
+                module.enable_fakequant()
+            else:
+                pass
+
+    def disable_fakequant(self):
+        for name, module in self.qmodel.named_modules():
+            if type(module) in quant_modules_list:
+                module.disable_fakequant()
+            else:
+                pass
+
+    # deprecated
     def calib_linear(
             self, 
             qlinear: QLinear, 
@@ -352,11 +421,8 @@ class Calibrator:
 
         return y, y_scale, y_zero
 
-def calibrate():
-    pass
 
-calibrator = Calibrator()
-
+# deprecated
 def test_calibrate_linear():
     # Symmetric Quantize
     inc = 1024
@@ -711,6 +777,118 @@ def test_calibrate_add():
         msg="The Diff of QMatMul Calibrate Test:\n" + str(y-yq)
     )
 
+def test_calibrate_vit_block():
+    n_embd = 384
+    n_head = 6
+    sample_batch_size = 32
+    batch_size = 10
+
+    from allo.ops.vit import ViTBlock
+    blk = ViTBlock(n_embd=n_embd, num_heads=n_head, ffn_hidden_dim=n_embd * 4)
+    example_inputs = torch.randn(sample_batch_size, 197, n_embd) * 12
+    test_inputs = torch.randn(batch_size, 197, n_embd) * 16
+
+    qblk = replace_module_with_quantized(model=blk)
+    calibrator = Calibrator(qblk, example_inputs)
+    calibrator.calibrate()
+    calibrator.enable_fakequant()
+
+    golden = blk(test_inputs)
+    res = qblk(test_inputs)
+
+    print(f"mean diff: {torch.mean(golden - res)}")
+    print(f"max diff: {torch.max(golden - res)}")
+
+
+def test_calibrate_vit():
+    scale = 1
+    n_embd = 192 * scale
+    n_head = 3 * scale
+    n_layers = 12
+    n_channels = 3
+    sample_batch_size = 32
+    batch_size = 1000
+    patch_size = (16, 16)
+    img_size = (224, 224)
+    n_cls = 1000
+
+    from allo.ops.vit import ViTImgCls
+    import os
+    dataset_path = "/root/data/dataset/imagenet-1k-test"
+    # example_inputs = torch.rand(sample_batch_size, n_channels, img_size[0], img_size[1])
+    example_val_data = get_imagenet_test_data(dataset_path, sample_batch_size, img_size[0], is_reverse_sample=True)
+    test_val_data = get_imagenet_test_data(dataset_path, batch_size, img_size[0])
+    example_inputs = torch.concat([x[0] for x in example_val_data])
+    test_inputs = torch.concat([x[0] for x in test_val_data])
+    test_labels = torch.tensor([x[1] for x in test_val_data], dtype=torch.int)
+    # test_inputs = torch.rand(batch_size, n_channels, img_size[0], img_size[1])
+    
+    vit = ViTImgCls(n_embd, n_head, n_layers, n_channels, patch_size, img_size, n_cls).eval()
+
+    from transformers import ViTForImageClassification
+    hf_vit = ViTForImageClassification.from_pretrained("/root/data/models/deit-tiny-patch16-224")
+    hf_vit = hf_vit.eval()
+    
+    from utils import replace_vit_with_hf_vit
+    replace_vit_with_hf_vit(vit, hf_vit)
+
+    vit = replace_module_with_quantized(model=vit)
+    calibrator = Calibrator(vit, example_inputs)
+    calibrator.calibrate()
+    calibrator.enable_fakequant()
+
+    # debug
+    # vit.vit.vit_blocks[0].norm1.disable_fakequant()
+    # vit.vit.vit_blocks[0].norm2.disable_fakequant()
+    # vit.vit.vit_blocks[0].attention.linear_q.disable_fakequant()
+    # vit.vit.vit_blocks[0].attention.linear_k.disable_fakequant()
+    # vit.vit.vit_blocks[0].attention.linear_v.disable_fakequant()
+    # vit.vit.vit_blocks[0].attention.linear_out.disable_fakequant()
+    # vit.vit.vit_blocks[0].attention.matmul1.disable_fakequant()
+    # vit.vit.vit_blocks[0].attention.matmul2.disable_fakequant()
+    # vit.vit.vit_blocks[0].ffn.fc1.disable_fakequant()
+    # vit.vit.vit_blocks[0].ffn.fc2.disable_fakequant()
+    # vit.vit.vit_blocks[0].ffn.activation.disable_fakequant()
+    # vit.vit.vit_blocks[0].add1.disable_fakequant()
+    # vit.vit.vit_blocks[0].add2.disable_fakequant()
+    # vit.vit.vit_blocks[0].attention.softmax.disable_fakequant()
+    # vit.vit.ln_f.disable_fakequant()
+
+    if False:
+        total = batch_size
+        top1_match = 0
+        top1_acc = 0
+        top1_acc_ref = 0
+        mean_diff = 0
+        max_diff = torch.tensor(0.0)
+        step = 20
+        with torch.no_grad():
+            for i in range(0, total, step):
+                inp = test_inputs[i:min(i+step, total)]
+                lbl = test_labels[i:min(i+step, total)]
+                golden = hf_vit(*[inp]).logits
+                res = vit(inp)
+                top1_match += torch.sum(golden.argmax(-1) == res.argmax(-1))
+                top1_acc += torch.sum(lbl == res.argmax(-1))
+                top1_acc_ref += torch.sum(lbl == golden.argmax(-1))
+                mean_diff += torch.mean(torch.abs(golden - res))
+                max_diff = torch.max(torch.abs(golden - res).max(), max_diff)
+        mean_diff = mean_diff * step / total
+        print(f"{golden.max(-1)=}\n{res.max(-1)=}")
+        print(f"Top1 Match: {top1_match}/{total}")
+        print(f"Top1 Accuracy: {top1_acc}/{total}")
+        print(f"Top1 Accuracy Reference: {top1_acc_ref}/{total}")
+        print(f"mean diff: {mean_diff}")
+        print(f"max diff: {max_diff}")
+        # np.testing.assert_allclose(res.detach().numpy(), golden.detach().numpy(), atol=1e-2)
+    else:
+        llvm_mod = allo.frontend.from_pytorch_hls(
+            vit,
+            example_inputs=[example_inputs[:2]],
+            leaf_modules=[ViTGetFirstToken, ViTTokenExpand, QLinear, QConv2d],
+            verbose=False,
+        )
+
 
 if __name__ == "__main__":
     # test_calibrate_linear()
@@ -720,4 +898,5 @@ if __name__ == "__main__":
     # test_calibrate_softmax()
     # test_calibrate_layernorm()
     # test_calibrate_add()
-    pass
+    test_calibrate_vit()
+    # test_calibrate_vit_block()

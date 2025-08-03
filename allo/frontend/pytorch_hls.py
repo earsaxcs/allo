@@ -47,6 +47,7 @@ def from_pytorch_hls(
         else model.__name__
     )
     gm = GraphModule(tracer.root, graph, name)
+    gm.print_readable()
     ShapeProp(gm).propagate(*args)
     if verbose:
         print(gm.graph)
