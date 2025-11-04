@@ -1212,9 +1212,9 @@ class QAdd(QuantizableModule):
         self.register_buffer("x_scale", torch.zeros(x_quant_param_shape))
         self.register_buffer("y_scale", torch.zeros(y_quant_param_shape))
         self.register_buffer("o_scale", torch.zeros(o_quant_param_shape))
-        # x_coe == x_scale / o_scale
+        # x_fused_scale == x_scale / o_scale
         self.register_buffer("x_fused_scale", torch.zeros(fused_scale_quant_param_shape))
-        # y_coe == y_scale / o_scale
+        # y_fused_scale == y_scale / o_scale
         self.register_buffer("y_fused_scale", torch.zeros(fused_scale_quant_param_shape))
 
         if act_quant_mode == "sym":
@@ -1339,7 +1339,7 @@ class QMatMul(QuantizableModule):
         self.register_buffer("x_scale", torch.zeros(x_quant_param_shape))
         self.register_buffer("y_scale", torch.zeros(y_quant_param_shape))
         self.register_buffer("o_scale", torch.zeros(o_quant_param_shape))
-        # coe == x_scale * y_scale / o_scale
+        # fused_scale == x_scale * y_scale / o_scale
         self.register_buffer("fused_scale", torch.zeros(fused_scale_quant_param_shape))
 
         if act_quant_mode == "sym":
@@ -1454,8 +1454,8 @@ class QMatMulIsqrtD(QMatMul):
         return super().forward_float(x_float, y_float) / self.sqrt_dim
     
     def forward_int(self, x_int, y_int):
-        # NOTICE: Here we fuse the sqrt_dim into output_scale and coe
-        # But this request you to get the correct coe and scale first
+        # NOTICE: Here we fuse the sqrt_dim into output_scale and cofused_scalee
+        # But this request you to get the correct fused_scale and scale first
         return super().forward_int(x_int, y_int)
     
     def copy_from(self, matmul):

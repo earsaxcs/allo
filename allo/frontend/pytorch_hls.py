@@ -14,7 +14,7 @@ except ImportError:
 from .. import dsl 
 from ..ir import types
 from ..customize import customize
-from .pytorch import TorchBuilder
+from .pytorch import TorchBuilder, _process_quantized_params
 
 
 def from_pytorch_hls(
@@ -47,7 +47,7 @@ def from_pytorch_hls(
         else model.__name__
     )
     gm = GraphModule(tracer.root, graph, name)
-    gm.print_readable()
+    # gm.print_readable()
     ShapeProp(gm).propagate(*args)
     if verbose:
         print(gm.graph)
@@ -58,9 +58,18 @@ def from_pytorch_hls(
     for name, param in gm.named_parameters():
         new_name = "g_" + name.replace(".", "_")
         global_vars.update({new_name: param.detach().numpy()})
+    # for name, buffer in gm.named_buffers():
+    #     new_name = "g_" + name.replace(".", "_")
+    #     global_vars.update({new_name: buffer.detach().numpy()})
+
+    # ========== 关键插入点：处理量化参数 ==========
+    # 在这里调用量化参数处理函数，将浮点权重/偏置替换为整数版本
+    # 并注入所有scale/zero常量
+    _process_quantized_params(gm, global_vars)
 
     builder = TorchBuilder(gm, example_inputs, leaf_modules)
     code = builder.build()
+    print(code)
     s = customize(
         code, verbose=verbose, global_vars=global_vars, enable_tensor=enable_tensor
     )

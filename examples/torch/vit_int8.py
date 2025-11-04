@@ -855,6 +855,7 @@ def test_calibrate_vit():
     # vit.vit.ln_f.disable_fakequant()
 
     if False:
+        # Test Quant Precision
         total = batch_size
         top1_match = 0
         top1_acc = 0
@@ -885,7 +886,7 @@ def test_calibrate_vit():
         llvm_mod = allo.frontend.from_pytorch_hls(
             vit,
             example_inputs=[example_inputs[:2]],
-            leaf_modules=[ViTGetFirstToken, ViTTokenExpand, QLinear, QConv2d],
+            leaf_modules=[ViTGetFirstToken, ViTTokenExpand, QLinear, QConv2d, IntLayerNorm, IntSoftmax, IntGELU, QAdd, QMatMul],
             verbose=False,
         )
 

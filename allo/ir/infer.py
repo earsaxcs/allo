@@ -905,13 +905,13 @@ class TypeInferer(ASTVisitor):
             node.shape = new_args[0].shape
             node.dtype = new_args[0].dtype
             return node
-        if op_name in {"matmul", "bmm", "linear", "conv2d", "sumpool", "maxpool"}:
+        if op_name in {"matmul", "bmm", "linear", "conv2d", "sumpool", "maxpool", "qconv2d", "qlinear"}:
             argAshape = new_args[0].shape
             argBshape = new_args[1].shape
-            if op_name == "conv2d":
+            if op_name in {"conv2d", "qconv2d"}:
                 convStride = [int(x.value) for x in new_args[2].elts]
             node.dtype = new_args[0].dtype
-            if op_name == "conv2d":
+            if op_name in {"conv2d", "qconv2d"}:
                 node.shape = (
                     argAshape[0],
                     argBshape[0],
@@ -941,7 +941,7 @@ class TypeInferer(ASTVisitor):
                     argAshape[0] == argBshape[0]
                 ), f"The first dimension of the first input and the first dimension of the second input must be the same, got {argAshape[0]} and {argBshape[0]}"
                 node.shape = (argAshape[0], argAshape[1], argBshape[2])
-            elif op_name == "linear":
+            elif op_name in {"linear", "qlinear"}:
                 # The weight parameter (i.e., `new_args[1]`) should be 2D, see:
                 # https://pytorch.org/docs/stable/generated/torch.nn.Linear.html
                 assert len(argBshape) == 2
