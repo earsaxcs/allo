@@ -10,6 +10,7 @@
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassRegistry.h"
 
+#include "allo/Dialect/VivadoDialect.h"
 #include "allo/Dialect/AlloOps.h"
 
 namespace mlir {
@@ -21,12 +22,14 @@ std::unique_ptr<OperationPass<ModuleOp>> createFixedPointToIntegerPass();
 std::unique_ptr<OperationPass<ModuleOp>> createLowerCompositeTypePass();
 std::unique_ptr<OperationPass<ModuleOp>> createLowerBitOpsPass();
 std::unique_ptr<OperationPass<ModuleOp>> createLowerPrintOpsPass();
+std::unique_ptr<OperationPass<ModuleOp>> createLowerAlloQuantToVivadoPass();
 
 bool applyAlloToLLVMLoweringPass(ModuleOp &module, MLIRContext &context);
 bool applyFixedPointToInteger(ModuleOp &module);
 bool applyLowerCompositeType(ModuleOp &module);
 bool applyLowerBitOps(ModuleOp &module);
 bool applyLowerPrintOps(ModuleOp &module);
+bool applyLowerAlloQuantToVivado(ModuleOp &module, MLIRContext &context);
 
 /// Registers all Allo conversion passes
 void registerAlloConversionPasses();

@@ -166,7 +166,8 @@ def _process_quantized_params(gm, global_vars):
             print(f"  rshift values (first 5): {rshift.flat[error_indices[:5]]}")
             print(f"  coe_fixed values (first 5): {coe_fixed.flat[error_indices[:5]]}")
         
-        # 此处均以i32返回
+        # 此处均以i32/i64返回
+        # 由外部负责转换到需要的类型
         return sign, coe_fixed, rshift
     
     # 定义需要处理的量化模块类型
@@ -314,6 +315,8 @@ def _process_quantized_params(gm, global_vars):
         
         # ========== 特殊处理：IntGELU ==========
         if isinstance(module, IntGELU):
+            # IntGELU 需要 4 组 scale: input_scale, gelu_scale, fused_scale, output_scale
+            # (input_scale, output_scale 和 fused_scale 已经在通用部分处理)
             if hasattr(module, 'gelu_scale'):
                 scale_data = module.gelu_scale.data.detach().numpy()
                 sign, coe, rshift = float_to_fixed_point(scale_data, fixed_bits=16)
@@ -621,6 +624,8 @@ class TorchBuilder:
             
             # ========== 特殊处理：IntGELU ==========
             if isinstance(module, IntGELU):
+                # IntGELU 需要 4 组 scale: input_scale, gelu_scale, fused_scale, output_scale
+                # (input_scale 和 output_scale 已经在通用部分声明)
                 if hasattr(module, 'gelu_scale'):
                     scale_shape = module.gelu_scale.shape
                     if len(scale_shape) == 0:
@@ -632,7 +637,7 @@ class TorchBuilder:
                         declarations.append(f"    {var_prefix}_gelu_scale_sign: int8[{shape_str}] = g_{var_prefix}_gelu_scale_sign")
                         declarations.append(f"    {var_prefix}_gelu_scale_coe: uint16[{shape_str}] = g_{var_prefix}_gelu_scale_coe")
                         declarations.append(f"    {var_prefix}_gelu_scale_rshift: int16[{shape_str}] = g_{var_prefix}_gelu_scale_rshift")
-        
+
         # 返回所有声明，每个声明一行
         return '\n'.join(declarations) + '\n' if declarations else ''
 
@@ -1098,21 +1103,28 @@ class TorchBuilder:
         weight_scale_coe = get_var_name(target_name + "_weight_scale_coe")
         weight_scale_rshift = get_var_name(target_name + "_weight_scale_rshift")
         
-        # bias_scale 的拆分参数
-        bias_scale_sign = get_var_name(target_name + "_bias_scale_sign")
-        bias_scale_coe = get_var_name(target_name + "_bias_scale_coe")
-        bias_scale_rshift = get_var_name(target_name + "_bias_scale_rshift")
-        
         params = [
             inp, weight, stride,
             fused_scale_sign, fused_scale_coe, fused_scale_rshift,
             input_scale_sign, input_scale_coe, input_scale_rshift,
             output_scale_sign, output_scale_coe, output_scale_rshift,
-            weight_scale_sign, weight_scale_coe, weight_scale_rshift,
-            bias_scale_sign, bias_scale_coe, bias_scale_rshift
+            weight_scale_sign, weight_scale_coe, weight_scale_rshift
         ]
         
         kwargs = []
+        
+        if module.bias is not None:
+            # bias_scale 的拆分参数
+            bias_scale_sign = get_var_name(target_name + "_bias_scale_sign")
+            bias_scale_coe = get_var_name(target_name + "_bias_scale_coe")
+            bias_scale_rshift = get_var_name(target_name + "_bias_scale_rshift")
+            kwargs.append(f"bscl_sign={bias_scale_sign}")
+            kwargs.append(f"bscl_coe={bias_scale_coe}")
+            kwargs.append(f"bscl_rshift={bias_scale_rshift}")
+            
+            bias = get_var_name(target_name + "_bias_int")
+            kwargs.append(f"bias={bias}")
+
         if hasattr(module, 'input_zero') and module.input_zero is not None:
             input_zero = get_var_name(target_name + "_input_zero")
             kwargs.append(f"izr={input_zero}")
@@ -1120,10 +1132,6 @@ class TorchBuilder:
         if hasattr(module, 'output_zero') and module.output_zero is not None:
             output_zero = get_var_name(target_name + "_output_zero")
             kwargs.append(f"ozr={output_zero}")
-        
-        if module.bias is not None:
-            bias = get_var_name(target_name + "_bias_int")
-            kwargs.append(f"bias={bias}")
         
         # 组装参数字符串
         params_str = ', '.join(str(p) for p in params)
@@ -1158,21 +1166,28 @@ class TorchBuilder:
         weight_scale_coe = get_var_name(target_name + "_weight_scale_coe")
         weight_scale_rshift = get_var_name(target_name + "_weight_scale_rshift")
         
-        # bias_scale 的拆分参数
-        bias_scale_sign = get_var_name(target_name + "_bias_scale_sign")
-        bias_scale_coe = get_var_name(target_name + "_bias_scale_coe")
-        bias_scale_rshift = get_var_name(target_name + "_bias_scale_rshift")
-        
         params = [
             inp, weight,
             fused_scale_sign, fused_scale_coe, fused_scale_rshift,
             input_scale_sign, input_scale_coe, input_scale_rshift,
             output_scale_sign, output_scale_coe, output_scale_rshift,
-            weight_scale_sign, weight_scale_coe, weight_scale_rshift,
-            bias_scale_sign, bias_scale_coe, bias_scale_rshift
+            weight_scale_sign, weight_scale_coe, weight_scale_rshift
         ]
         
         kwargs = []
+        
+        if module.bias is not None:
+            # bias_scale 的拆分参数
+            bias_scale_sign = get_var_name(target_name + "_bias_scale_sign")
+            bias_scale_coe = get_var_name(target_name + "_bias_scale_coe")
+            bias_scale_rshift = get_var_name(target_name + "_bias_scale_rshift")
+            kwargs.append(f"bscl_sign={bias_scale_sign}")
+            kwargs.append(f"bscl_coe={bias_scale_coe}")
+            kwargs.append(f"bscl_rshift={bias_scale_rshift}")
+            
+            bias = get_var_name(target_name + "_bias_int")
+            kwargs.append(f"bias={bias}")
+
         if hasattr(module, 'input_zero') and module.input_zero is not None:
             input_zero = get_var_name(target_name + "_input_zero")
             kwargs.append(f"izr={input_zero}")
@@ -1180,10 +1195,6 @@ class TorchBuilder:
         if hasattr(module, 'output_zero') and module.output_zero is not None:
             output_zero = get_var_name(target_name + "_output_zero")
             kwargs.append(f"ozr={output_zero}")
-        
-        if module.bias is not None:
-            bias = get_var_name(target_name + "_bias_int")
-            kwargs.append(f"bias={bias}")
         
         # 组装参数字符串
         params_str = ', '.join(str(p) for p in params)
@@ -1212,13 +1223,28 @@ class TorchBuilder:
         o_scale_coe = get_var_name(target_name + "_o_scale_coe")
         o_scale_rshift = get_var_name(target_name + "_o_scale_rshift")
         
+        params = [
+            inp1, inp2,
+            x_scale_sign, x_scale_coe, x_scale_rshift,
+            y_scale_sign, y_scale_coe, y_scale_rshift,
+            o_scale_sign, o_scale_coe, o_scale_rshift
+        ]
+        
+        kwargs = []
         # zero points
         if hasattr(module, 'x_zero') and module.x_zero is not None:
             x_zero = get_var_name(target_name + "_x_zero")
             y_zero = get_var_name(target_name + "_y_zero")
             o_zero = get_var_name(target_name + "_o_zero")
+            kwargs.append(f"x_zero={x_zero}")
+            kwargs.append(f"y_zero={y_zero}")
+            kwargs.append(f"o_zero={o_zero}")
     
-        return f"{node.name} = dsl.qadd({inp1}, {inp2}, {x_scale_sign}, {x_scale_coe}, {x_scale_rshift}, {y_scale_sign}, {y_scale_coe}, {y_scale_rshift}, {o_scale_sign}, {o_scale_coe}, {o_scale_rshift})"
+        params_str = ', '.join(str(p) for p in params)
+        if kwargs:
+            params_str += ', ' + ', '.join(kwargs)
+            
+        return f"{node.name} = dsl.qadd({params_str})"
     
     def build_IntSoftmax(self, node):
         """构建 IntSoftmax 的 DSL 调用"""
@@ -1239,19 +1265,35 @@ class TorchBuilder:
         softmax_scale_coe = get_var_name(target_name + "_softmax_scale_coe")
         softmax_scale_rshift = get_var_name(target_name + "_softmax_scale_rshift")
         
-        # 如果有 fused_scale
+        params = [
+            inp,
+            input_scale_sign, input_scale_coe, input_scale_rshift,
+            softmax_scale_sign, softmax_scale_coe, softmax_scale_rshift,
+            output_scale_sign, output_scale_coe, output_scale_rshift
+        ]
+        
+        kwargs = []
         if hasattr(module, 'fused_scale'):
             fused_scale_sign = get_var_name(target_name + "_fused_scale_sign")
             fused_scale_coe = get_var_name(target_name + "_fused_scale_coe")
             fused_scale_rshift = get_var_name(target_name + "_fused_scale_rshift")
+            kwargs.append(f"fused_scale_sign={fused_scale_sign}")
+            kwargs.append(f"fused_scale_coe={fused_scale_coe}")
+            kwargs.append(f"fused_scale_rshift={fused_scale_rshift}")
         
         # zero points (如果是非对称量化)
         if hasattr(module, 'input_zero') and module.input_zero is not None:
             input_zero = get_var_name(target_name + "_input_zero")
             output_zero = get_var_name(target_name + "_output_zero")
+            kwargs.append(f"input_zero={input_zero}")
+            kwargs.append(f"output_zero={output_zero}")
         
         # 构建 DSL 调用
-        return f"{node.name} = dsl.int_softmax({inp}, {input_scale_sign}, {input_scale_coe}, {input_scale_rshift}, {softmax_scale_sign}, {softmax_scale_coe}, {softmax_scale_rshift}, {output_scale_sign}, {output_scale_coe}, {output_scale_rshift})"
+        params_str = ', '.join(str(p) for p in params)
+        if kwargs:
+            params_str += ', ' + ', '.join(kwargs)
+            
+        return f"{node.name} = dsl.int_softmax({params_str})"
     
     def build_IntLayerNorm(self, node):
         """构建 IntLayerNorm 的 DSL 调用"""
@@ -1284,13 +1326,31 @@ class TorchBuilder:
             fused_scale_sign = get_var_name(target_name + "_fused_scale_sign")
             fused_scale_coe = get_var_name(target_name + "_fused_scale_coe")
             fused_scale_rshift = get_var_name(target_name + "_fused_scale_rshift")
+        else:
+            raise ValueError("IntLayerNorm requires fused_scale")
+            
+        params = [
+            inp, bias_int,
+            input_scale_sign, input_scale_coe, input_scale_rshift,
+            layernorm_scale_sign, layernorm_scale_coe, layernorm_scale_rshift,
+            bias_scale_sign, bias_scale_coe, bias_scale_rshift,
+            fused_scale_sign, fused_scale_coe, fused_scale_rshift,
+            output_scale_sign, output_scale_coe, output_scale_rshift
+        ]
         
+        kwargs = []
         # zero points
         if hasattr(module, 'input_zero') and module.input_zero is not None:
             input_zero = get_var_name(target_name + "_input_zero")
             output_zero = get_var_name(target_name + "_output_zero")
+            kwargs.append(f"input_zero={input_zero}")
+            kwargs.append(f"output_zero={output_zero}")
         
-        return f"{node.name} = dsl.int_layernorm({inp}, {bias_int}, {layernorm_scale_sign}, {layernorm_scale_coe}, {layernorm_scale_rshift}, {bias_scale_sign}, {bias_scale_coe}, {bias_scale_rshift}, {fused_scale_sign}, {fused_scale_coe}, {fused_scale_rshift})"
+        params_str = ', '.join(str(p) for p in params)
+        if kwargs:
+            params_str += ', ' + ', '.join(kwargs)
+        
+        return f"{node.name} = dsl.int_layernorm({params_str})"
     
     def build_IntGELU(self, node):
         """构建 IntGELU 的 DSL 调用"""
@@ -1298,25 +1358,44 @@ class TorchBuilder:
         target_name = node.target.replace(".", "_")
         inp = get_var_name(node.args[0])
         
-        # 获取 scale 参数
+        # 获取 4 组 scale 参数: input, gelu, fused, output
         input_scale_sign = get_var_name(target_name + "_input_scale_sign")
         input_scale_coe = get_var_name(target_name + "_input_scale_coe")
         input_scale_rshift = get_var_name(target_name + "_input_scale_rshift")
-        
-        output_scale_sign = get_var_name(target_name + "_output_scale_sign")
-        output_scale_coe = get_var_name(target_name + "_output_scale_coe")
-        output_scale_rshift = get_var_name(target_name + "_output_scale_rshift")
         
         gelu_scale_sign = get_var_name(target_name + "_gelu_scale_sign")
         gelu_scale_coe = get_var_name(target_name + "_gelu_scale_coe")
         gelu_scale_rshift = get_var_name(target_name + "_gelu_scale_rshift")
         
-        # zero points
+        fused_scale_sign = get_var_name(target_name + "_fused_scale_sign")
+        fused_scale_coe = get_var_name(target_name + "_fused_scale_coe")
+        fused_scale_rshift = get_var_name(target_name + "_fused_scale_rshift")
+        
+        output_scale_sign = get_var_name(target_name + "_output_scale_sign")
+        output_scale_coe = get_var_name(target_name + "_output_scale_coe")
+        output_scale_rshift = get_var_name(target_name + "_output_scale_rshift")
+        
+        params = [
+            inp,
+            input_scale_sign, input_scale_coe, input_scale_rshift,
+            gelu_scale_sign, gelu_scale_coe, gelu_scale_rshift,
+            fused_scale_sign, fused_scale_coe, fused_scale_rshift,
+            output_scale_sign, output_scale_coe, output_scale_rshift
+        ]
+        
+        kwargs = []
+        # zero points (可选)
         if hasattr(module, 'input_zero') and module.input_zero is not None:
             input_zero = get_var_name(target_name + "_input_zero")
             output_zero = get_var_name(target_name + "_output_zero")
-        
-        return f"{node.name} = dsl.int_gelu({inp}, {gelu_scale_sign}, {gelu_scale_coe}, {gelu_scale_rshift}, {output_scale_sign}, {output_scale_coe}, {output_scale_rshift})"
+            kwargs.append(f"input_zero={input_zero}")
+            kwargs.append(f"output_zero={output_zero}")
+            
+        params_str = ', '.join(str(p) for p in params)
+        if kwargs:
+            params_str += ', ' + ', '.join(kwargs)
+            
+        return f"{node.name} = dsl.int_gelu({params_str})"
     def build_QMatMul(self, node):
         """构建 QMatMul 的 DSL 调用"""
         module = self.get_module(node.target)
@@ -1337,13 +1416,28 @@ class TorchBuilder:
         o_scale_coe = get_var_name(target_name + "_o_scale_coe")
         o_scale_rshift = get_var_name(target_name + "_o_scale_rshift")
         
+        params = [
+            inp1, inp2,
+            x_scale_sign, x_scale_coe, x_scale_rshift,
+            y_scale_sign, y_scale_coe, y_scale_rshift,
+            o_scale_sign, o_scale_coe, o_scale_rshift
+        ]
+        
+        kwargs = []
         # zero points
         if hasattr(module, 'x_zero') and module.x_zero is not None:
             x_zero = get_var_name(target_name + "_x_zero")
             y_zero = get_var_name(target_name + "_y_zero")
             o_zero = get_var_name(target_name + "_o_zero")
+            kwargs.append(f"x_zero={x_zero}")
+            kwargs.append(f"y_zero={y_zero}")
+            kwargs.append(f"o_zero={o_zero}")
         
-        return f"{node.name} = dsl.qmatmul({inp1}, {inp2}, {x_scale_sign}, {x_scale_coe}, {x_scale_rshift}, {y_scale_sign}, {y_scale_coe}, {y_scale_rshift}, {o_scale_sign}, {o_scale_coe}, {o_scale_rshift})"
+        params_str = ', '.join(str(p) for p in params)
+        if kwargs:
+            params_str += ', ' + ', '.join(kwargs)
+            
+        return f"{node.name} = dsl.qmatmul({params_str})"
 
     def build_QMatMulIsqrtD(self, node):
         """构建 QMatMulIsqrtD 的 DSL 调用 (带 sqrt(d) 归一化的 MatMul)"""
@@ -1365,4 +1459,24 @@ class TorchBuilder:
         o_scale_coe = get_var_name(target_name + "_o_scale_coe")
         o_scale_rshift = get_var_name(target_name + "_o_scale_rshift")
         
-        return f"{node.name} = dsl.qmatmul_isqrtd({inp1}, {inp2}, {x_scale_sign}, {x_scale_coe}, {x_scale_rshift}, {y_scale_sign}, {y_scale_coe}, {y_scale_rshift}, {o_scale_sign}, {o_scale_coe}, {o_scale_rshift})"
+        params = [
+            inp1, inp2,
+            x_scale_sign, x_scale_coe, x_scale_rshift,
+            y_scale_sign, y_scale_coe, y_scale_rshift,
+            o_scale_sign, o_scale_coe, o_scale_rshift
+        ]
+        
+        kwargs = []
+        if hasattr(module, 'x_zero') and module.x_zero is not None:
+            x_zero = get_var_name(target_name + "_x_zero")
+            y_zero = get_var_name(target_name + "_y_zero")
+            o_zero = get_var_name(target_name + "_o_zero")
+            kwargs.append(f"x_zero={x_zero}")
+            kwargs.append(f"y_zero={y_zero}")
+            kwargs.append(f"o_zero={o_zero}")
+        
+        params_str = ', '.join(str(p) for p in params)
+        if kwargs:
+            params_str += ', ' + ', '.join(kwargs)
+        
+        return f"{node.name} = dsl.qmatmul_isqrtd({params_str})"

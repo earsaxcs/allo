@@ -9,6 +9,7 @@
 include "allo/Dialect/AlloDialect.td"
 include "allo/Dialect/AlloTypes.td"
 include "allo/Dialect/AlloAttrs.td"
+include "allo/Dialect/AlloQuantOps.td"
 
 include "mlir/IR/EnumAttr.td"
 include "mlir/IR/BuiltinTypes.td"

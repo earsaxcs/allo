@@ -26,3 +26,15 @@ add_public_tablegen_target(MLIRAlloEnumsIncGen)
 
 add_mlir_doc(AlloDialect AlloDialect Allo/ -gen-dialect-doc)
 add_mlir_doc(AlloOps AlloOps Allo/ -gen-op-doc)
+
+# Vivado dialect
+set(LLVM_TARGET_DEFINITIONS VivadoQuantOps.td)
+mlir_tablegen(VivadoOps.h.inc -gen-op-decls)
+mlir_tablegen(VivadoOps.cpp.inc -gen-op-defs)
+mlir_tablegen(VivadoDialect.h.inc -gen-dialect-decls -dialect=vivado)
+mlir_tablegen(VivadoDialect.cpp.inc -gen-dialect-defs -dialect=vivado)
+add_public_tablegen_target(MLIRVivadoOpsIncGen)
+add_dependencies(mlir-headers MLIRVivadoOpsIncGen)
+
+add_mlir_doc(VivadoDialect VivadoDialect Vivado/ -gen-dialect-doc)
+add_mlir_doc(VivadoQuantOps VivadoOps Vivado/ -gen-op-doc)

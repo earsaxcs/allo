@@ -63,6 +63,7 @@ from .passes import (
 )
 from .backend.llvm import LLVMModule
 from .backend.hls import HLSModule
+from .backend.vivado import VivadoModule
 from .library import KERNEL2SCHEDULE
 
 
@@ -891,6 +892,17 @@ class Schedule:
                 self.module,
                 top_func_name=self.top_func_name,
                 platform=platform,
+                mode=mode,
+                project=project,
+                ext_libs=self.ext_libs,
+                configs=configs,
+                func_args=self.func_args,
+                wrap_io=wrap_io,
+            )
+        elif target in {"vivado", "vivado_accel", "pynq", "verilog", "chisel", "spinialhdl"}:
+            return VivadoModule(
+                self.module,
+                top_func_name=self.top_func_name,
                 mode=mode,
                 project=project,
                 ext_libs=self.ext_libs,

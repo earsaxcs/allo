@@ -4,6 +4,7 @@
 add_mlir_dialect_library(MLIRAllo
         AlloDialect.cpp
         AlloOps.cpp
+        VivadoDialect.cpp
 
         ADDITIONAL_HEADER_DIRS
         ${PROJECT_SOURCE_DIR}/include/allo
@@ -13,6 +14,7 @@ add_mlir_dialect_library(MLIRAllo
         MLIRAlloTypesIncGen
         MLIRAlloAttrsIncGen
         MLIRAlloEnumsIncGen
+        MLIRVivadoOpsIncGen
 
 	LINK_LIBS PUBLIC
 	MLIRIR

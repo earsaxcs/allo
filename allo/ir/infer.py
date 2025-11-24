@@ -905,7 +905,16 @@ class TypeInferer(ASTVisitor):
             node.shape = new_args[0].shape
             node.dtype = new_args[0].dtype
             return node
-        if op_name in {"matmul", "bmm", "linear", "conv2d", "sumpool", "maxpool", "qconv2d", "qlinear"}:
+        
+        if op_name == "qadd":
+            assert (
+                new_args[0].shape == new_args[1].shape
+            ), f"Quantized addition requires the same shape, got {new_args[0].shape} and {new_args[1].shape}"
+            node.shape = new_args[0].shape
+            node.dtype = new_args[0].dtype
+            return node
+
+        if op_name in {"matmul", "bmm", "linear", "conv2d", "sumpool", "maxpool", "qconv2d", "qlinear", "qmatmul", "qmatmul_isqrtd"}:
             argAshape = new_args[0].shape
             argBshape = new_args[1].shape
             if op_name in {"conv2d", "qconv2d"}:
@@ -925,7 +934,7 @@ class TypeInferer(ASTVisitor):
                     argAshape[2] - argBshape[0] + 1,
                     argAshape[3] - argBshape[1] + 1,
                 )
-            elif op_name == "matmul":
+            elif op_name in {"matmul", "qmatmul", "qmatmul_isqrtd"}:
                 assert (
                     argAshape[-1] == argBshape[-2]
                 ), f"The last dimension of the first input and the second last dimension of the second input must be the same, got {argAshape[1]} and {argBshape[0]}"
@@ -977,7 +986,7 @@ class TypeInferer(ASTVisitor):
             node.shape = axes
             node.dtype = new_args[0].dtype
             return node
-        if op_name in {"layernorm", "gelu", "tril"}:
+        if op_name in {"layernorm", "gelu", "tril", "int_layernorm", "int_gelu", "int_softmax"}:
             node.shape = new_args[0].shape
             node.dtype = new_args[0].dtype
             return node

@@ -33,4 +33,24 @@ def LowerPrintOps : Pass<"lower-print-ops", "ModuleOp"> {
   let constructor = "mlir::allo::createLowerPrintOpsPass()";
 }
 
+def LowerAlloQuantToVivado : Pass<"lower-allo-quant-to-vivado", "ModuleOp"> {
+  let summary = "Lower Allo quantized ops to Vivado backend ops";
+  let description = [{
+    This pass lowers platform-agnostic Allo quantization operations to 
+    Vivado/PYNQ backend-specific operations. It performs a simple 1:1 mapping
+    while preserving all mathematical semantics and adding default backend
+    attributes for hardware implementation.
+    
+    Lowering patterns:
+    - allo.qmatmul -> vivado.qmatmul (with default tiling and buffer allocation)
+    - allo.qlinear -> vivado.qlinear (with bias fusion support)
+    - allo.qadd -> vivado.qadd (with fusion hints)
+    - allo.int_gelu -> vivado.int_gelu (with LUT implementation)
+    - allo.int_softmax -> vivado.int_softmax (with LUT implementation)
+    - allo.int_layernorm -> vivado.int_layernorm (with approx rsqrt)
+  }];
+  let constructor = "mlir::allo::createLowerAlloQuantToVivadoPass()";
+  let dependentDialects = ["mlir::allo::vivado::VivadoDialect"];
+}
+
 #endif // ALLO_MLIR_PASSES

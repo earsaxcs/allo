@@ -2,4 +2,4 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from .pytorch import from_pytorch
-from .pytorch_hls import from_pytorch_hls
+from .pytorch_vivado import from_pytorch_vivado

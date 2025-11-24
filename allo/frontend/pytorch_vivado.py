@@ -17,7 +17,7 @@ from ..customize import customize
 from .pytorch import TorchBuilder, _process_quantized_params
 
 
-def from_pytorch_hls(
+def from_pytorch_vivado(
     model,
     example_inputs,
     leaf_modules=None,
@@ -73,8 +73,9 @@ def from_pytorch_hls(
     s = customize(
         code, verbose=verbose, global_vars=global_vars, enable_tensor=enable_tensor
     )
-    mod = s.build(target='vhls')
-    # print(mod)
+    print(s.module)
+    mod = s.build(target='vivado')
+    print(mod)
     if verbose:
         print(s.module)
     return mod

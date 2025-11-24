@@ -883,7 +883,7 @@ def test_calibrate_vit():
         print(f"max diff: {max_diff}")
         # np.testing.assert_allclose(res.detach().numpy(), golden.detach().numpy(), atol=1e-2)
     else:
-        llvm_mod = allo.frontend.from_pytorch_hls(
+        llvm_mod = allo.frontend.from_pytorch_vivado(
             vit,
             example_inputs=[example_inputs[:2]],
             leaf_modules=[ViTGetFirstToken, ViTTokenExpand, QLinear, QConv2d, IntLayerNorm, IntSoftmax, IntGELU, QAdd, QMatMul],

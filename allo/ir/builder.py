@@ -32,6 +32,7 @@ from .._mlir.ir import (
     ArrayAttr,
     Attribute,
     OpResultList,
+    OpResult,
 )
 from .._mlir.ir import Type as MLIRType
 from .._mlir.dialects import (
@@ -62,6 +63,7 @@ from .symbol_resolver import ASTResolver
 from ..backend.ip import IPModule
 from ..utils import get_mlir_dtype_from_str
 from ..logging import print_error_message
+from . import quant_ops_builder
 
 
 class ASTBuilder(ASTVisitor):
@@ -1905,7 +1907,9 @@ class ASTTransformer(ASTBuilder):
                 stream_type = allo_d.StreamType.get(stream.build(), depth=stream.depth)
                 stream_op = allo_d.StreamConstructOp(stream_type, ip=ctx.get_ip())
                 return stream_op
-            if isinstance(new_args[0].result, OpResultList):
+            if isinstance(new_args[0], OpResult):
+                arg_type = new_args[0].type
+            elif isinstance(new_args[0].result, OpResultList):
                 arg_type = new_args[0].result[0].type
             else:
                 arg_type = new_args[0].result.type
@@ -1944,6 +1948,16 @@ class ASTTransformer(ASTBuilder):
                 "linear",
                 "view",
                 "concat",
+                # Quantized ops (treated like library calls for now)
+                "qmatmul",
+                "qmatmul_isqrtd",
+                "qconv2d",
+                "qlinear",
+                "qadd",
+                # Integer-activation/normalization helpers
+                "int_gelu",
+                "int_softmax",
+                "int_layernorm",
             }:
                 return ASTTransformer.build_library_op(
                     ctx, node=node, attr=fn_name, new_args=new_args
@@ -1969,7 +1983,7 @@ class ASTTransformer(ASTBuilder):
 
         # User-defined subfunction
         func = ctx.global_vars[obj_name]
-        new_args = [stmt.result for stmt in build_stmts(ctx, node.args)]
+        new_args = [stmt.result if hasattr(stmt, "result") else stmt for stmt in build_stmts(ctx, node.args)]
         func_name = obj_name if ctx.func_id is None else f"{obj_name}_{ctx.func_id}"
         if func_name not in ctx.global_vars or not isinstance(
             ctx.global_vars[func_name], func_d.FuncOp
@@ -2014,6 +2028,20 @@ class ASTTransformer(ASTBuilder):
         shape = shape if shape is not None else node.shape
         with ip:
             alloc_op = ASTTransformer.build_array(ctx, dtype, shape)
+            # Handle quantized ops using destination-passing style: pre-allocate output
+            # buffer and pass it to the operation. Operations write to the buffer
+            # and have no return values.
+            if attr in {
+                "qmatmul",
+                "qmatmul_isqrtd",
+                "qconv2d",
+                "qlinear",
+                "qadd",
+                "int_gelu",
+                "int_softmax",
+                "int_layernorm",
+            }:
+                return quant_ops_builder.build_quant_placeholder(ctx, node, attr, new_args, alloc_op.result, transformer_cls=ASTTransformer)
             if attr == "concat":
                 axis = node.keywords[0].value.value
                 strides = [1] * len(shape)
@@ -2240,7 +2268,7 @@ class ASTTransformer(ASTBuilder):
             elif attr == "transpose":
                 with ctx.get_ip():
                     op = linalg_d.transpose(
-                        input=new_args[0].result,
+                        input=new_args[0].result if hasattr(new_args[0], "result") else new_args[0],
                         outs=[result_tensor.result],
                         permutation=tuple(x.val for x in new_args[1]),
                     )
@@ -2263,7 +2291,7 @@ class ASTTransformer(ASTBuilder):
                 )
                 shaped_type = ASTTransformer.build_shaped_type(ctx, dtype, shape)
                 op = view_op(
-                    source=new_args[0].result,
+                    source=new_args[0].result if hasattr(new_args[0], "result") else new_args[0],
                     result=shaped_type,
                     shape=shape_value.result,
                     ip=ctx.get_ip(),
@@ -2372,7 +2400,10 @@ class ASTTransformer(ASTBuilder):
         ret = ASTTransformer.build_cast_op(
             ctx, ret, node.dtype, ctx.top_func_tree.dtype, ctx.top_func_tree.shape
         )
-        res = ret.result if not isinstance(ret.result, OpResultList) else ret.result[0]
+        if not hasattr(ret, "result"):
+            res = ret
+        else:
+            res = ret.result if not isinstance(ret.result, OpResultList) else ret.result[0]
         if (
             isinstance(res.type, MemRefType)
             and res.type.layout != ctx.top_func.type.results[0].layout

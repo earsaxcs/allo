@@ -215,23 +215,37 @@ def qconv2d(inp, filter, _stride, fscl_sign, fscl_coe, fscl_rshift, iscl_sign, i
         return np.einsum("fcij,nchwij->nfhw", filter, sub_matrices)
     return np.einsum("fcij,nchwij->nfhw", filter, sub_matrices) + np.broadcast_to(bias, shape=sub_matrices.shape[:1] + sub_matrices.shape[2:4] + bias.shape).transpose(0, 3, 1, 2)
 
-def int_gelu(x, gelu_scale_sign, gelu_scale_coe, gelu_scale_rshift, 
+def int_gelu(x, input_scale_sign, input_scale_coe, input_scale_rshift,
+          gelu_scale_sign, gelu_scale_coe, gelu_scale_rshift,
+          fused_scale_sign, fused_scale_coe, fused_scale_rshift,
           output_scale_sign, output_scale_coe, output_scale_rshift, 
           input_zero=None, output_zero=None, name=None):
-    """IntGELU 的 DSL 包装器 - 接受定点化的 scale 参数"""
+    """IntGELU 的 DSL 包装器 - 接受定点化的 scale 参数
+    Args:
+        x: 输入张量
+        input_scale: 输入量化scale (sign, coe, rshift)
+        gelu_scale: GELU内部scale (sign, coe, rshift)
+        fused_scale: 融合scale = gelu_scale / output_scale (sign, coe, rshift)
+        output_scale: 输出量化scale (sign, coe, rshift)
+        input_zero: 输入零点 (可选)
+        output_zero: 输出零点 (可选)
+    """
     pass
 
 def int_softmax(x, input_scale_sign, input_scale_coe, input_scale_rshift,
              softmax_scale_sign, softmax_scale_coe, softmax_scale_rshift,
              output_scale_sign, output_scale_coe, output_scale_rshift,
+             fused_scale_sign=None, fused_scale_coe=None, fused_scale_rshift=None,
              input_zero=None, output_zero=None, name=None):
     """IntSoftmax 的 DSL 包装器 - 接受定点化的 scale 参数"""
     pass
 
 def int_layernorm(x, bias_int, 
+               input_scale_sign, input_scale_coe, input_scale_rshift,
                layernorm_scale_sign, layernorm_scale_coe, layernorm_scale_rshift,
                bias_scale_sign, bias_scale_coe, bias_scale_rshift,
                fused_scale_sign, fused_scale_coe, fused_scale_rshift,
+               output_scale_sign, output_scale_coe, output_scale_rshift,
                input_zero=None, output_zero=None, eps: float = 1e-5):
     """IntLayerNorm 的 DSL 包装器 - 接受定点化的 scale 参数"""
     pass
