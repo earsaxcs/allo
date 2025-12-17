@@ -12,6 +12,7 @@
 #include "allo-c/Dialect/Registration.h"
 #include "allo-c/Translation/EmitIntelHLS.h"
 #include "allo-c/Translation/EmitTapaHLS.h"
+#include "allo-c/Translation/EmitVivadoC.h"
 #include "allo-c/Translation/EmitVivadoHLS.h"
 #include "allo/Conversion/Passes.h"
 #include "allo/Dialect/AlloDialect.h"
@@ -104,6 +105,13 @@ static bool emitTapaHls(MlirModule &mod, py::object fileObject) {
   py::gil_scoped_release();
   return mlirLogicalResultIsSuccess(
       mlirEmitTapaHls(mod, accum.getCallback(), accum.getUserData()));
+}
+
+static bool emitVivadoC(MlirModule &mod, py::object fileObject) {
+  PyFileAccumulator accum(fileObject, false);
+  py::gil_scoped_release();
+  return mlirLogicalResultIsSuccess(
+      mlirEmitVivadoC(mod, accum.getCallback(), accum.getUserData()));
 }
 
 //===----------------------------------------------------------------------===//
@@ -257,6 +265,7 @@ PYBIND11_MODULE(_allo, m) {
   allo_m.def("emit_vhls", &emitVivadoHls);
   allo_m.def("emit_ihls", &emitIntelHls);
   allo_m.def("emit_thls", &emitTapaHls);
+  allo_m.def("emit_vivado_c", &emitVivadoC);
 
   // LLVM backend APIs.
   allo_m.def("lower_allo_to_llvm", &lowerAlloToLLVM);

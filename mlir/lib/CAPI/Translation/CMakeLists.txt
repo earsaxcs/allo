@@ -3,6 +3,7 @@
 
 add_mlir_public_c_api_library(MLIRAlloCAPIEmitHLSCpp
   EmitVivadoHLS.cpp
+  EmitVivadoC.cpp
   EmitIntelHLS.cpp
   EmitTapaHLS.cpp
 

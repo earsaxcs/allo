@@ -12,6 +12,8 @@ add_mlir_library(MLIRAlloPasses
     DataPlacement.cpp
     UnifyKernels.cpp
     MergeSubviewAndCopy.cpp
+    PYNQHoistBufferAlloc.cpp
+    PYNQBufferAllocation.cpp
 
     ADDITIONAL_HEADER_DIRS
     ${PROJECT_SOURCE_DIR}/include/allo
@@ -20,6 +22,8 @@ add_mlir_library(MLIRAlloPasses
     MLIRAlloOpsIncGen
     MLIRAlloTypesIncGen
     MLIRAlloPassesIncGen
+    MLIRPYNQOpsIncGen
+    MLIRPYNQTypesIncGen
 
     LINK_COMPONENTS
     Core

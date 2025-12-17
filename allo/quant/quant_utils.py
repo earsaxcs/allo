@@ -4,6 +4,9 @@ import torch
 import torch.nn as nn
 import math
 
+# Debug switch for printing quantization messages
+DEBUG_QUANT = False
+
 def max_min_quantize_params(
     input_tensor: torch.Tensor | None,
     bitwidth: int = 8,
@@ -42,7 +45,8 @@ def max_min_quantize_params(
     if quant_mode not in ['sym', 'asym']:
         raise ValueError("quant_mode must be 'sym' or 'asym'")
     if not 2 <= bitwidth <= 32: # Arbitrary but reasonable bitwidth range
-         print(f"Warning: Using bitwidth {bitwidth} which is outside the typical range (2-32).")
+        if DEBUG_QUANT:
+            print(f"Warning: Using bitwidth {bitwidth} which is outside the typical range (2-32).")
 
     ndim = input_tensor.ndim
     if ndim < 1 or ndim > 4: # Now supports 1D, 2D, 3D, 4D
@@ -66,7 +70,8 @@ def max_min_quantize_params(
         # 不过Bias很多时候是直接被动继承中间值的scale的，不会单独统计其min、max了
         # Norm Weight这里只适用于Transformer里的Norm，只针对hidden_dim这一维
         if per_channel:
-             print(f"Warning: 1D tensor (shape {input_tensor.shape}) does not support per-channel quantization. Forcing per-tensor.")
+            if DEBUG_QUANT:
+                print(f"Warning: 1D tensor (shape {input_tensor.shape}) does not support per-channel quantization. Forcing per-tensor.")
         _per_channel_effective = False
 
     if _per_channel_effective:
@@ -78,24 +83,29 @@ def max_min_quantize_params(
             if ndim == 2:
                 # Linear Weight [O, I] (dim 0) vs Linear Activation [B, I] (dim 1)
                 actual_channel_dim = 0 if is_weight else 1
-                print(f"Info: Inferring channel_dim={actual_channel_dim} for {ndim}D tensor based on is_weight={is_weight}.")
+                if DEBUG_QUANT:
+                    print(f"Info: Inferring channel_dim={actual_channel_dim} for {ndim}D tensor based on is_weight={is_weight}.")
             elif ndim == 3:
                 # NOTICE: is_weight==False means its per-token currently
                 actual_channel_dim = 1
-                print(f"Info: Inferring channel_dim={actual_channel_dim} for {ndim}D tensor.")
+                if DEBUG_QUANT:
+                    print(f"Info: Inferring channel_dim={actual_channel_dim} for {ndim}D tensor.")
                 if is_weight:
                     # Typical for Transformer/RNN Activation [B, S, E] (dim 2)
                      actual_channel_dim = 2
-                     print("Info: Assuming 3D tensor is activation-like for per-channel inference. If it's a 3D weight, manually set channel_dim.")
+                     if DEBUG_QUANT:
+                         print("Info: Assuming 3D tensor is activation-like for per-channel inference. If it's a 3D weight, manually set channel_dim.")
             elif ndim == 4:
                 if _is_seq_x_effective and not is_weight:
                     # Transformer Attention Score [B, H, L, L]
                     actual_channel_dim = 2
-                    print(f"Info: Inferring channel_dim={actual_channel_dim} for {ndim}D tensor based on is_weight={is_weight}. It's Transformer Attention Score")
+                    if DEBUG_QUANT:
+                        print(f"Info: Inferring channel_dim={actual_channel_dim} for {ndim}D tensor based on is_weight={is_weight}. It's Transformer Attention Score")
                 else:
                     # Conv Weight [O, I, K, K] (dim 0) vs Conv Activation [B, C, H, W] (dim 1)
                     actual_channel_dim = 0 if is_weight else 1
-                    print(f"Info: Inferring channel_dim={actual_channel_dim} for {ndim}D tensor based on is_weight={is_weight} (assuming channels-first for activations). For channels-last activation ([B, H, W, C]), please manually set channel_dim=3.")
+                    if DEBUG_QUANT:
+                        print(f"Info: Inferring channel_dim={actual_channel_dim} for {ndim}D tensor based on is_weight={is_weight} (assuming channels-first for activations). For channels-last activation ([B, H, W, C]), please manually set channel_dim=3.")
 
         # 验证确定的维度是否有效
         if actual_channel_dim < 0 or actual_channel_dim >= ndim:
@@ -216,7 +226,8 @@ def mean_std_quantize_params(
     if quant_mode not in ['sym', 'asym']:
         raise ValueError("quant_mode must be 'sym' or 'asym'")
     if not 2 <= bitwidth <= 32:
-         print(f"Warning: Using bitwidth {bitwidth} which is outside the typical range (2-32).")
+        if DEBUG_QUANT:
+            print(f"Warning: Using bitwidth {bitwidth} which is outside the typical range (2-32).")
     if n_sigmas <= 0:
          raise ValueError("n_sigmas must be positive.")
 
@@ -239,7 +250,8 @@ def mean_std_quantize_params(
     if ndim == 1:
         # 1D 张量 (Bias, Norm Weight) 不支持 Per-Channel
         if per_channel:
-             print(f"Warning: 1D tensor (shape {input_tensor.shape}) does not support per-channel quantization based on shape. Forcing per-tensor.")
+            if DEBUG_QUANT:
+                print(f"Warning: 1D tensor (shape {input_tensor.shape}) does not support per-channel quantization based on shape. Forcing per-tensor.")
         _per_channel_effective = False
 
     if _per_channel_effective:
@@ -251,17 +263,21 @@ def mean_std_quantize_params(
             if ndim == 2:
                 # Linear Weight [O, I] (dim 0) vs Linear Activation [B, I] (dim 1)
                 actual_channel_dim = 0 if is_weight else 1
-                print(f"Info: Inferring channel_dim={actual_channel_dim} for {ndim}D tensor based on is_weight={is_weight}.")
+                if DEBUG_QUANT:
+                    print(f"Info: Inferring channel_dim={actual_channel_dim} for {ndim}D tensor based on is_weight={is_weight}.")
             elif ndim == 3:
                 # Typical for Transformer/RNN Activation [B, S, E] (dim 2)
                 actual_channel_dim = 2
-                print(f"Info: Inferring channel_dim={actual_channel_dim} for {ndim}D tensor.")
+                if DEBUG_QUANT:
+                    print(f"Info: Inferring channel_dim={actual_channel_dim} for {ndim}D tensor.")
                 if is_weight:
-                     print("Info: Assuming 3D tensor is activation-like for per-channel inference. If it's a 3D weight, manually set channel_dim.")
+                    if DEBUG_QUANT:
+                        print("Info: Assuming 3D tensor is activation-like for per-channel inference. If it's a 3D weight, manually set channel_dim.")
             elif ndim == 4:
                 # Conv Weight [O, I, K, K] (dim 0) vs Conv Activation [B, C, H, W] (dim 1)
                 actual_channel_dim = 0 if is_weight else 1
-                print(f"Info: Inferring channel_dim={actual_channel_dim} for {ndim}D tensor based on is_weight={is_weight} (assuming channels-first for activations). For channels-last activation ([B, H, W, C]), manually set channel_dim=3.")
+                if DEBUG_QUANT:
+                    print(f"Info: Inferring channel_dim={actual_channel_dim} for {ndim}D tensor based on is_weight={is_weight} (assuming channels-first for activations). For channels-last activation ([B, H, W, C]), manually set channel_dim=3.")
 
         # 验证确定的维度是否有效
         if actual_channel_dim < 0 or actual_channel_dim >= ndim:

@@ -25,10 +25,29 @@ include "mlir/Interfaces/SideEffectInterfaces.td"
 include "mlir/IR/SymbolInterfaces.td"
 include "mlir/IR/OpAsmInterface.td"
 
-// Type constraints (reuse from AlloQuantOps for consistency)
-def SignType : AnyTypeOf<[I8, AnyTypeOf<[MemRefOf<[I8]>, RankedTensorOf<[I8]>]>]>;
-def CoeType : AnyTypeOf<[I16, AnyTypeOf<[MemRefOf<[I16]>, RankedTensorOf<[I16]>]>]>;
-def RshiftType : AnyTypeOf<[I16, AnyTypeOf<[MemRefOf<[I16]>, RankedTensorOf<[I16]>]>]>;
+// Type constraints for Vivado backend (packed scale format)
+// ScaleType: 32-bit packed integer containing sign, coe, and rshift
+// The packing layout is defined by ScalePackingAttr which is just a StrAttr
+def ScaleType : AnyTypeOf<[I32, AnyTypeOf<[MemRefOf<[I32]>, RankedTensorOf<[I32]>]>]>;
+
+// ScalePackingAttr: Defines the bit layout of the 32-bit packed scale
+// Format: {sign_bits, sign_offset, coe_bits, coe_offset, rshift_bits, rshift_offset}
+// Default layout: sign[31:24] (8 bits), rshift[23:16] (8 bits), coe[15:0] (16 bits)
+// Example: "8,24,8,16,16,0" means:
+//   - sign: 8 bit at position 24
+//   - rshift: 8 bits at positions [23:16]
+//   - coe: 16 bits at positions [15:0]
+// def ScalePackingAttr : StrAttr;
+
+// ScaleCoeMode: Defines the semantic type of the 'coe' field in the packed scale
+// Options:
+//   - "Full": Records the highest 1-bit of the fixed-point in [0.5, 1), e.g. records the whole part "1001110" of 0b0.1001110..., just ignores the 0b0.
+//              For a 17-bit input (value * 2^17), takes the high 16 bits (value >> 1)
+//   - "Tail": Records the variant part of the fixed-point in [0.5, 1), e.g. records the variant part "001110..." of 0b0.1001110..., ignores the 0b0.1 because it's always begins with 0b0.1
+//              For a 17-bit input (value * 2^17), takes the low 16 bits (value & 0xFFFF)
+// Default: "Tail" - matches the assumption that Allo ops provide coe as [0.5, 1) * 2^17
+// define ScaleCoeMode : StrAttr;
+
 def ZeroType : AnyTypeOf<[AnyInteger, AnyTypeOf<[MemRefOf<[AnyInteger]>, RankedTensorOf<[AnyInteger]>]>]>;
 
 //===----------------------------------------------------------------------===//
@@ -114,15 +133,9 @@ def Vivado_QMatMulOp : Vivado_Op<"qmatmul", [AttrSizedOperandSegments]> {
     AnyShaped:$output,
     AnyShaped:$lhs,
     AnyShaped:$rhs,
-    SignType:$x_scale_sign,
-    CoeType:$x_scale_coe,
-    RshiftType:$x_scale_rshift,
-    SignType:$y_scale_sign,
-    CoeType:$y_scale_coe,
-    RshiftType:$y_scale_rshift,
-    SignType:$o_scale_sign,
-    CoeType:$o_scale_coe,
-    RshiftType:$o_scale_rshift,
+    ScaleType:$x_scale,
+    ScaleType:$y_scale,
+    ScaleType:$o_scale,
     Optional<ZeroType>:$x_zero,
     Optional<ZeroType>:$y_zero,
     Optional<ZeroType>:$o_zero,
@@ -137,23 +150,21 @@ def Vivado_QMatMulOp : Vivado_Op<"qmatmul", [AttrSizedOperandSegments]> {
     DefaultValuedAttr<BoolAttr, "false">:$transpose_weight,
     OptionalAttr<StrArrayAttr>:$hls_pragmas,
     DefaultValuedAttr<StrAttr, "\"i32\"">:$accumulator_type,
-    DefaultValuedAttr<StrAttr, "\"inline\"">:$requant_mode
+    DefaultValuedAttr<StrAttr, "\"inline\"">:$requant_mode,
+    DefaultValuedAttr<StrAttr, "\"8,24,8,16,16,0\"">:$scale_packing,
+    DefaultValuedAttr<StrAttr, "\"Tail\"">:$scale_coe_mode
   );
   
   let results = (outs);
   
   let assemblyFormat = [{
     `(` $output `,` $lhs `,` $rhs `,`
-        $x_scale_sign `,` $x_scale_coe `,` $x_scale_rshift `,`
-        $y_scale_sign `,` $y_scale_coe `,` $y_scale_rshift `,`
-        $o_scale_sign `,` $o_scale_coe `,` $o_scale_rshift
+        $x_scale `,` $y_scale `,` $o_scale
         (`x_zero` `=` $x_zero^ `:` type($x_zero))?
         (`y_zero` `=` $y_zero^ `:` type($y_zero))?
         (`o_zero` `=` $o_zero^ `:` type($o_zero))? `)` attr-dict `:` 
         type($output) `,` type($lhs) `,` type($rhs) `,`
-        type($x_scale_sign) `,` type($x_scale_coe) `,` type($x_scale_rshift) `,`
-        type($y_scale_sign) `,` type($y_scale_coe) `,` type($y_scale_rshift) `,`
-        type($o_scale_sign) `,` type($o_scale_coe) `,` type($o_scale_rshift)
+        type($x_scale) `,` type($y_scale) `,` type($o_scale)
   }];
   
   // let hasVerifier = 1;
@@ -184,11 +195,11 @@ def Vivado_QLinearOp : Vivado_Op<"qlinear", [AttrSizedOperandSegments]> {
     AnyShaped:$output,
     AnyShaped:$input,
     AnyShaped:$weight,
-    SignType:$fscl_sign, CoeType:$fscl_coe, RshiftType:$fscl_rshift,
-    SignType:$iscl_sign, CoeType:$iscl_coe, RshiftType:$iscl_rshift,
-    SignType:$oscl_sign, CoeType:$oscl_coe, RshiftType:$oscl_rshift,
-    SignType:$wscl_sign, CoeType:$wscl_coe, RshiftType:$wscl_rshift,
-    Optional<SignType>:$bscl_sign, Optional<CoeType>:$bscl_coe, Optional<RshiftType>:$bscl_rshift,
+    ScaleType:$fscl,
+    ScaleType:$iscl,
+    ScaleType:$oscl,
+    ScaleType:$wscl,
+    Optional<ScaleType>:$bscl,
     Optional<ZeroType>:$input_zero,
     Optional<ZeroType>:$output_zero,
     Optional<AnyShaped>:$bias,
@@ -204,27 +215,23 @@ def Vivado_QLinearOp : Vivado_Op<"qlinear", [AttrSizedOperandSegments]> {
     DefaultValuedAttr<BoolAttr, "false">:$transpose_weight,
     OptionalAttr<StrArrayAttr>:$hls_pragmas,
     DefaultValuedAttr<StrAttr, "\"i32\"">:$accumulator_type,
-    DefaultValuedAttr<StrAttr, "\"inline\"">:$requant_mode
+    DefaultValuedAttr<StrAttr, "\"inline\"">:$requant_mode,
+    DefaultValuedAttr<StrAttr, "\"8,24,8,16,16,0\"">:$scale_packing,
+    DefaultValuedAttr<StrAttr, "\"Tail\"">:$scale_coe_mode
   );
   
   let results = (outs);
   
   let assemblyFormat = [{
     `(` $output `,` $input `,` $weight `,`
-        $fscl_sign `,` $fscl_coe `,` $fscl_rshift `,`
-        $iscl_sign `,` $iscl_coe `,` $iscl_rshift `,`
-        $oscl_sign `,` $oscl_coe `,` $oscl_rshift `,`
-        $wscl_sign `,` $wscl_coe `,` $wscl_rshift
-        (`,` $bscl_sign^ `,` $bscl_coe `,` $bscl_rshift)?
+        $fscl `,` $iscl `,` $oscl `,` $wscl
+        (`,` $bscl^)?
         (`input_zero` `=` $input_zero^ `:` type($input_zero))?
         (`output_zero` `=` $output_zero^ `:` type($output_zero))?
         (`bias` `=` $bias^ `:` type($bias))? `)` attr-dict `:` 
         type($output) `,` type($input) `,` type($weight) `,`
-        type($fscl_sign) `,` type($fscl_coe) `,` type($fscl_rshift) `,`
-        type($iscl_sign) `,` type($iscl_coe) `,` type($iscl_rshift) `,`
-        type($oscl_sign) `,` type($oscl_coe) `,` type($oscl_rshift) `,`
-        type($wscl_sign) `,` type($wscl_coe) `,` type($wscl_rshift)
-        (`,` type($bscl_sign)^ `,` type($bscl_coe) `,` type($bscl_rshift))?
+        type($fscl) `,` type($iscl) `,` type($oscl) `,` type($wscl)
+        (`,` type($bscl)^)?
   }];
   
   // let hasVerifier = 1;
@@ -253,32 +260,30 @@ def Vivado_QAddOp : Vivado_Op<"qadd", [AttrSizedOperandSegments]> {
     AnyShaped:$output,
     AnyShaped:$lhs,
     AnyShaped:$rhs,
-    SignType:$x_scale_sign, CoeType:$x_scale_coe, RshiftType:$x_scale_rshift,
-    SignType:$y_scale_sign, CoeType:$y_scale_coe, RshiftType:$y_scale_rshift,
-    SignType:$o_scale_sign, CoeType:$o_scale_coe, RshiftType:$o_scale_rshift,
+    ScaleType:$x_scale,
+    ScaleType:$y_scale,
+    ScaleType:$o_scale,
     Optional<ZeroType>:$x_zero,
     Optional<ZeroType>:$y_zero,
     Optional<ZeroType>:$o_zero,
     
     DefaultValuedAttr<BoolAttr, "false">:$fuse_into_producer,
-    DefaultValuedAttr<BoolAttr, "true">:$vectorize
+    DefaultValuedAttr<BoolAttr, "true">:$vectorize,
+    DefaultValuedAttr<StrAttr, "\"8,24,8,16,16,0\"">:$scale_packing,
+    DefaultValuedAttr<StrAttr, "\"Tail\"">:$scale_coe_mode
   );
   
   let results = (outs);
   
   let assemblyFormat = [{
     `(` $output `,` $lhs `,` $rhs `,`
-        $x_scale_sign `,` $x_scale_coe `,` $x_scale_rshift `,`
-        $y_scale_sign `,` $y_scale_coe `,` $y_scale_rshift `,`
-        $o_scale_sign `,` $o_scale_coe `,` $o_scale_rshift
+        $x_scale `,` $y_scale `,` $o_scale
         (`x_zero` `=` $x_zero^ `:` type($x_zero))?
         (`y_zero` `=` $y_zero^ `:` type($y_zero))?
         (`o_zero` `=` $o_zero^ `:` type($o_zero))? `)`
         attr-dict `:` 
         type($output) `,` type($lhs) `,` type($rhs) `,`
-        type($x_scale_sign) `,` type($x_scale_coe) `,` type($x_scale_rshift) `,`
-        type($y_scale_sign) `,` type($y_scale_coe) `,` type($y_scale_rshift) `,`
-        type($o_scale_sign) `,` type($o_scale_coe) `,` type($o_scale_rshift)
+        type($x_scale) `,` type($y_scale) `,` type($o_scale)
   }];
 }
 
@@ -306,31 +311,27 @@ def Vivado_IntGELUOp : Vivado_Op<"int_gelu", [AttrSizedOperandSegments]> {
   let arguments = (ins 
     AnyShaped:$output,
     AnyShaped:$input,
-    SignType:$iscl_sign, CoeType:$iscl_coe, RshiftType:$iscl_rshift,
-    SignType:$gscl_sign, CoeType:$gscl_coe, RshiftType:$gscl_rshift,
-    SignType:$fscl_sign, CoeType:$fscl_coe, RshiftType:$fscl_rshift,
-    SignType:$oscl_sign, CoeType:$oscl_coe, RshiftType:$oscl_rshift,
+    ScaleType:$iscl,
+    ScaleType:$gscl,
+    ScaleType:$fscl,
+    ScaleType:$oscl,
     Optional<ZeroType>:$input_zero,
     Optional<ZeroType>:$output_zero,
     
-    DefaultValuedAttr<StrAttr, "\"lut\"">:$implementation  // "lut" or "polynomial"
+    DefaultValuedAttr<StrAttr, "\"lut\"">:$implementation,  // "lut" or "polynomial"
+    DefaultValuedAttr<StrAttr, "\"8,24,8,16,16,0\"">:$scale_packing,
+    DefaultValuedAttr<StrAttr, "\"Tail\"">:$scale_coe_mode
   );
   
   let results = (outs);
   
   let assemblyFormat = [{
     `(` $output `,` $input `,`
-        $iscl_sign `,` $iscl_coe `,` $iscl_rshift `,`
-        $gscl_sign `,` $gscl_coe `,` $gscl_rshift `,`
-        $fscl_sign `,` $fscl_coe `,` $fscl_rshift `,`
-        $oscl_sign `,` $oscl_coe `,` $oscl_rshift
+        $iscl `,` $gscl `,` $fscl `,` $oscl
         (`input_zero` `=` $input_zero^ `:` type($input_zero))?
         (`output_zero` `=` $output_zero^ `:` type($output_zero))? `)`
         attr-dict `:` type($output) `,` type($input) `,`
-        type($iscl_sign) `,` type($iscl_coe) `,` type($iscl_rshift) `,`
-        type($gscl_sign) `,` type($gscl_coe) `,` type($gscl_rshift) `,`
-        type($fscl_sign) `,` type($fscl_coe) `,` type($fscl_rshift) `,`
-        type($oscl_sign) `,` type($oscl_coe) `,` type($oscl_rshift)
+        type($iscl) `,` type($gscl) `,` type($fscl) `,` type($oscl)
   }];
 }
 
@@ -344,32 +345,30 @@ def Vivado_IntSoftmaxOp : Vivado_Op<"int_softmax", [AttrSizedOperandSegments]> {
   let arguments = (ins 
     AnyShaped:$output,
     AnyShaped:$input,
-    SignType:$iscl_sign, CoeType:$iscl_coe, RshiftType:$iscl_rshift,
-    SignType:$sscl_sign, CoeType:$sscl_coe, RshiftType:$sscl_rshift,
-    SignType:$oscl_sign, CoeType:$oscl_coe, RshiftType:$oscl_rshift,
-    Optional<SignType>:$fscl_sign, Optional<CoeType>:$fscl_coe, Optional<RshiftType>:$fscl_rshift,
+    ScaleType:$iscl,
+    ScaleType:$sscl,
+    ScaleType:$oscl,
+    Optional<ScaleType>:$fscl,
     Optional<ZeroType>:$input_zero,
     Optional<ZeroType>:$output_zero,
     I64Attr:$axis,
     
-    DefaultValuedAttr<StrAttr, "\"lut\"">:$implementation
+    DefaultValuedAttr<StrAttr, "\"lut\"">:$implementation,
+    DefaultValuedAttr<StrAttr, "\"8,24,8,16,16,0\"">:$scale_packing,
+    DefaultValuedAttr<StrAttr, "\"Tail\"">:$scale_coe_mode
   );
   
   let results = (outs);
   
   let assemblyFormat = [{
     `(` $output `,` $input `,`
-        $iscl_sign `,` $iscl_coe `,` $iscl_rshift `,`
-        $sscl_sign `,` $sscl_coe `,` $sscl_rshift `,`
-        $oscl_sign `,` $oscl_coe `,` $oscl_rshift
-        (`,` $fscl_sign^ `,` $fscl_coe `,` $fscl_rshift)?
+        $iscl `,` $sscl `,` $oscl
+        (`,` $fscl^)?
         (`input_zero` `=` $input_zero^ `:` type($input_zero))?
         (`output_zero` `=` $output_zero^ `:` type($output_zero))? `)` attr-dict `:` 
         type($output) `,` type($input) `,`
-        type($iscl_sign) `,` type($iscl_coe) `,` type($iscl_rshift) `,`
-        type($sscl_sign) `,` type($sscl_coe) `,` type($sscl_rshift) `,`
-        type($oscl_sign) `,` type($oscl_coe) `,` type($oscl_rshift)
-        (`,` type($fscl_sign)^ `,` type($fscl_coe) `,` type($fscl_rshift))?
+        type($iscl) `,` type($sscl) `,` type($oscl)
+        (`,` type($fscl)^)?
   }];
 }
 
@@ -385,36 +384,30 @@ def Vivado_IntLayerNormOp : Vivado_Op<"int_layernorm", [AttrSizedOperandSegments
     AnyShaped:$output,
     AnyShaped:$input,
     AnyShaped:$bias_int,
-    SignType:$iscl_sign, CoeType:$iscl_coe, RshiftType:$iscl_rshift,
-    SignType:$lscl_sign, CoeType:$lscl_coe, RshiftType:$lscl_rshift,
-    SignType:$bscl_sign, CoeType:$bscl_coe, RshiftType:$bscl_rshift,
-    SignType:$fscl_sign, CoeType:$fscl_coe, RshiftType:$fscl_rshift,
-    SignType:$oscl_sign, CoeType:$oscl_coe, RshiftType:$oscl_rshift,
+    ScaleType:$iscl,
+    ScaleType:$lscl,
+    ScaleType:$bscl,
+    ScaleType:$fscl,
+    ScaleType:$oscl,
     Optional<ZeroType>:$input_zero,
     Optional<ZeroType>:$output_zero,
     F32Attr:$eps,
     
-    DefaultValuedAttr<StrAttr, "\"approx\"">:$rsqrt_method  // "approx" or "lut"
+    DefaultValuedAttr<StrAttr, "\"approx\"">:$rsqrt_method,  // "approx" or "lut"
+    DefaultValuedAttr<StrAttr, "\"8,24,8,16,16,0\"">:$scale_packing,
+    DefaultValuedAttr<StrAttr, "\"Tail\"">:$scale_coe_mode
   );
   
   let results = (outs);
   
   let assemblyFormat = [{
     `(` $output `,` $input `,` $bias_int `,`
-        $iscl_sign `,` $iscl_coe `,` $iscl_rshift `,`
-        $lscl_sign `,` $lscl_coe `,` $lscl_rshift `,`
-        $bscl_sign `,` $bscl_coe `,` $bscl_rshift `,`
-        $fscl_sign `,` $fscl_coe `,` $fscl_rshift `,`
-        $oscl_sign `,` $oscl_coe `,` $oscl_rshift
+        $iscl `,` $lscl `,` $bscl `,` $fscl `,` $oscl
         (`input_zero` `=` $input_zero^ `:` type($input_zero))?
         (`output_zero` `=` $output_zero^ `:` type($output_zero))? `)`
         `eps` `=` $eps attr-dict `:` 
         type($output) `,` type($input) `,` type($bias_int) `,`
-        type($iscl_sign) `,` type($iscl_coe) `,` type($iscl_rshift) `,`
-        type($lscl_sign) `,` type($lscl_coe) `,` type($lscl_rshift) `,`
-        type($bscl_sign) `,` type($bscl_coe) `,` type($bscl_rshift) `,`
-        type($fscl_sign) `,` type($fscl_coe) `,` type($fscl_rshift) `,`
-        type($oscl_sign) `,` type($oscl_coe) `,` type($oscl_rshift)
+        type($iscl) `,` type($lscl) `,` type($bscl) `,` type($fscl) `,` type($oscl)
   }];
 }
 
@@ -438,11 +431,11 @@ def Vivado_QConv2dOp : Vivado_Op<"qconv2d", [AttrSizedOperandSegments]> {
     AnyShaped:$output,
     AnyShaped:$input,
     AnyShaped:$filter,
-    SignType:$fscl_sign, CoeType:$fscl_coe, RshiftType:$fscl_rshift,
-    SignType:$iscl_sign, CoeType:$iscl_coe, RshiftType:$iscl_rshift,
-    SignType:$oscl_sign, CoeType:$oscl_coe, RshiftType:$oscl_rshift,
-    SignType:$wscl_sign, CoeType:$wscl_coe, RshiftType:$wscl_rshift,
-    Optional<SignType>:$bscl_sign, Optional<CoeType>:$bscl_coe, Optional<RshiftType>:$bscl_rshift,
+    ScaleType:$fscl,
+    ScaleType:$iscl,
+    ScaleType:$oscl,
+    ScaleType:$wscl,
+    Optional<ScaleType>:$bscl,
     Optional<ZeroType>:$input_zero,
     Optional<ZeroType>:$output_zero,
     Optional<AnyShaped>:$bias,
@@ -457,28 +450,24 @@ def Vivado_QConv2dOp : Vivado_Op<"qconv2d", [AttrSizedOperandSegments]> {
     DefaultValuedAttr<BoolAttr, "false">:$enable_bias,
     OptionalAttr<StrArrayAttr>:$hls_pragmas,
     DefaultValuedAttr<StrAttr, "\"i32\"">:$accumulator_type,
-    DefaultValuedAttr<StrAttr, "\"inline\"">:$requant_mode
+    DefaultValuedAttr<StrAttr, "\"inline\"">:$requant_mode,
+    DefaultValuedAttr<StrAttr, "\"8,24,8,16,16,0\"">:$scale_packing,
+    DefaultValuedAttr<StrAttr, "\"Tail\"">:$scale_coe_mode
   );
   
   let results = (outs);
   
   let assemblyFormat = [{
     `(` $output `,` $input `,` $filter `,`
-        $fscl_sign `,` $fscl_coe `,` $fscl_rshift `,`
-        $iscl_sign `,` $iscl_coe `,` $iscl_rshift `,`
-        $oscl_sign `,` $oscl_coe `,` $oscl_rshift `,`
-        $wscl_sign `,` $wscl_coe `,` $wscl_rshift
-        (`,` $bscl_sign^ `,` $bscl_coe `,` $bscl_rshift)?
+        $fscl `,` $iscl `,` $oscl `,` $wscl
+        (`,` $bscl^)?
         (`input_zero` `=` $input_zero^ `:` type($input_zero))?
         (`output_zero` `=` $output_zero^ `:` type($output_zero))?
         (`bias` `=` $bias^ `:` type($bias))? `)`
         `stride` `=` $stride attr-dict `:` 
         type($output) `,` type($input) `,` type($filter) `,`
-        type($fscl_sign) `,` type($fscl_coe) `,` type($fscl_rshift) `,`
-        type($iscl_sign) `,` type($iscl_coe) `,` type($iscl_rshift) `,`
-        type($oscl_sign) `,` type($oscl_coe) `,` type($oscl_rshift) `,`
-        type($wscl_sign) `,` type($wscl_coe) `,` type($wscl_rshift)
-        (`,` type($bscl_sign)^ `,` type($bscl_coe) `,` type($bscl_rshift))?
+        type($fscl) `,` type($iscl) `,` type($oscl) `,` type($wscl)
+        (`,` type($bscl)^)?
   }];
 }
 
@@ -499,15 +488,9 @@ def Vivado_QMatMulIsqrtDOp : Vivado_Op<"qmatmul_isqrtd", [AttrSizedOperandSegmen
     AnyShaped:$output,
     AnyShaped:$lhs,
     AnyShaped:$rhs,
-    SignType:$x_scale_sign,
-    CoeType:$x_scale_coe,
-    RshiftType:$x_scale_rshift,
-    SignType:$y_scale_sign,
-    CoeType:$y_scale_coe,
-    RshiftType:$y_scale_rshift,
-    SignType:$o_scale_sign,
-    CoeType:$o_scale_coe,
-    RshiftType:$o_scale_rshift,
+    ScaleType:$x_scale,
+    ScaleType:$y_scale,
+    ScaleType:$o_scale,
     Optional<ZeroType>:$x_zero,
     Optional<ZeroType>:$y_zero,
     Optional<ZeroType>:$o_zero,
@@ -522,24 +505,22 @@ def Vivado_QMatMulIsqrtDOp : Vivado_Op<"qmatmul_isqrtd", [AttrSizedOperandSegmen
     DefaultValuedAttr<BoolAttr, "false">:$transpose_weight,
     OptionalAttr<StrArrayAttr>:$hls_pragmas,
     DefaultValuedAttr<StrAttr, "\"i32\"">:$accumulator_type,
-    DefaultValuedAttr<StrAttr, "\"inline\"">:$requant_mode
+    DefaultValuedAttr<StrAttr, "\"inline\"">:$requant_mode,
+    DefaultValuedAttr<StrAttr, "\"8,24,8,16,16,0\"">:$scale_packing,
+    DefaultValuedAttr<StrAttr, "\"Tail\"">:$scale_coe_mode
   );
   
   let results = (outs);
   
   let assemblyFormat = [{
     `(` $output `,` $lhs `,` $rhs `,`
-        $x_scale_sign `,` $x_scale_coe `,` $x_scale_rshift `,`
-        $y_scale_sign `,` $y_scale_coe `,` $y_scale_rshift `,`
-        $o_scale_sign `,` $o_scale_coe `,` $o_scale_rshift
+        $x_scale `,` $y_scale `,` $o_scale
         (`x_zero` `=` $x_zero^ `:` type($x_zero))?
         (`y_zero` `=` $y_zero^ `:` type($y_zero))?
         (`o_zero` `=` $o_zero^ `:` type($o_zero))? `)`
         attr-dict `:` 
         type($output) `,` type($lhs) `,` type($rhs) `,`
-        type($x_scale_sign) `,` type($x_scale_coe) `,` type($x_scale_rshift) `,`
-        type($y_scale_sign) `,` type($y_scale_coe) `,` type($y_scale_rshift) `,`
-        type($o_scale_sign) `,` type($o_scale_coe) `,` type($o_scale_rshift)
+        type($x_scale) `,` type($y_scale) `,` type($o_scale)
   }];
 }
 

@@ -9,6 +9,9 @@
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Pass/Pass.h"
 
+#include "allo/Dialect/PYNQDialect.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
+
 namespace mlir {
 namespace allo {
 

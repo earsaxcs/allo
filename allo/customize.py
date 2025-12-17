@@ -909,6 +909,7 @@ class Schedule:
                 configs=configs,
                 func_args=self.func_args,
                 wrap_io=wrap_io,
+                debug_mode=True,
             )
         raise NotImplementedError(f"Target {target} is not supported")
 

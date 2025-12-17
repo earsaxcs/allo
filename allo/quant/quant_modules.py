@@ -720,6 +720,7 @@ class IntSoftmax(QuantizableModule):
             act_per_head: bool = False,
         ):
         super(IntSoftmax, self).__init__()
+        self.debug_count = 2
         self.dim = dim
         self.c = 32 # sigmoid capacity, it's node side effect outside the forward of intgelu
         self.n = self.c - softmax_act_bit # the capacity of exp, it's no side effect outside the _int_exp function
@@ -853,9 +854,9 @@ class IntSoftmax(QuantizableModule):
             # softmax_int = self.qact.forward_int(softmax_int)
             softmax_int = softmax_int * self.fused_scale[None, None, :, None]
 
-        # # No need here for it's executed in qact
-        # if self.act_quant_mode == "asym":
-        #     softmax_int = softmax_int + self.output_zero
+        # finally, add zero back if asymmetric
+        if self.act_quant_mode == "asym":
+            softmax_int = softmax_int + self.output_zero
         
         return softmax_int
 
@@ -863,7 +864,18 @@ class IntSoftmax(QuantizableModule):
         if self.calibrate_mode:
             return self.calibrate(x_float)
         elif self.fakequant_mode:
-            return self.forward_int(x_int=torch.clamp(torch.round(x_float / self.input_scale[None, None, :, None]), -2**(self.in_act_bit-1), 2**(self.in_act_bit-1)-1)) * self.output_scale[None, None, :, None]
+            self.debug_count += 1
+            tmp = self.forward_int(x_int=torch.clamp(torch.round(x_float / self.input_scale[None, None, :, None]), -2**(self.in_act_bit-1), 2**(self.in_act_bit-1)-1)) * self.output_scale[None, None, :, None]
+            if self.debug_count == 1:
+                print("Debug Info of IntSoftmax:")
+                print("Input Scale:", self.input_scale)
+                print("Softmax Scale:", self.softmax_scale)
+                print("Output Scale:", self.output_scale)
+                if self.out_act_bit != self.softmax_act_bit:
+                    print("Fused Scale:", self.fused_scale)
+                print("Input Sample:", x_float)
+                print("Output Sample:", tmp)
+            return tmp
         else:
             return self.forward_float(x_float)
 
@@ -1033,7 +1045,8 @@ class IntLayerNorm(QuantizableModule):
         elif self.act_quant_mode == "asym":
             self.input_zero.data = x_zero
             self.output_zero.data = y_zero
-            self.qact.output_zero.data = y_zero
+            # NOTICE: self.qact.output_zero is not used
+            # self.qact.output_zero.data = y_zero
 
         return y
 
@@ -1064,9 +1077,9 @@ class IntLayerNorm(QuantizableModule):
         y_int = y_int * self.fused_scale[None, None, :]
         # print(y_int,y_int*self.qact.fused_scale,self.qact.fused_scale,sep="\n")
 
-        # No need here for it's executed in qact
-        # if self.act_quant_mode == "asym":
-        #     y_int = y_int + self.output_zero
+        # Dequant zero
+        if self.act_quant_mode == "asym":
+            y_int = y_int + self.output_zero
 
         return y_int
     

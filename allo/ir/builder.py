@@ -1675,6 +1675,12 @@ class ASTTransformer(ASTBuilder):
     def build_Module(ctx, node):
         with ctx.mlir_ctx:
             module = Module.create()
+        # Attach global quantization configuration as module attribute
+        if "__allo_quant_fixed_bits__" in ctx.global_vars:
+            fixed_bits = ctx.global_vars["__allo_quant_fixed_bits__"]
+            module.operation.attributes["allo.quant.fixed_bits"] = IntegerAttr.get(
+                IntegerType.get_signless(32), fixed_bits
+            )
         ctx.set_ip(module.body)
         for stmt in node.body:
             build_stmt(ctx, stmt)

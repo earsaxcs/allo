@@ -5,6 +5,8 @@
 import os
 import re
 import io
+import sys
+import tempfile
 import subprocess
 import time
 from .._mlir.dialects import allo as allo_d
@@ -39,6 +41,49 @@ from ..ir.transform import find_func_in_module
 from ..utils import get_func_inputs_outputs
 
 # from .. import primitives as prim
+
+
+def _run_pass_with_capture(pm, module):
+    """Run MLIR PassManager while capturing stdout/stderr output.
+    
+    This is necessary because MLIR's IR printing outputs directly to C-level
+    file descriptors, bypassing Python's sys.stdout/stderr.
+    
+    Args:
+        pm: MLIR PassManager instance
+        module: MLIR Module to transform
+        
+    Returns:
+        str: Captured output from IR printing (empty string if no output)
+    """
+    stdout_fd = sys.stdout.fileno()
+    stderr_fd = sys.stderr.fileno()
+    
+    with tempfile.TemporaryFile(mode='w+b') as tmpf:
+        # Save original file descriptors
+        saved_stdout = os.dup(stdout_fd)
+        saved_stderr = os.dup(stderr_fd)
+        try:
+            # Redirect stdout/stderr to temp file
+            os.dup2(tmpf.fileno(), stdout_fd)
+            os.dup2(tmpf.fileno(), stderr_fd)
+            
+            # Run the pass pipeline
+            pm.run(module.operation)
+            
+            # Flush buffers before restoring
+            sys.stdout.flush()
+            sys.stderr.flush()
+        finally:
+            # Restore original file descriptors
+            os.dup2(saved_stdout, stdout_fd)
+            os.dup2(saved_stderr, stderr_fd)
+            os.close(saved_stdout)
+            os.close(saved_stderr)
+        
+        # Read captured content
+        tmpf.seek(0)
+        return tmpf.read().decode('utf-8')
 
 
 def is_available(backend="vivado_hls"):
@@ -167,20 +212,27 @@ class VivadoModule:
         project=None,
         ext_libs=None,
         configs=None,
-        func_args=None,
-        wrap_io=True,
+        func_args=None,  # Reserved for future use
+        wrap_io=True,    # Reserved for future use
+        debug_mode=False,
+        debug_output_dir="./vivado_mlir_debug",
     ):
         self.top_func_name = top_func_name
         self.mode = mode
         self.project = project
         self.platform = platform
         self.ext_libs = [] if ext_libs is None else ext_libs
+        self.debug_mode = debug_mode
+        self.debug_output_dir = debug_output_dir
+        # Reserved parameters (not yet implemented)
+        _ = func_args, wrap_io
+
         if configs is not None:
-            new_configs = DEFAULT_CONFIG
+            new_configs = DEFAULT_CONFIG.copy()
             new_configs.update(configs)
             configs = new_configs
         else:
-            configs = DEFAULT_CONFIG
+            configs = DEFAULT_CONFIG.copy()
         if self.mode is not None:
             configs["mode"] = self.mode
         with Context() as ctx, Location.unknown():
@@ -188,6 +240,12 @@ class VivadoModule:
             self.module = Module.parse(str(mod), ctx)
             self.func = find_func_in_module(self.module, top_func_name)
             self.module = decompose_library_function(self.module)
+
+            if self.debug_mode:
+                os.makedirs(self.debug_output_dir, exist_ok=True)
+                with open(os.path.join(self.debug_output_dir, "0_initial.mlir"), "w") as f:
+                    f.write(str(self.module))
+
             _mlir_lower_pipeline(self.module, lower_linalg=True)
             # Run through lowering passes
             # pm = PassManager.parse(
@@ -203,10 +261,28 @@ class VivadoModule:
             #     ")"
             # )
             pm = PassManager.parse(
-                "builtin.module(",
+                "builtin.module("
+                "empty-tensor-to-alloc-tensor,"
+                "lower-allo-quant-to-vivado"
                 ")"
             )
-            pm.run(self.module.operation)
+
+            if self.debug_mode:
+                pm.enable_ir_printing()
+                # Run passes with IR output capture
+                captured_output = _run_pass_with_capture(pm, self.module)
+                # Save captured IR printing output
+                debug_ir_path = os.path.join(self.debug_output_dir, "vivado-debug.mlir")
+                with open(debug_ir_path, "w", encoding="utf-8") as f:
+                    f.write(captured_output)
+                # Save final transformed IR
+                final_ir_path = os.path.join(self.debug_output_dir, "final.mlir")
+                with open(final_ir_path, "w", encoding="utf-8") as f:
+                    f.write(str(self.module))
+            else:
+                # Run passes without capture (faster)
+                pm.run(self.module.operation)
+            
         buf = io.StringIO()
         match platform:
             case "tapa":
@@ -362,6 +438,26 @@ class VivadoModule:
         return f"VivadoModule({self.top_func_name}, {self.mode}, {self.project})"
 
     def __call__(self, *args, shell=True):
+        """Execute HLS simulation, synthesis, or hardware emulation.
+        
+        This method is called when the user wants to actually run the generated
+        HLS code through simulation or synthesis. It is NOT required for just
+        generating MLIR IR or HLS C++ code.
+        
+        Supported modes by platform:
+        - vivado_hls: csim, csyn, custom, debug
+        - vitis_hls: csim, csyn, sw_emu, hw_emu, hw  
+        - tapa: csim, fast_hw_emu, hw_emu, hw
+        
+        Args:
+            *args: Input/output tensors for simulation
+            shell: Whether to run subprocess with shell=True
+            
+        Note:
+            For the current quantized ViT workflow that only generates IR and 
+            HLS code, this method does not need to be called. The VivadoModule
+            constructor already handles all code generation.
+        """
         if self.platform == "vivado_hls":
             assert is_available("vivado_hls"), "vivado_hls is not available"
             ver = run_process("g++ --version", r"\d+\.\d+\.\d+")[0].split(".")

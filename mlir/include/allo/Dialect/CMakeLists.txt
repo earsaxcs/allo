@@ -38,3 +38,33 @@ add_dependencies(mlir-headers MLIRVivadoOpsIncGen)
 
 add_mlir_doc(VivadoDialect VivadoDialect Vivado/ -gen-dialect-doc)
 add_mlir_doc(VivadoQuantOps VivadoOps Vivado/ -gen-op-doc)
+
+# PYNQ dialect
+set(LLVM_TARGET_DEFINITIONS PYNQOps.td)
+mlir_tablegen(PYNQOps.h.inc -gen-op-decls)
+mlir_tablegen(PYNQOps.cpp.inc -gen-op-defs)
+mlir_tablegen(PYNQDialect.h.inc -gen-dialect-decls -dialect=pynq)
+mlir_tablegen(PYNQDialect.cpp.inc -gen-dialect-defs -dialect=pynq)
+add_public_tablegen_target(MLIRPYNQOpsIncGen)
+add_dependencies(mlir-headers MLIRPYNQOpsIncGen)
+
+set(LLVM_TARGET_DEFINITIONS PYNQTypes.td)
+mlir_tablegen(PYNQTypes.h.inc -gen-typedef-decls)
+mlir_tablegen(PYNQTypes.cpp.inc -gen-typedef-defs)
+add_public_tablegen_target(MLIRPYNQTypesIncGen)
+add_dependencies(mlir-headers MLIRPYNQTypesIncGen)
+
+set(LLVM_TARGET_DEFINITIONS PYNQAttrs.td)
+mlir_tablegen(PYNQAttrs.h.inc -gen-attrdef-decls)
+mlir_tablegen(PYNQAttrs.cpp.inc -gen-attrdef-defs)
+add_public_tablegen_target(MLIRPYNQAttrsIncGen)
+add_dependencies(mlir-headers MLIRPYNQAttrsIncGen)
+
+set(LLVM_TARGET_DEFINITIONS PYNQAttrs.td)
+mlir_tablegen(PYNQEnums.h.inc -gen-enum-decls)
+mlir_tablegen(PYNQEnums.cpp.inc -gen-enum-defs)
+add_public_tablegen_target(MLIRPYNQEnumsIncGen)
+add_dependencies(mlir-headers MLIRPYNQEnumsIncGen)
+
+add_mlir_doc(PYNQDialect PYNQDialect PYNQ/ -gen-dialect-doc)
+add_mlir_doc(PYNQOps PYNQOps PYNQ/ -gen-op-doc)

@@ -3,6 +3,12 @@
  * These ops accept both float and integer tensor/memref inputs/outputs.
  * Scale parameters are passed as integer arrays (sign: i8, coe: i16, rshift: i16).
  * Optional zero points and bias are handled via Variadic to match DSL signatures.
+ * 
+ * Scale Coefficient Representation:
+ * - coe (coefficient) represents values in [0.5, 1.0) as fixed-point integers
+ * - fixed_bits attribute specifies the number of bits: coe = value * 2^fixed_bits
+ * - Default fixed_bits = 17, meaning coe ∈ [65536, 131071] for value ∈ [0.5, 1.0)
+ * - Example: 0.625 * 2^17 = 81920 = 0b10100000000000000
  */
 
 include "allo/Dialect/AlloDialect.td"
@@ -15,12 +21,12 @@ include "mlir/Interfaces/SideEffectInterfaces.td"
 // sign: i8 scalar or shaped (int8 sign, truly signed)
 def SignType : AnyTypeOf<[I8, AnyTypeOf<[MemRefOf<[I8]>, RankedTensorOf<[I8]>]>]>;
 
-// coe: i16 scalar or shaped (SEMANTICALLY uint16, stored as i16 due to MLIR limitation)
-//      Range: [0x8000, 0xFFFF] = [32768, 65535] represents normalized coeff [0.5, 1.0)
-//      CRITICAL: In C++ lowering, MUST cast to uint16_t before arithmetic operations!
+// coe: i32 scalar or shaped (SEMANTICALLY uintN, stored as i32 due to MLIR limitation)
+//      Range: usually 17-bit, [0x10000, 0x1FFFF] = [65536, 131071] represents normalized coeff [0.5, 1.0)
+//      CRITICAL: In C++ lowering, MUST cast to uintN_t before arithmetic operations!
 //                Directly using as signed i16 will cause incorrect comparisons/extensions.
-//      Example:  uint16_t coeUnsigned = static_cast<uint16_t>(coeValue);
-def CoeType : AnyTypeOf<[I16, AnyTypeOf<[MemRefOf<[I16]>, RankedTensorOf<[I16]>]>]>;
+//      Example:  uintN_t coeUnsigned = static_cast<uintN_t>(coeValue);
+def CoeType : AnyTypeOf<[I32, AnyTypeOf<[MemRefOf<[I32]>, RankedTensorOf<[I32]>]>]>;
 
 // rshift: i16 scalar or shaped (int16 shift amount, truly signed, can be negative for left shift)
 def RshiftType : AnyTypeOf<[I16, AnyTypeOf<[MemRefOf<[I16]>, RankedTensorOf<[I16]>]>]>;

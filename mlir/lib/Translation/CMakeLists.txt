@@ -6,6 +6,12 @@ file(GLOB globbed *.cpp)
 add_mlir_library(MLIRAlloEmitHLSCpp
   ${globbed}
 
+  DEPENDS
+  MLIRPYNQOpsIncGen
+  MLIRPYNQTypesIncGen
+  MLIRPYNQAttrsIncGen
+  MLIRPYNQEnumsIncGen
+
   LINK_LIBS PUBLIC
   MLIRAllo
   MLIRAlloSupport

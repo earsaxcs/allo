@@ -21,14 +21,34 @@ from .. import dsl
 from ..ir import types
 from ..customize import customize
 
+# Global configuration for quantization
+# SCALE_FIXED_BITS: Number of bits used to represent scale coefficient in [0.5, 1.0)
+# Default: 17 bits (coe ∈ [65536, 131071] represents [0.5, 1.0))
+# This value should match kExpectedAlloFixedBits in LowerAlloQuantToVivado.cpp
+#
+# Configuration Flow:
+# 1. Set SCALE_FIXED_BITS here (default: 17)
+# 2. float_to_fixed_point() uses this to convert scales: coe = value * 2^SCALE_FIXED_BITS
+# 3. In LowerAlloQuantToVivado.cpp, kExpectedAlloFixedBits should match this value
+# 4. The lowering pass validates and packs coe according to scale_coe_mode (Tail/Full)
+#
+# Example:
+#   SCALE_FIXED_BITS = 17 means:
+#   - scale 0.5 → coe = 0.5 * 2^17 = 65536 = 0b10000000000000000
+#   - scale 0.625 → coe = 0.625 * 2^17 = 81920 = 0b10100000000000000
+#   - Tail mode: stores low 16 bits (variant part)
+#   - Full mode: stores high 16 bits (including leading 1)
+SCALE_FIXED_BITS = 17
 
+
+# maybe used in pytorch_vivado.py
 def _process_quantized_params(gm, global_vars):
     """
     处理量化模块的参数和buffers，将浮点权重/偏置替换为整数版本，
     并注入所有量化相关的scale/zero常量到global_vars中。
     
     Scale参数会被转换为定点表示：scale = sign * coe * 2^(-rshift)
-    其中 coe ∈ [0.5, 1)，存储为定点数（使用 uint16/uint32）
+    其中 coe ∈ [0.5, 1)，存储为定点数（使用 int32/int64）
     
     Args:
         gm: GraphModule，包含traced的模型
@@ -52,7 +72,7 @@ def _process_quantized_params(gm, global_vars):
         
         Returns:
             sign: 符号位 (±1)，int8
-            coe_fixed: 定点系数，int16，范围 [2^15, 2^16)，对应浮点 [0.5, 1)
+            coe_fixed: 定点系数，int16/32/64，范围 [2^(fixed_bits-1), 2^fixed_bits)，对应浮点 [0.5, 1)
             rshift: 移位数，int16，范围 [-32767, 32767]
                     > 0: 右移（scale < 1）
                     < 0: 左移（scale > 1）
@@ -101,7 +121,7 @@ def _process_quantized_params(gm, global_vars):
         # 处理浮点精度导致的边界问题
         # 理论上 coe_float ∈ [0.5, 1)，但可能因为精度问题略微超出
         iteration_count = 0
-        max_iterations = 10  # 防止无限循环
+        max_iterations = 64  # 防止无限循环
         
         # 注意：这里的逻辑是 coe >= 1.0 时 rshift 减1（相当于除以2），coe < 0.5 时 rshift 加1（相当于乘以2）
         # 因为 scale = coe * 2^(-rshift)，所以：
@@ -122,10 +142,10 @@ def _process_quantized_params(gm, global_vars):
         if iteration_count >= max_iterations:
             print(f"Warning: Float normalization failed to converge")
         
-        # coe_float ∈ [0.5, 1) → coe_fixed ∈ [2^15, 2^16)
-        # 注意：使用 uint16 表示更合理，但为了兼容性暂时用 int16 返回
-        max_fixed_value = (1 << fixed_bits) - 1  # 2^16 - 1 = 65535
-        min_fixed_value = (1 << (fixed_bits - 1))  # 2^15 = 32768
+        # coe_float ∈ [0.5, 1) → coe_fixed ∈ [2^16, 2^17)
+        # 注意：使用 uint 表示更合理，但为了兼容性暂时用 int 返回
+        max_fixed_value = (1 << fixed_bits) - 1  # 2^17 - 1 = 131071
+        min_fixed_value = (1 << (fixed_bits - 1))  # 2^16 = 65536
         
         coe_fixed = np.round(coe_float * (1 << fixed_bits)).astype(dtype)
         coe_fixed = np.clip(coe_fixed, min_fixed_value, max_fixed_value)
@@ -168,6 +188,9 @@ def _process_quantized_params(gm, global_vars):
         
         # 此处均以i32/i64返回
         # 由外部负责转换到需要的类型
+
+        # NOTE: 合并coe_fixed的fixed_bits到rshift里，之后coe_fixed当成一个纯粹的介于[2^(fixed_bits-1), 2^fixed_bits)的整数看待
+        rshift = rshift + fixed_bits
         return sign, coe_fixed, rshift
     
     # 定义需要处理的量化模块类型
@@ -207,10 +230,10 @@ def _process_quantized_params(gm, global_vars):
                 # 注入weight_scale（定点表示）
                 if hasattr(module, 'weight_scale'):
                     scale_data = module.weight_scale.data.detach().numpy()
-                    sign, coe, rshift = float_to_fixed_point(scale_data, fixed_bits=16)
+                    sign, coe, rshift = float_to_fixed_point(scale_data, fixed_bits=SCALE_FIXED_BITS)
                     
                     global_vars[var_prefix + "_weight_scale_sign"] = sign.astype(np.int8)
-                    global_vars[var_prefix + "_weight_scale_coe"] = coe.astype(np.uint16)
+                    global_vars[var_prefix + "_weight_scale_coe"] = coe.astype(np.int32)
                     global_vars[var_prefix + "_weight_scale_rshift"] = rshift.astype(np.int16)
         
         # ========== 处理偏置 (bias) ==========
@@ -223,10 +246,10 @@ def _process_quantized_params(gm, global_vars):
                 # 注入bias_scale（定点表示）
                 if hasattr(module, 'bias_scale'):
                     scale_data = module.bias_scale.data.detach().numpy()
-                    sign, coe, rshift = float_to_fixed_point(scale_data, fixed_bits=16)
+                    sign, coe, rshift = float_to_fixed_point(scale_data, fixed_bits=SCALE_FIXED_BITS)
                     
                     global_vars[var_prefix + "_bias_scale_sign"] = sign.astype(np.int8)
-                    global_vars[var_prefix + "_bias_scale_coe"] = coe.astype(np.uint16)
+                    global_vars[var_prefix + "_bias_scale_coe"] = coe.astype(np.int32)
                     global_vars[var_prefix + "_bias_scale_rshift"] = rshift.astype(np.int16)
         
         # ========== 处理激活量化相关的scale（定点表示）==========
@@ -234,28 +257,28 @@ def _process_quantized_params(gm, global_vars):
         # input_scale
         if hasattr(module, 'input_scale'):
             scale_data = module.input_scale.data.detach().numpy()
-            sign, coe, rshift = float_to_fixed_point(scale_data, fixed_bits=16)
+            sign, coe, rshift = float_to_fixed_point(scale_data, fixed_bits=SCALE_FIXED_BITS)
             
             global_vars[var_prefix + "_input_scale_sign"] = sign.astype(np.int8)
-            global_vars[var_prefix + "_input_scale_coe"] = coe.astype(np.uint16)
+            global_vars[var_prefix + "_input_scale_coe"] = coe.astype(np.int32)
             global_vars[var_prefix + "_input_scale_rshift"] = rshift.astype(np.int16)
         
         # output_scale
         if hasattr(module, 'output_scale'):
             scale_data = module.output_scale.data.detach().numpy()
-            sign, coe, rshift = float_to_fixed_point(scale_data, fixed_bits=16)
+            sign, coe, rshift = float_to_fixed_point(scale_data, fixed_bits=SCALE_FIXED_BITS)
             
             global_vars[var_prefix + "_output_scale_sign"] = sign.astype(np.int8)
-            global_vars[var_prefix + "_output_scale_coe"] = coe.astype(np.uint16)
+            global_vars[var_prefix + "_output_scale_coe"] = coe.astype(np.int32)
             global_vars[var_prefix + "_output_scale_rshift"] = rshift.astype(np.int16)
         
         # fused_scale（最关键：用于运行时缩放）
         if hasattr(module, 'fused_scale'):
             scale_data = module.fused_scale.data.detach().numpy()
-            sign, coe, rshift = float_to_fixed_point(scale_data, fixed_bits=16)
+            sign, coe, rshift = float_to_fixed_point(scale_data, fixed_bits=SCALE_FIXED_BITS)
             
             global_vars[var_prefix + "_fused_scale_sign"] = sign.astype(np.int8)
-            global_vars[var_prefix + "_fused_scale_coe"] = coe.astype(np.uint16)
+            global_vars[var_prefix + "_fused_scale_coe"] = coe.astype(np.int32)
             global_vars[var_prefix + "_fused_scale_rshift"] = rshift.astype(np.int16)
         
         # input_zero / output_zero（非对称量化，保持整数）
@@ -273,10 +296,10 @@ def _process_quantized_params(gm, global_vars):
         if isinstance(module, IntLayerNorm):
             if hasattr(module, 'layernorm_scale'):
                 scale_data = module.layernorm_scale.data.detach().numpy()
-                sign, coe, rshift = float_to_fixed_point(scale_data, fixed_bits=16)
+                sign, coe, rshift = float_to_fixed_point(scale_data, fixed_bits=SCALE_FIXED_BITS)
                 
                 global_vars[var_prefix + "_layernorm_scale_sign"] = sign.astype(np.int8)
-                global_vars[var_prefix + "_layernorm_scale_coe"] = coe.astype(np.uint16)
+                global_vars[var_prefix + "_layernorm_scale_coe"] = coe.astype(np.int32)
                 global_vars[var_prefix + "_layernorm_scale_rshift"] = rshift.astype(np.int16)
             
             if hasattr(module, 'bias_int'):
@@ -289,10 +312,10 @@ def _process_quantized_params(gm, global_vars):
             for scale_name in ['x_scale', 'y_scale', 'o_scale']:
                 if hasattr(module, scale_name):
                     scale_data = getattr(module, scale_name).data.detach().numpy()
-                    sign, coe, rshift = float_to_fixed_point(scale_data, fixed_bits=16)
+                    sign, coe, rshift = float_to_fixed_point(scale_data, fixed_bits=SCALE_FIXED_BITS)
                     
                     global_vars[var_prefix + f"_{scale_name}_sign"] = sign.astype(np.int8)
-                    global_vars[var_prefix + f"_{scale_name}_coe"] = coe.astype(np.uint16)
+                    global_vars[var_prefix + f"_{scale_name}_coe"] = coe.astype(np.int32)
                     global_vars[var_prefix + f"_{scale_name}_rshift"] = rshift.astype(np.int16)
             
             # zero points（保持整数）
@@ -307,10 +330,10 @@ def _process_quantized_params(gm, global_vars):
         if isinstance(module, IntSoftmax):
             if hasattr(module, 'softmax_scale'):
                 scale_data = module.softmax_scale.data.detach().numpy()
-                sign, coe, rshift = float_to_fixed_point(scale_data, fixed_bits=16)
+                sign, coe, rshift = float_to_fixed_point(scale_data, fixed_bits=SCALE_FIXED_BITS)
                 
                 global_vars[var_prefix + "_softmax_scale_sign"] = sign.astype(np.int8)
-                global_vars[var_prefix + "_softmax_scale_coe"] = coe.astype(np.uint16)
+                global_vars[var_prefix + "_softmax_scale_coe"] = coe.astype(np.int32)
                 global_vars[var_prefix + "_softmax_scale_rshift"] = rshift.astype(np.int16)
         
         # ========== 特殊处理：IntGELU ==========
@@ -319,10 +342,10 @@ def _process_quantized_params(gm, global_vars):
             # (input_scale, output_scale 和 fused_scale 已经在通用部分处理)
             if hasattr(module, 'gelu_scale'):
                 scale_data = module.gelu_scale.data.detach().numpy()
-                sign, coe, rshift = float_to_fixed_point(scale_data, fixed_bits=16)
+                sign, coe, rshift = float_to_fixed_point(scale_data, fixed_bits=SCALE_FIXED_BITS)
                 
                 global_vars[var_prefix + "_gelu_scale_sign"] = sign.astype(np.int8)
-                global_vars[var_prefix + "_gelu_scale_coe"] = coe.astype(np.uint16)
+                global_vars[var_prefix + "_gelu_scale_coe"] = coe.astype(np.int32)
                 global_vars[var_prefix + "_gelu_scale_rshift"] = rshift.astype(np.int16)
 
 def from_pytorch(
@@ -362,6 +385,8 @@ def from_pytorch(
     for pymod in (types,):
         global_vars.update({item[0]: item[1] for item in inspect.getmembers(pymod)})
     global_vars.update({"dsl": dsl})
+    # Pass SCALE_FIXED_BITS to builder for quantization
+    global_vars.update({"__allo_quant_fixed_bits__": SCALE_FIXED_BITS})
     # 处理参数 (nn.Parameter)
     for name, param in gm.named_parameters():
         new_name = "g_" + name.replace(".", "_")
@@ -506,13 +531,13 @@ class TorchBuilder:
                         # 标量
                         # !!!: Please Notice here if you need to change the type (int8 here) of weight_scale_sign to other type
                         declarations.append(f"    {var_prefix}_weight_scale_sign: int8 = g_{var_prefix}_weight_scale_sign")
-                        declarations.append(f"    {var_prefix}_weight_scale_coe: uint16 = g_{var_prefix}_weight_scale_coe")
+                        declarations.append(f"    {var_prefix}_weight_scale_coe: int32 = g_{var_prefix}_weight_scale_coe")
                         declarations.append(f"    {var_prefix}_weight_scale_rshift: int16 = g_{var_prefix}_weight_scale_rshift")
                     else:
                         # 向量/张量
                         shape_str = ', '.join(str(s) for s in scale_shape)
                         declarations.append(f"    {var_prefix}_weight_scale_sign: int8[{shape_str}] = g_{var_prefix}_weight_scale_sign")
-                        declarations.append(f"    {var_prefix}_weight_scale_coe: uint16[{shape_str}] = g_{var_prefix}_weight_scale_coe")
+                        declarations.append(f"    {var_prefix}_weight_scale_coe: int32[{shape_str}] = g_{var_prefix}_weight_scale_coe")
                         declarations.append(f"    {var_prefix}_weight_scale_rshift: int16[{shape_str}] = g_{var_prefix}_weight_scale_rshift")
             
             # ========== 偏置相关 ==========
@@ -526,12 +551,12 @@ class TorchBuilder:
                     scale_shape = module.bias_scale.shape
                     if len(scale_shape) == 0:
                         declarations.append(f"    {var_prefix}_bias_scale_sign: int8 = g_{var_prefix}_bias_scale_sign")
-                        declarations.append(f"    {var_prefix}_bias_scale_coe: uint16 = g_{var_prefix}_bias_scale_coe")
+                        declarations.append(f"    {var_prefix}_bias_scale_coe: int32 = g_{var_prefix}_bias_scale_coe")
                         declarations.append(f"    {var_prefix}_bias_scale_rshift: int16 = g_{var_prefix}_bias_scale_rshift")
                     else:
                         shape_str = ', '.join(str(s) for s in scale_shape)
                         declarations.append(f"    {var_prefix}_bias_scale_sign: int8[{shape_str}] = g_{var_prefix}_bias_scale_sign")
-                        declarations.append(f"    {var_prefix}_bias_scale_coe: uint16[{shape_str}] = g_{var_prefix}_bias_scale_coe")
+                        declarations.append(f"    {var_prefix}_bias_scale_coe: int32[{shape_str}] = g_{var_prefix}_bias_scale_coe")
                         declarations.append(f"    {var_prefix}_bias_scale_rshift: int16[{shape_str}] = g_{var_prefix}_bias_scale_rshift")
             
             # ========== 激活量化相关的 scale ==========
@@ -544,13 +569,13 @@ class TorchBuilder:
                         if len(scale_shape) == 0:
                             # 标量
                             declarations.append(f"    {var_prefix}_{scale_name}_sign: int8 = g_{var_prefix}_{scale_name}_sign")
-                            declarations.append(f"    {var_prefix}_{scale_name}_coe: uint16 = g_{var_prefix}_{scale_name}_coe")
+                            declarations.append(f"    {var_prefix}_{scale_name}_coe: int32 = g_{var_prefix}_{scale_name}_coe")
                             declarations.append(f"    {var_prefix}_{scale_name}_rshift: int16 = g_{var_prefix}_{scale_name}_rshift")
                         else:
                             # 向量/张量
                             shape_str = ', '.join(str(s) for s in scale_shape)
                             declarations.append(f"    {var_prefix}_{scale_name}_sign: int8[{shape_str}] = g_{var_prefix}_{scale_name}_sign")
-                            declarations.append(f"    {var_prefix}_{scale_name}_coe: uint16[{shape_str}] = g_{var_prefix}_{scale_name}_coe")
+                            declarations.append(f"    {var_prefix}_{scale_name}_coe: int32[{shape_str}] = g_{var_prefix}_{scale_name}_coe")
                             declarations.append(f"    {var_prefix}_{scale_name}_rshift: int16[{shape_str}] = g_{var_prefix}_{scale_name}_rshift")
             
             # ========== Zero points（非对称量化）==========
@@ -572,12 +597,12 @@ class TorchBuilder:
                     scale_shape = module.layernorm_scale.shape
                     if len(scale_shape) == 0:
                         declarations.append(f"    {var_prefix}_layernorm_scale_sign: int8 = g_{var_prefix}_layernorm_scale_sign")
-                        declarations.append(f"    {var_prefix}_layernorm_scale_coe: uint16 = g_{var_prefix}_layernorm_scale_coe")
+                        declarations.append(f"    {var_prefix}_layernorm_scale_coe: int32 = g_{var_prefix}_layernorm_scale_coe")
                         declarations.append(f"    {var_prefix}_layernorm_scale_rshift: int16 = g_{var_prefix}_layernorm_scale_rshift")
                     else:
                         shape_str = ', '.join(str(s) for s in scale_shape)
                         declarations.append(f"    {var_prefix}_layernorm_scale_sign: int8[{shape_str}] = g_{var_prefix}_layernorm_scale_sign")
-                        declarations.append(f"    {var_prefix}_layernorm_scale_coe: uint16[{shape_str}] = g_{var_prefix}_layernorm_scale_coe")
+                        declarations.append(f"    {var_prefix}_layernorm_scale_coe: int32[{shape_str}] = g_{var_prefix}_layernorm_scale_coe")
                         declarations.append(f"    {var_prefix}_layernorm_scale_rshift: int16[{shape_str}] = g_{var_prefix}_layernorm_scale_rshift")
             
             # ========== 特殊处理：QAdd/QMatMul（双输入）==========
@@ -589,12 +614,12 @@ class TorchBuilder:
                             scale_shape = scale_attr.shape
                             if len(scale_shape) == 0:
                                 declarations.append(f"    {var_prefix}_{scale_name}_sign: int8 = g_{var_prefix}_{scale_name}_sign")
-                                declarations.append(f"    {var_prefix}_{scale_name}_coe: uint16 = g_{var_prefix}_{scale_name}_coe")
+                                declarations.append(f"    {var_prefix}_{scale_name}_coe: int32 = g_{var_prefix}_{scale_name}_coe")
                                 declarations.append(f"    {var_prefix}_{scale_name}_rshift: int16 = g_{var_prefix}_{scale_name}_rshift")
                             else:
                                 shape_str = ', '.join(str(s) for s in scale_shape)
                                 declarations.append(f"    {var_prefix}_{scale_name}_sign: int8[{shape_str}] = g_{var_prefix}_{scale_name}_sign")
-                                declarations.append(f"    {var_prefix}_{scale_name}_coe: uint16[{shape_str}] = g_{var_prefix}_{scale_name}_coe")
+                                declarations.append(f"    {var_prefix}_{scale_name}_coe: int32[{shape_str}] = g_{var_prefix}_{scale_name}_coe")
                                 declarations.append(f"    {var_prefix}_{scale_name}_rshift: int16[{shape_str}] = g_{var_prefix}_{scale_name}_rshift")
                 
                 for zero_name in ['x_zero', 'y_zero', 'o_zero']:
@@ -614,12 +639,12 @@ class TorchBuilder:
                     scale_shape = module.softmax_scale.shape
                     if len(scale_shape) == 0:
                         declarations.append(f"    {var_prefix}_softmax_scale_sign: int8 = g_{var_prefix}_softmax_scale_sign")
-                        declarations.append(f"    {var_prefix}_softmax_scale_coe: uint16 = g_{var_prefix}_softmax_scale_coe")
+                        declarations.append(f"    {var_prefix}_softmax_scale_coe: int32 = g_{var_prefix}_softmax_scale_coe")
                         declarations.append(f"    {var_prefix}_softmax_scale_rshift: int16 = g_{var_prefix}_softmax_scale_rshift")
                     else:
                         shape_str = ', '.join(str(s) for s in scale_shape)
                         declarations.append(f"    {var_prefix}_softmax_scale_sign: int8[{shape_str}] = g_{var_prefix}_softmax_scale_sign")
-                        declarations.append(f"    {var_prefix}_softmax_scale_coe: uint16[{shape_str}] = g_{var_prefix}_softmax_scale_coe")
+                        declarations.append(f"    {var_prefix}_softmax_scale_coe: int32[{shape_str}] = g_{var_prefix}_softmax_scale_coe")
                         declarations.append(f"    {var_prefix}_softmax_scale_rshift: int16[{shape_str}] = g_{var_prefix}_softmax_scale_rshift")
             
             # ========== 特殊处理：IntGELU ==========
@@ -630,12 +655,12 @@ class TorchBuilder:
                     scale_shape = module.gelu_scale.shape
                     if len(scale_shape) == 0:
                         declarations.append(f"    {var_prefix}_gelu_scale_sign: int8 = g_{var_prefix}_gelu_scale_sign")
-                        declarations.append(f"    {var_prefix}_gelu_scale_coe: uint16 = g_{var_prefix}_gelu_scale_coe")
+                        declarations.append(f"    {var_prefix}_gelu_scale_coe: int32 = g_{var_prefix}_gelu_scale_coe")
                         declarations.append(f"    {var_prefix}_gelu_scale_rshift: int16 = g_{var_prefix}_gelu_scale_rshift")
                     else:
                         shape_str = ', '.join(str(s) for s in scale_shape)
                         declarations.append(f"    {var_prefix}_gelu_scale_sign: int8[{shape_str}] = g_{var_prefix}_gelu_scale_sign")
-                        declarations.append(f"    {var_prefix}_gelu_scale_coe: uint16[{shape_str}] = g_{var_prefix}_gelu_scale_coe")
+                        declarations.append(f"    {var_prefix}_gelu_scale_coe: int32[{shape_str}] = g_{var_prefix}_gelu_scale_coe")
                         declarations.append(f"    {var_prefix}_gelu_scale_rshift: int16[{shape_str}] = g_{var_prefix}_gelu_scale_rshift")
 
         # 返回所有声明，每个声明一行

@@ -9,6 +9,9 @@
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Pass/Pass.h"
 
+#include "allo/Dialect/PYNQDialect.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
+
 namespace mlir {
 namespace allo {
 
@@ -20,6 +23,8 @@ std::unique_ptr<OperationPass<ModuleOp>> createRemoveStrideMapPass();
 std::unique_ptr<OperationPass<ModuleOp>> createMemRefDCEPass();
 std::unique_ptr<OperationPass<ModuleOp>> createDataPlacementPass();
 std::unique_ptr<OperationPass<ModuleOp>> createMergeSubviewAndCopyPass();
+std::unique_ptr<OperationPass<ModuleOp>> createPYNQHoistBufferAllocPass();
+std::unique_ptr<OperationPass<ModuleOp>> createPYNQBufferAllocationPass();
 
 bool applyLoopTransformation(ModuleOp &f);
 bool applyAnyWidthInteger(ModuleOp &module);

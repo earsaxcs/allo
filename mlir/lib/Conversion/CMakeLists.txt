@@ -14,6 +14,7 @@ add_mlir_dialect_library(MLIRAlloConversion
     DEPENDS
     MLIRAlloOpsIncGen
     MLIRVivadoOpsIncGen
+    MLIRPYNQOpsIncGen
     MLIRAlloTypesIncGen
     MLIRAlloPassesIncGen
     MLIRAlloConversionPassesIncGen
