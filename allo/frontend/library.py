@@ -3,7 +3,7 @@
 # pylint: disable = unsubscriptable-object, unsupported-assignment-operation
 # This file is the library of Allo frontend functions, which is responsible for converting PyTorch leaf modules to Allo representation.
 from .. import dsl
-from ..ir.types import float32, int32
+from ..ir.types import float32, int32, int8
 
 
 def KVCache_lib(s_0, s_1, s_2, s_3):
@@ -46,20 +46,41 @@ def CoreAttention_lib(s_0, s_1, s_2, s_3):
 
     return CoreAttention
 
-def ViTGetFirstToken_lib(s_0, s_1, s_2):
+def ViTGetFirstToken_float32_lib(s_0, s_1, s_2):
+    """Generate ViTGetFirstToken function for float32 type."""
     def ViTGetFirstToken(x: float32[s_0, s_1, s_2]) -> float32[s_0, s_2]:
-        first_token: float32[s_0, s_2] # = 0.0
+        first_token: float32[s_0, s_2]
         for i, j in dsl.grid(s_0, s_2):
             first_token[i, j] = x[i, 0, j]
         return first_token
-    
     return ViTGetFirstToken
 
-def ViTTokenExpand_lib(s_0, s_1, s_2):
+
+def ViTGetFirstToken_int8_lib(s_0, s_1, s_2):
+    """Generate ViTGetFirstToken function for int8 type."""
+    def ViTGetFirstToken(x: int8[s_0, s_1, s_2]) -> int8[s_0, s_2]:
+        first_token: int8[s_0, s_2]
+        for i, j in dsl.grid(s_0, s_2):
+            first_token[i, j] = x[i, 0, j]
+        return first_token
+    return ViTGetFirstToken
+
+
+def ViTTokenExpand_float32_lib(s_0, s_1, s_2):
+    """Generate ViTTokenExpand function for float32 type."""
     def ViTTokenExpand(token: float32[1, s_1, s_2]) -> float32[s_0, s_1, s_2]:
-        tokens: float32[s_0, s_1, s_2] # = 0.0
+        tokens: float32[s_0, s_1, s_2]
         for i, j, k in dsl.grid(s_0, s_1, s_2):
             tokens[i, j, k] = token[0, j, k]
         return tokens
-    
+    return ViTTokenExpand
+
+
+def ViTTokenExpand_int8_lib(s_0, s_1, s_2):
+    """Generate ViTTokenExpand function for int8 type."""
+    def ViTTokenExpand(token: int8[1, s_1, s_2]) -> int8[s_0, s_1, s_2]:
+        tokens: int8[s_0, s_1, s_2]
+        for i, j, k in dsl.grid(s_0, s_1, s_2):
+            tokens[i, j, k] = token[0, j, k]
+        return tokens
     return ViTTokenExpand

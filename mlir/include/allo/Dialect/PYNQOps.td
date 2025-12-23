@@ -18,14 +18,18 @@
  * 
  * Instruction Field Widths (from instr.h):
  *   - BUFFER_ID_WIDTH: 3 bits (0-7)
- *   - TILE_ID_WIDTH: 3 bits (0-7, represents 1-8 tiles)
+ *   - TILE_ID_WIDTH: 3 bits (1-8 tiles)
  *   - PKG_ID_WIDTH: 12 bits (total package count)
  *   - REDUCE_K_ID_WIDTH: 8 bits (reduce axis element count)
- *   - HEAD_COUNT_ID_WIDTH: 3 bits (multi-head attention head count)
+ *   - HEAD_COUNT_ID_WIDTH: 2 bits (multi-head attention head count, 1-4)
  *   - HEAD_TILE_AXIS_ID_WIDTH: 1 bit (head tile axis selector)
  *   - ENABLE_BIAS_ID_WIDTH: 1 bit (bias enable flag)
  *   - ENABLE_TRANSPOSE_ID_WIDTH: 1 bit (transpose flag)
+ *   - MATRIX_RESERVED_BITS_0: 4 bits (reserved)
  *   - OP_ID_WIDTH: 2 bits (vector operation type)
+ *
+ * Note: For Reduce K, Head Count and Tile Count fields, the hardware encoding uses (value - 1)
+ * But you don't need to concern with this because it will be handled by the Runtime.
  * 
  * Note: Dialect and Type definitions are in PYNQDialect.td and PYNQTypes.td
  *       Attribute definitions are in PYNQAttrs.td
@@ -178,25 +182,26 @@ def PYNQ_MatMulInstrOp : PYNQ_Op<"matmul_instr", []> {
       bits[0:2]   - RD: output_buffer_id (3 bits)
       bits[3:5]   - RS2: input_buffer_id (3 bits)  
       bits[6:8]   - RS1: weight_buffer_id (3 bits)
-      bits[9:11]  - input_tile_count - 1 (3 bits, value 0-7 represents 1-8 tiles)
-      bits[12:14] - weight_tile_count - 1 (3 bits)
-      bits[15:22] - reduce_k - 1 (8 bits, reduce axis element count)
-      bits[23:25] - head_count (3 bits, for multi-head attention)
-      bits[26]    - head_tile_axis (1 bit, axis selector for head tiling)
-      bits[27:29] - reserved (3 bits)
-      bit[30]     - enable_bias (1 bit, whether to add bias)
-      bit[31]     - enable_transpose (1 bit, transpose weight matrix)
+      bits[9:11]  - input_tile_count (3 bits, value 1-8)
+      bits[12:14] - weight_tile_count (3 bits, value 1-8)
+      bits[15:22] - reduce_k (8 bits, reduction dimension size, 1-256)
+      bits[23:24] - head_count (2 bits, number of attention heads, 1-4)
+      bits[25]    - head_tile_axis (1 bit, tiling axis for multi-head attention)
+      bits[26:29] - reserved (4 bits)
+      bit[30]     - enable_bias (1 bit, add bias vector: 0=no, 1=yes)
+      bit[31]     - enable_transpose (1 bit, transpose output matrix: 0=no, 1=yes)
     
     Note:
       - 1 tile = 32 bytes = 32 x i8
       - Buffer IDs use RISC-V style naming: RS1 (input), RS2 (weight), RD (output)
+      - buffer_msg array is packed in reverse order: [2]=RD, [1]=RS2, [0]=RS1
       - All parameters are passed as u32, matching instr.h function signature
     
     Hardware constraints:
     - Buffer IDs must be in range [0, 7]
-    - Tile counts must be in range [1, 8] (encoded as count-1)
-    - reduce_k must be in range [1, 256] (encoded as reduce_k-1)
-    - head_count in range [0, 7]
+    - Tile counts must be in range [1, 8]
+    - reduce_k must be in range [1, 256]
+    - head_count must be in range [1, 4]
     
     Example:
       pynq.matmul_instr 
@@ -207,16 +212,16 @@ def PYNQ_MatMulInstrOp : PYNQ_Op<"matmul_instr", []> {
   }];
   
   let arguments = (ins
-    I32:$input_buffer_id,      // RS1: input buffer ID (0-7)
-    I32:$weight_buffer_id,     // RS2: weight buffer ID (0-7)
-    I32:$output_buffer_id,     // RD: output buffer ID (0-7)
-    I32:$input_tile_count,     // Input tile count (1-8), encoded as count-1
-    I32:$weight_tile_count,    // Weight tile count (1-8), encoded as count-1
-    I32:$reduce_k,             // Reduce axis element count (1-256), encoded as k-1
-    I32:$head_count,           // Multi-head attention head count (0-7)
-    I32:$head_tile_axis,       // Head tile axis selector (0 or 1)
-    I32:$enable_bias,          // Whether to add bias (0 or 1)
-    I32:$enable_transpose      // Whether to transpose weight (0 or 1)
+    I32:$input_buffer_id,      // RS1 (buffer_msg[0]): input buffer ID (0-7)
+    I32:$weight_buffer_id,     // RS2 (buffer_msg[1]): weight buffer ID (0-7)
+    I32:$output_buffer_id,     // RD (buffer_msg[2]): output buffer ID (0-7)
+    I32:$input_tile_count,     // Input tile count (1-8)
+    I32:$weight_tile_count,    // Weight tile count (1-8)
+    I32:$reduce_k,             // Reduction dimension size (1-256)
+    I32:$head_count,           // Number of attention heads (1-4)
+    I32:$head_tile_axis,       // Tiling axis for multi-head attention (0 or 1)
+    I32:$enable_bias,          // Add bias vector (0=no, 1=yes)
+    I32:$enable_transpose      // Transpose weight matrix (0=no, 1=yes)
   );
   
   let results = (outs);
@@ -249,13 +254,14 @@ def PYNQ_DataTransferOp : PYNQ_Op<"data_transfer", []> {
     Maps to gen_data_instr() in instr.h.
     
     Instruction format (32 bits) - gen_data_instr():
-      bits[0:11]  - total_pkg_num (12 bits, total number of packages)
-      bits[12:14] - tile_count - 1 (3 bits, value 0-7 represents 1-8 tiles)
-      bits[15:17] - buffer_id (3 bits)
+      bits[0:11]  - total_pkg_num (12 bits, total number of packages, 0-4095)
+      bits[12:14] - tile_count (3 bits, value 1-8)
+      bits[15:17] - buffer_id (3 bits, on-chip buffer ID 0-7)
       bits[18:31] - reserved (14 bits)
 
     Note:
-      - 1 pkg = 256 bits = 32 x i8 (one DMA transfer unit)
+      - 1 package = 256 bits = 32 bytes (one DMA transfer unit)
+      - 1 tile = 32 bytes = 32 x int8
       - Direction is not part of the instruction encoding, but determines
         which hardware register to write to trigger the DMA
       - All parameters are passed as u32, matching instr.h function signature
@@ -286,7 +292,7 @@ def PYNQ_DataTransferOp : PYNQ_Op<"data_transfer", []> {
   let arguments = (ins
     AnyMemRef:$data,          // Host memory buffer
     I32:$buffer_id,           // On-chip buffer ID (0-7)
-    I32:$tile_count,          // Number of tiles (1-8), encoded as count-1
+    I32:$tile_count,          // Number of tiles (1-8)
     I32:$total_pkg_num,       // Total number of packages to transfer
     I32:$direction            // 0 = host->device, 1 = device->host
   );
@@ -312,12 +318,12 @@ def PYNQ_DataTransferOp : PYNQ_Op<"data_transfer", []> {
 //===----------------------------------------------------------------------===//
 // 
 // Vector instructions share a common encoding format - gen_vector_instr():
-//   bits[0:2]   - buffer_id (3 bits, primary buffer)
-//   bits[3:5]   - tile_count - 1 (3 bits)
-//   bits[6:13]  - reduce_k (8 bits)
+//   bits[0:2]   - buffer_id (3 bits, primary buffer ID)
+//   bits[3:5]   - tile_count (3 bits, value 1-8)
+//   bits[6:13]  - reduce_k (8 bits, 1-256)
 //   bits[14:15] - op (2 bits, operation type)
 //   bits[16:18] - extra_buffer_id (3 bits, secondary buffer for some ops)
-//   bits[19:31] - reserved
+//   bits[19:31] - reserved (13 bits)
 //
 // Operation types (op field):
 //   0 = GELU
@@ -339,20 +345,20 @@ class PYNQ_VectorOpBase<string mnemonic, string opSummary, int opCode>
     Vector operation mapped to gen_vector_instr() in instr.h.
     
     Instruction format (32 bits):
-      bits[0:2]   - buffer_id (3 bits)
-      bits[3:5]   - tile_count - 1 (3 bits)
-      bits[6:13]  - reduce_k (8 bits)
-      bits[14:15] - op (2 bits)
-      bits[16:18] - extra_buffer_id (3 bits)
-      bits[19:31] - reserved
+      bits[0:2]   - buffer_id (3 bits, primary buffer ID)
+      bits[3:5]   - tile_count (3 bits, value 1-8)
+      bits[6:13]  - reduce_k (8 bits, 1-256)
+      bits[14:15] - op (2 bits, operation type)
+      bits[16:18] - extra_buffer_id (3 bits, secondary buffer ID)
+      bits[19:31] - reserved (13 bits)
   }];
   
   // Common arguments for vector ops (all u32 to match instr.h)
   let arguments = (ins
     I32:$buffer_id,           // Primary buffer ID (0-7)
-    I32:$tile_count,          // Tile count (1-8), encoded as count-1
-    I32:$reduce_k,            // Reduce dimension size
-    I32:$extra_buffer_id      // Secondary buffer ID (for ops that need it)
+    I32:$tile_count,          // Tile count (1-8)
+    I32:$reduce_k,            // Reduce dimension size (1-256)
+    I32:$extra_buffer_id      // Secondary buffer ID (0-7, for ops that need it)
   );
   
   let results = (outs);
@@ -385,19 +391,19 @@ class PYNQ_SimpleVectorOpBase<string mnemonic, string opSummary, int opCode>
     extra_buffer_id is not used and will be set to 0 during codegen.
     
     Instruction format (32 bits):
-      bits[0:2]   - buffer_id (3 bits)
-      bits[3:5]   - tile_count - 1 (3 bits)
-      bits[6:13]  - reduce_k (8 bits)
-      bits[14:15] - op (2 bits)
-      bits[16:18] - extra_buffer_id = 0 (unused)
-      bits[19:31] - reserved
+      bits[0:2]   - buffer_id (3 bits, primary buffer ID)
+      bits[3:5]   - tile_count (3 bits, 1-8)
+      bits[6:13]  - reduce_k (8 bits, 1-256)
+      bits[14:15] - op (2 bits, operation type)
+      bits[16:18] - extra_buffer_id = 0 (unused, 3 bits)
+      bits[19:31] - reserved (13 bits)
   }];
   
   // Override: Arguments without extra_buffer_id
   let arguments = (ins
     I32:$buffer_id,           // Primary buffer ID (0-7)
-    I32:$tile_count,          // Tile count (1-8), encoded as count-1
-    I32:$reduce_k             // Reduce dimension size / element count
+    I32:$tile_count,          // Tile count (1-8)
+    I32:$reduce_k             // Reduce dimension size (1-256)
   );
   
   // Override: Simplified assembly format
@@ -428,12 +434,12 @@ def PYNQ_GELUOp : PYNQ_SimpleVectorOpBase<"gelu",
     Maps to gen_vector_instr() with op = 0.
     
     Instruction format (32 bits) - gen_vector_instr():
-      bits[0:2]   - buffer_id (3 bits, input/output buffer)
-      bits[3:5]   - tile_count - 1 (3 bits)
-      bits[6:13]  - reduce_k (8 bits, number of elements)
+      bits[0:2]   - buffer_id (3 bits, input/output buffer ID)
+      bits[3:5]   - tile_count (3 bits, 1-8)
+      bits[6:13]  - reduce_k (8 bits, 1-256)
       bits[14:15] - op = 0 (2 bits, GELU operation)
       bits[16:18] - extra_buffer_id (3 bits, unused, set to 0)
-      bits[19:31] - reserved
+      bits[19:31] - reserved (13 bits)
     
     GELU is applied element-wise: GELU(x) = x * Φ(x)
     where Φ is the cumulative distribution function of standard normal.
@@ -454,12 +460,12 @@ def PYNQ_QAddOp : PYNQ_VectorOpBase<"qadd",
     Maps to gen_vector_instr() with op = 1.
     
     Instruction format (32 bits) - gen_vector_instr():
-      bits[0:2]   - buffer_id (3 bits, first input and output buffer)
-      bits[3:5]   - tile_count - 1 (3 bits)
-      bits[6:13]  - reduce_k (8 bits, number of elements)
+      bits[0:2]   - buffer_id (3 bits, first input and output buffer ID)
+      bits[3:5]   - tile_count (3 bits, value 1-8)
+      bits[6:13]  - reduce_k (8 bits, number of elements, 1-256)
       bits[14:15] - op = 1 (2 bits, QAdd operation)
-      bits[16:18] - extra_buffer_id (3 bits, second input buffer)
-      bits[19:31] - reserved
+      bits[16:18] - extra_buffer_id (3 bits, second input buffer ID)
+      bits[19:31] - reserved (13 bits)
     
     The operation performs: buffer[buffer_id] += buffer[extra_buffer_id]
     Result is stored in buffer_id (in-place addition).
@@ -482,12 +488,12 @@ def PYNQ_SoftmaxOp : PYNQ_SimpleVectorOpBase<"softmax",
     Maps to gen_vector_instr() with op = 2.
     
     Instruction format (32 bits) - gen_vector_instr():
-      bits[0:2]   - buffer_id (3 bits, input/output buffer)
-      bits[3:5]   - tile_count - 1 (3 bits)
-      bits[6:13]  - reduce_k (8 bits, softmax dimension size)
+      bits[0:2]   - buffer_id (3 bits, input/output buffer ID)
+      bits[3:5]   - tile_count (3 bits, value 1-8)
+      bits[6:13]  - reduce_k (8 bits, softmax dimension size, 1-256)
       bits[14:15] - op = 2 (2 bits, softmax operation)
       bits[16:18] - extra_buffer_id (3 bits, unused, set to 0)
-      bits[19:31] - reserved
+      bits[19:31] - reserved (13 bits)
     
     The operation is performed in-place on the specified buffer.
     reduce_k specifies the dimension size for softmax normalization.
@@ -508,12 +514,12 @@ def PYNQ_LayerNormOp : PYNQ_SimpleVectorOpBase<"layernorm",
     Maps to gen_vector_instr() with op = 3.
     
     Instruction format (32 bits) - gen_vector_instr():
-      bits[0:2]   - buffer_id (3 bits, input/output buffer)
-      bits[3:5]   - tile_count - 1 (3 bits)
-      bits[6:13]  - reduce_k (8 bits, normalization dimension size)
+      bits[0:2]   - buffer_id (3 bits, input/output buffer ID)
+      bits[3:5]   - tile_count (3 bits, value 1-8)
+      bits[6:13]  - reduce_k (8 bits, normalization dimension size, 1-256)
       bits[14:15] - op = 3 (2 bits, layernorm operation)
       bits[16:18] - extra_buffer_id (3 bits, unused, set to 0)
-      bits[19:31] - reserved
+      bits[19:31] - reserved (13 bits)
     
     The operation normalizes the data in-place on the specified buffer.
     
@@ -534,12 +540,12 @@ def PYNQ_VectorOp : PYNQ_Op<"vector_op", []> {
     Maps to gen_vector_instr() with configurable op field.
     
     Instruction format (32 bits) - gen_vector_instr():
-      bits[0:2]   - buffer_id (3 bits)
-      bits[3:5]   - tile_count - 1 (3 bits)
-      bits[6:13]  - reduce_k (8 bits)
+      bits[0:2]   - buffer_id (3 bits, primary buffer ID)
+      bits[3:5]   - tile_count (3 bits, value 1-8)
+      bits[6:13]  - reduce_k (8 bits, 1-256)
       bits[14:15] - op (2 bits, operation type 0-3)
-      bits[16:18] - extra_buffer_id (3 bits)
-      bits[19:31] - reserved
+      bits[16:18] - extra_buffer_id (3 bits, secondary buffer ID)
+      bits[19:31] - reserved (13 bits)
     
     Use this op when:
     - You need to specify a custom op code
@@ -558,8 +564,8 @@ def PYNQ_VectorOp : PYNQ_Op<"vector_op", []> {
   
   let arguments = (ins
     I32:$buffer_id,           // Primary buffer ID (0-7)
-    I32:$tile_count,          // Tile count (1-8), encoded as count-1
-    I32:$reduce_k,            // Operation parameter
+    I32:$tile_count,          // Tile count (1-8)
+    I32:$reduce_k,            // Operation parameter (1-256)
     I32:$op,                  // Operation type (0-3)
     I32:$extra_buffer_id      // Secondary buffer ID (0-7)
   );
@@ -606,6 +612,110 @@ def PYNQ_SyncOp : PYNQ_Op<"sync", []> {
   let results = (outs);
   
   let assemblyFormat = [{ attr-dict }];
+}
+
+//===----------------------------------------------------------------------===//
+// PYNQ CPU-side Quantize Op
+//===----------------------------------------------------------------------===//
+
+def PYNQ_QuantOp : PYNQ_Op<"quant", []> {
+  let summary = "CPU-side (PS) quantization operation";
+  let description = [{
+    Performs floating-point to integer quantization on the ARM CPU (PS).
+    This op runs on the CPU, not on the FPGA accelerator (PL).
+    
+    **Operation:**
+    For symmetric mode: q = round(x / scale)
+    For asymmetric mode: q = round(x / scale) + zero
+    
+    **Purpose:**
+    Used at quantized/non-quantized boundaries where float tensors
+    (e.g., cls_token, position_embeddings) need to be converted to
+    integer format before being processed by quantized operations.
+    
+    **Quant Mode Encoding (2-bit):**
+    - 0: symmetric, per-tensor
+    - 1: asymmetric, per-tensor  
+    - 2: symmetric, per-token
+    - 3: asymmetric, per-token
+    
+    **Code Generation:**
+    Will be lowered to CPU loop code that performs element-wise quantization.
+    
+    Example:
+      pynq.quant output = %int_buf, input = %float_buf,
+                 scale = %scale, quant_mode = 0
+  }];
+  
+  let arguments = (ins
+    AnyMemRef:$output,           // Output integer memref (pre-allocated)
+    AnyMemRef:$input,            // Input float memref
+    I32:$scale,                  // Packed scale (sign, coe, rshift in 32-bit)
+    Optional<I32>:$zero,         // Zero point (for asymmetric mode)
+    I8Attr:$quant_mode           // Quantization mode (0-3)
+  );
+  
+  let results = (outs);
+  
+  let assemblyFormat = [{
+    `output` `=` $output `,` `input` `=` $input `,`
+    `scale` `=` $scale
+    (`zero` `=` $zero^)?
+    `quant_mode` `=` $quant_mode attr-dict `:` 
+    type($output) `,` type($input)
+  }];
+}
+
+//===----------------------------------------------------------------------===//
+// PYNQ CPU-side Dequantize Op
+//===----------------------------------------------------------------------===//
+
+def PYNQ_DequantOp : PYNQ_Op<"dequant", []> {
+  let summary = "CPU-side (PS) dequantization operation";
+  let description = [{
+    Performs integer to floating-point dequantization on the ARM CPU (PS).
+    This op runs on the CPU, not on the FPGA accelerator (PL).
+    
+    **Operation:**
+    For symmetric mode: x = q * scale
+    For asymmetric mode: x = (q - zero) * scale
+    
+    **Purpose:**
+    Used at quantized/non-quantized boundaries where integer tensors
+    need to be converted back to float format for operations that
+    require floating-point precision (e.g., final output, comparison).
+    
+    **Quant Mode Encoding (2-bit):**
+    - 0: symmetric, per-tensor
+    - 1: asymmetric, per-tensor
+    - 2: symmetric, per-token
+    - 3: asymmetric, per-token
+    
+    **Code Generation:**
+    Will be lowered to CPU loop code that performs element-wise dequantization.
+    
+    Example:
+      pynq.dequant output = %float_buf, input = %int_buf,
+                   scale = %scale, quant_mode = 0
+  }];
+  
+  let arguments = (ins
+    AnyMemRef:$output,           // Output float memref (pre-allocated)
+    AnyMemRef:$input,            // Input integer memref
+    I32:$scale,                  // Packed scale (sign, coe, rshift in 32-bit)
+    Optional<I32>:$zero,         // Zero point (for asymmetric mode)
+    I8Attr:$quant_mode           // Quantization mode (0-3)
+  );
+  
+  let results = (outs);
+  
+  let assemblyFormat = [{
+    `output` `=` $output `,` `input` `=` $input `,`
+    `scale` `=` $scale
+    (`zero` `=` $zero^)?
+    `quant_mode` `=` $quant_mode attr-dict `:` 
+    type($output) `,` type($input)
+  }];
 }
 
 // //===----------------------------------------------------------------------===//

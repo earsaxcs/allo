@@ -194,14 +194,16 @@ def concat(x, y, axis=0):
 # TODO: here just remain as placeholder
 
 def qlinear(X, W, fscl_sign, fscl_coe, fscl_rshift, iscl_sign, iscl_coe, iscl_rshift, 
-            oscl_sign, oscl_coe, oscl_rshift, wscl_sign, wscl_coe, wscl_rshift, 
+            oscl_sign, oscl_coe, oscl_rshift, oscl_inv_sign, oscl_inv_coe, oscl_inv_rshift,
+            wscl_sign, wscl_coe, wscl_rshift, 
             bscl_sign=None, bscl_coe=None, bscl_rshift=None, izr=None, ozr=None, bias=None, name=None):
     if bias is None:
         return matmul(X, W.T)
     return matmul(X, W.T) + bias
 
 def qconv2d(inp, filter, _stride, fscl_sign, fscl_coe, fscl_rshift, iscl_sign, iscl_coe, iscl_rshift,
-            oscl_sign, oscl_coe, oscl_rshift, wscl_sign, wscl_coe, wscl_rshift,
+            oscl_sign, oscl_coe, oscl_rshift, oscl_inv_sign, oscl_inv_coe, oscl_inv_rshift,
+            wscl_sign, wscl_coe, wscl_rshift,
             bscl_sign=None, bscl_coe=None, bscl_rshift=None, izr=None, ozr=None, bias=None, name=None):
     # TODO: implement quantization logic with scales and zero points
     view_shape = (
@@ -218,7 +220,8 @@ def qconv2d(inp, filter, _stride, fscl_sign, fscl_coe, fscl_rshift, iscl_sign, i
 def int_gelu(x, input_scale_sign, input_scale_coe, input_scale_rshift,
           gelu_scale_sign, gelu_scale_coe, gelu_scale_rshift,
           fused_scale_sign, fused_scale_coe, fused_scale_rshift,
-          output_scale_sign, output_scale_coe, output_scale_rshift, 
+          output_scale_sign, output_scale_coe, output_scale_rshift,
+          output_scale_inv_sign, output_scale_inv_coe, output_scale_inv_rshift,
           input_zero=None, output_zero=None, name=None):
     """IntGELU 的 DSL 包装器 - 接受定点化的 scale 参数
     Args:
@@ -235,6 +238,7 @@ def int_gelu(x, input_scale_sign, input_scale_coe, input_scale_rshift,
 def int_softmax(x, input_scale_sign, input_scale_coe, input_scale_rshift,
              softmax_scale_sign, softmax_scale_coe, softmax_scale_rshift,
              output_scale_sign, output_scale_coe, output_scale_rshift,
+             output_scale_inv_sign, output_scale_inv_coe, output_scale_inv_rshift,
              fused_scale_sign=None, fused_scale_coe=None, fused_scale_rshift=None,
              input_zero=None, output_zero=None, name=None):
     """IntSoftmax 的 DSL 包装器 - 接受定点化的 scale 参数"""
@@ -246,6 +250,7 @@ def int_layernorm(x, bias_int,
                bias_scale_sign, bias_scale_coe, bias_scale_rshift,
                fused_scale_sign, fused_scale_coe, fused_scale_rshift,
                output_scale_sign, output_scale_coe, output_scale_rshift,
+               output_scale_inv_sign, output_scale_inv_coe, output_scale_inv_rshift,
                input_zero=None, output_zero=None, eps: float = 1e-5):
     """IntLayerNorm 的 DSL 包装器 - 接受定点化的 scale 参数"""
     pass
@@ -254,6 +259,7 @@ def qmatmul(lhs, rhs,
             x_scale_sign, x_scale_coe, x_scale_rshift,
             y_scale_sign, y_scale_coe, y_scale_rshift,
             o_scale_sign, o_scale_coe, o_scale_rshift,
+            o_scale_inv_sign, o_scale_inv_coe, o_scale_inv_rshift,
             x_zero=None, y_zero=None, o_zero=None, name=None):
     """QMatMul 的 DSL 包装器 - 接受定点化的 scale 参数"""
     pass
@@ -262,6 +268,7 @@ def qmatmul_isqrtd(lhs, rhs,
             x_scale_sign, x_scale_coe, x_scale_rshift,
             y_scale_sign, y_scale_coe, y_scale_rshift,
             o_scale_sign, o_scale_coe, o_scale_rshift,
+            o_scale_inv_sign, o_scale_inv_coe, o_scale_inv_rshift,
             x_zero=None, y_zero=None, o_zero=None, name=None):
     """QMatMul 的 DSL 包装器 - 接受定点化的 scale 参数"""
     pass
@@ -269,6 +276,85 @@ def qadd(lhs, rhs,
          x_scale_sign, x_scale_coe, x_scale_rshift,
          y_scale_sign, y_scale_coe, y_scale_rshift,
          o_scale_sign, o_scale_coe, o_scale_rshift,
+         o_scale_inv_sign, o_scale_inv_coe, o_scale_inv_rshift,
          x_zero=None, y_zero=None, o_zero=None, name=None):
     """QAdd 的 DSL 包装器 - 接受定点化的 scale 参数"""
+    pass
+
+
+# ==================== Quantize/Dequantize Operations ====================
+# 
+# Quant Mode Encoding:
+#   quant_mode (int8): 2-bit encoding
+#     - Bit 0: 0 = symmetric, 1 = asymmetric
+#     - Bit 1: 0 = per-tensor, 1 = per-token
+#   Values:
+#     0b00 = 0: symmetric, per-tensor
+#     0b01 = 1: asymmetric, per-tensor
+#     0b10 = 2: symmetric, per-token
+#     0b11 = 3: asymmetric, per-token
+#
+# Quant:  float input  -> int output
+# Dequant: int input   -> float output
+
+# Quant mode constants
+QUANT_SYM_TENSOR = 0    # 0b00: symmetric, per-tensor
+QUANT_ASYM_TENSOR = 1   # 0b01: asymmetric, per-tensor
+QUANT_SYM_TOKEN = 2     # 0b10: symmetric, per-token
+QUANT_ASYM_TOKEN = 3    # 0b11: asymmetric, per-token
+
+
+def quant(x, quant_mode, scale_sign, scale_coe, scale_rshift, zero=None, name=None):
+    """Quantize: float -> int
+    
+    将浮点张量量化为整数张量。
+    
+    Args:
+        x: 输入浮点张量
+        quant_mode: 量化模式 (int8)
+            - 0: symmetric, per-tensor
+            - 1: asymmetric, per-tensor
+            - 2: symmetric, per-token
+            - 3: asymmetric, per-token
+        scale_sign, scale_coe, scale_rshift: scale 的定点表示三元组
+            scale = sign * coe * 2^(-rshift)
+        zero: 零点 (仅 asymmetric 模式需要)
+        name: 操作名称 (可选)
+    
+    Returns:
+        量化后的整数张量
+    
+    Quantization formula:
+        symmetric:  q = round(x / scale)
+        asymmetric: q = round(x / scale) + zero
+    """
+    # Python simulation (placeholder)
+    pass
+
+
+def dequant(x, quant_mode, scale_sign, scale_coe, scale_rshift, zero=None, name=None):
+    """Dequantize: int -> float
+    
+    将整数张量反量化为浮点张量。
+    
+    Args:
+        x: 输入整数张量
+        quant_mode: 量化模式 (int8)
+            - 0: symmetric, per-tensor
+            - 1: asymmetric, per-tensor
+            - 2: symmetric, per-token
+            - 3: asymmetric, per-token
+        scale_sign, scale_coe, scale_rshift: scale 的定点表示三元组
+            scale = sign * coe * 2^(-rshift)
+        zero: 零点 (仅 asymmetric 模式需要)
+        name: 操作名称 (可选)
+    
+    Returns:
+        反量化后的浮点张量
+    
+    Dequantization formula:
+        symmetric:  x = q * scale
+        asymmetric: x = (q - zero) * scale
+    """
+    # Python simulation (placeholder)
     pass

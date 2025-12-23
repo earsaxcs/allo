@@ -838,9 +838,17 @@ class ASTTransformer(ASTBuilder):
                     store_op = build_stmt(ctx, target, val=rhs, idx=idx)
             return rhs
         # Store LHS
-        rhs = ASTTransformer.build_cast_op(
-            ctx, rhs, node.value.dtype, node.dtype, node.value.shape
+        # Skip automatic type casting for quant/dequant operations to preserve their semantics
+        # quant: float->int, dequant: int->float (explicit type conversion)
+        is_quant_dequant = (
+            isinstance(node.value, ast.Call) and 
+            isinstance(node.value.func, ast.Attribute) and 
+            node.value.func.attr in {"quant", "dequant"}
         )
+        if not is_quant_dequant:
+            rhs = ASTTransformer.build_cast_op(
+                ctx, rhs, node.value.dtype, node.dtype, node.value.shape
+            )
         rhs = ASTTransformer.build_broadcast_op(
             ctx, rhs, node.dtype, node.value.shape, node.shape, node.dims[1]  # rhs
         )
@@ -1964,6 +1972,9 @@ class ASTTransformer(ASTBuilder):
                 "int_gelu",
                 "int_softmax",
                 "int_layernorm",
+                # quant/dequant
+                "quant",
+                "dequant",
             }:
                 return ASTTransformer.build_library_op(
                     ctx, node=node, attr=fn_name, new_args=new_args
@@ -2046,6 +2057,8 @@ class ASTTransformer(ASTBuilder):
                 "int_gelu",
                 "int_softmax",
                 "int_layernorm",
+                "quant",
+                "dequant",
             }:
                 return quant_ops_builder.build_quant_placeholder(ctx, node, attr, new_args, alloc_op.result, transformer_cls=ASTTransformer)
             if attr == "concat":

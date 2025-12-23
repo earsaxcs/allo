@@ -191,6 +191,8 @@ static uint32_t packScaleValues(int8_t sign, uint32_t coe, int16_t rshift,
 
 // Convert a global memref<...xi8/i16> to packed memref<...xi32>
 // This creates a new global constant with packed values
+// Note: This function checks if a packed global already exists to avoid redundant packing.
+// This is important because multiple ops (e.g., quant, dequant, qmatmul) may share the same scale.
 static Value convertGlobalScaleToPacked(
     PatternRewriter &rewriter, Location loc, ModuleOp module,
     Value signGlobal, Value coeGlobal, Value rshiftGlobal,
@@ -206,8 +208,26 @@ static Value convertGlobalScaleToPacked(
     return Value();
   }
   
-  // Find the global ops
+  // Generate unique name for packed global
+  std::string packedName = baseName + "_packed";
+  
+  // **Early check**: if this packed global already exists, return it directly
+  // This avoids redundant packing when multiple ops (e.g., quant/dequant/qmatmul) share scales
   auto signGlobalOp = module.lookupSymbol<memref::GlobalOp>(signGetGlobal.getName());
+  if (signGlobalOp) {
+    auto signType = signGlobalOp.getType().cast<MemRefType>();
+    auto i32Type = rewriter.getI32Type();
+    auto packedMemRefType = MemRefType::get(signType.getShape(), i32Type);
+    
+    if (auto existingGlobal = module.lookupSymbol<memref::GlobalOp>(packedName)) {
+      // Packed global exists - return reference without recomputing
+      OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointAfter(signGetGlobal);
+      return rewriter.create<memref::GetGlobalOp>(loc, packedMemRefType, packedName);
+    }
+  }
+  
+  // Find the global ops for packing
   auto coeGlobalOp = module.lookupSymbol<memref::GlobalOp>(coeGetGlobal.getName());
   auto rshiftGlobalOp = module.lookupSymbol<memref::GlobalOp>(rshiftGetGlobal.getName());
   
@@ -246,7 +266,8 @@ static Value convertGlobalScaleToPacked(
   // Create packed values
   SmallVector<uint32_t> packedValues;
   auto signValues = signDense.getValues<int8_t>();
-  auto coeValues = coeDense.getValues<uint16_t>();
+  // in the original input coe, it's stored as int32_t
+  auto coeValues = coeDense.getValues<int32_t>();
   auto rshiftValues = rshiftDense.getValues<int16_t>();
   
   auto signIt = signValues.begin();
@@ -254,7 +275,7 @@ static Value convertGlobalScaleToPacked(
   auto rshiftIt = rshiftValues.begin();
   
   while (signIt != signValues.end() && coeIt != coeValues.end() && rshiftIt != rshiftValues.end()) {
-    uint32_t packed = packScaleValues(*signIt, *coeIt, *rshiftIt,
+    uint32_t packed = packScaleValues(*signIt, static_cast<uint32_t>(*coeIt) & 0xFFFFFFFF, *rshiftIt,
                                       kScalePackingAttr, kScaleCoeModeAttr, kExpectedAlloFixedBits);
     packedValues.push_back(packed);
     ++signIt;
@@ -271,18 +292,7 @@ static Value convertGlobalScaleToPacked(
       RankedTensorType::get(signType.getShape(), i32Type),
       llvm::ArrayRef(packedValues));
   
-  // Generate unique name for packed global
-  std::string packedName = baseName + "_packed";
-  
-  // Check if this global already exists
-  if (auto existingGlobal = module.lookupSymbol<memref::GlobalOp>(packedName)) {
-    // Return reference to existing global
-    OpBuilder::InsertionGuard guard(rewriter);
-    rewriter.setInsertionPointAfter(existingGlobal);
-    return rewriter.create<memref::GetGlobalOp>(loc, packedMemRefType, packedName);
-  }
-  
-  // Create new global at module level
+  // Create new global at module level (we already checked it doesn't exist)
   OpBuilder::InsertionGuard guard(rewriter);
   rewriter.setInsertionPointToStart(module.getBody());
   
@@ -296,6 +306,9 @@ static Value convertGlobalScaleToPacked(
 }
 
 // Handle scalar scale values - pack at compile time
+// Note: Each call creates a new arith::ConstantOp. If multiple ops share the same
+// scalar scale constants, MLIR's CSE (Common Subexpression Elimination) pass will
+// automatically merge them, so we don't need manual deduplication here.
 static Value packScalarScale(
     PatternRewriter &rewriter, Location loc,
     Value sign, Value coe, Value rshift) {
@@ -312,7 +325,7 @@ static Value packScalarScale(
     auto rshiftAttr = rshiftConst.getValue().cast<IntegerAttr>();
     
     int8_t signVal = signAttr.getInt();
-    uint32_t coeVal = coeAttr.getInt();
+    uint32_t coeVal = static_cast<uint64_t>(coeAttr.getInt()) & 0xFFFFFFFF;
     int16_t rshiftVal = rshiftAttr.getInt();
     
     uint32_t packed = packScaleValues(signVal, coeVal, rshiftVal,
@@ -327,14 +340,79 @@ static Value packScalarScale(
   return Value();
 }
 
+// Helper function to extract base name from global operations
+// Infers the common prefix from sign/coe/rshift global names
+// Example: "x_scale_sign", "x_scale_coe", "x_scale_rshift" -> "x_scale"
+static std::string inferBaseNameFromGlobals(Value sign, Value coe, Value rshift) {
+  auto signGetGlobal = sign.getDefiningOp<memref::GetGlobalOp>();
+  auto coeGetGlobal = coe.getDefiningOp<memref::GetGlobalOp>();
+  auto rshiftGetGlobal = rshift.getDefiningOp<memref::GetGlobalOp>();
+  
+  if (!signGetGlobal || !coeGetGlobal || !rshiftGetGlobal) {
+    return "";  // Not global operations
+  }
+  
+  std::string signName = signGetGlobal.getName().str();
+  std::string coeName = coeGetGlobal.getName().str();
+  std::string rshiftName = rshiftGetGlobal.getName().str();
+  
+  // Find common prefix by comparing all three names
+  size_t minLen = std::min({signName.length(), coeName.length(), rshiftName.length()});
+  size_t commonLen = 0;
+  
+  for (size_t i = 0; i < minLen; ++i) {
+    if (signName[i] == coeName[i] && signName[i] == rshiftName[i]) {
+      commonLen = i + 1;
+    } else {
+      break;
+    }
+  }
+  
+  if (commonLen == 0) {
+    return "";  // No common prefix
+  }
+  
+  std::string baseName = signName.substr(0, commonLen);
+  
+  // Remove trailing underscore or common suffixes like "_sign", "_coe", "_rshift"
+  // Expected pattern: "prefix_sign", "prefix_coe", "prefix_rshift" -> "prefix"
+  if (baseName.length() > 0 && baseName.back() == '_') {
+    baseName.pop_back();
+  }
+  
+  // Additional validation: check if removing common suffix patterns makes sense
+  // e.g., "x_scale_s" -> "x_scale" by removing partial suffix
+  std::vector<std::string> suffixes = {"_sign", "_coe", "_rshift", "_s", "_c", "_r"};
+  for (const auto &suffix : suffixes) {
+    if (baseName.length() > suffix.length() && 
+        signName.compare(baseName.length(), suffix.length(), suffix) == 0) {
+      // Valid pattern found, baseName is correct
+      return baseName;
+    }
+  }
+  
+  return baseName;
+}
+
 // Main function to convert scale (handles both global and scalar)
+// If baseName is empty, it will be inferred from global operation names
 static Value convertScaleToPacked(
     PatternRewriter &rewriter, Location loc, ModuleOp module,
     Value sign, Value coe, Value rshift,
-    const std::string &baseName) {
+    const std::string &baseName = "") {
+  
+  // Infer baseName if not provided
+  std::string effectiveBaseName = baseName;
+  if (effectiveBaseName.empty()) {
+    effectiveBaseName = inferBaseNameFromGlobals(sign, coe, rshift);
+    if (effectiveBaseName.empty()) {
+      // Fallback to a generic name if inference fails
+      effectiveBaseName = "scale";
+    }
+  }
   
   // Try global conversion first
-  if (auto packed = convertGlobalScaleToPacked(rewriter, loc, module, sign, coe, rshift, baseName)) {
+  if (auto packed = convertGlobalScaleToPacked(rewriter, loc, module, sign, coe, rshift, effectiveBaseName)) {
     return packed;
   }
   
@@ -364,15 +442,17 @@ struct QMatMulLoweringPattern : public OpRewritePattern<allo_ops::QMatMulOp> {
     Value lhs = op.getLhs();
     Value rhs = op.getRhs();
     
-    // Pack scale parameters at compile time
+    // Pack scale parameters at compile time (baseName auto-inferred from global names)
     Value xScale = convertScaleToPacked(rewriter, loc, module,
-        op.getXScaleSign(), op.getXScaleCoe(), op.getXScaleRshift(), "x_scale");
+        op.getXScaleSign(), op.getXScaleCoe(), op.getXScaleRshift());
     Value yScale = convertScaleToPacked(rewriter, loc, module,
-        op.getYScaleSign(), op.getYScaleCoe(), op.getYScaleRshift(), "y_scale");
+        op.getYScaleSign(), op.getYScaleCoe(), op.getYScaleRshift());
     Value oScale = convertScaleToPacked(rewriter, loc, module,
-        op.getOScaleSign(), op.getOScaleCoe(), op.getOScaleRshift(), "o_scale");
+        op.getOScaleSign(), op.getOScaleCoe(), op.getOScaleRshift());
+    Value oScaleInv = convertScaleToPacked(rewriter, loc, module,
+        op.getOScaleInvSign(), op.getOScaleInvCoe(), op.getOScaleInvRshift());
     
-    if (!xScale || !yScale || !oScale) {
+    if (!xScale || !yScale || !oScale || !oScaleInv) {
       return op.emitError("Failed to pack scale parameters");
     }
     
@@ -384,7 +464,7 @@ struct QMatMulLoweringPattern : public OpRewritePattern<allo_ops::QMatMulOp> {
     // Create vivado.qmatmul op with packed scales
     rewriter.replaceOpWithNewOp<vivado_ops::QMatMulOp>(
         op, output, lhs, rhs,
-        xScale, yScale, oScale,
+        xScale, yScale, oScale, oScaleInv,
         xZero, yZero, oZero,
         // Backend-specific attributes with defaults from PYNQConfig
         rewriter.getI32IntegerAttr(pynq::TileConfig::kDefaultTileM),  // tile_m
@@ -422,24 +502,26 @@ struct QLinearLoweringPattern : public OpRewritePattern<allo_ops::QLinearOp> {
     Value input = op.getInput();
     Value weight = op.getWeight();
     
-    // Pack scale parameters at compile time
+    // Pack scale parameters at compile time (baseName auto-inferred from global names)
     Value fscl = convertScaleToPacked(rewriter, loc, module,
-        op.getFsclSign(), op.getFsclCoe(), op.getFsclRshift(), "fscl");
+        op.getFsclSign(), op.getFsclCoe(), op.getFsclRshift());
     Value iscl = convertScaleToPacked(rewriter, loc, module,
-        op.getIsclSign(), op.getIsclCoe(), op.getIsclRshift(), "iscl");
+        op.getIsclSign(), op.getIsclCoe(), op.getIsclRshift());
     Value oscl = convertScaleToPacked(rewriter, loc, module,
-        op.getOsclSign(), op.getOsclCoe(), op.getOsclRshift(), "oscl");
+        op.getOsclSign(), op.getOsclCoe(), op.getOsclRshift());
+    Value osclInv = convertScaleToPacked(rewriter, loc, module,
+        op.getOsclInvSign(), op.getOsclInvCoe(), op.getOsclInvRshift());
     Value wscl = convertScaleToPacked(rewriter, loc, module,
-        op.getWsclSign(), op.getWsclCoe(), op.getWsclRshift(), "wscl");
+        op.getWsclSign(), op.getWsclCoe(), op.getWsclRshift());
     
     // Optional bias scale
     Value bscl;
     if (op.getBsclSign()) {
       bscl = convertScaleToPacked(rewriter, loc, module,
-          op.getBsclSign(), op.getBsclCoe(), op.getBsclRshift(), "bscl");
+          op.getBsclSign(), op.getBsclCoe(), op.getBsclRshift());
     }
     
-    if (!fscl || !iscl || !oscl || !wscl) {
+    if (!fscl || !iscl || !oscl || !osclInv || !wscl) {
       return op.emitError("Failed to pack scale parameters");
     }
     
@@ -451,7 +533,7 @@ struct QLinearLoweringPattern : public OpRewritePattern<allo_ops::QLinearOp> {
     // Create vivado.qlinear op with packed scales
     rewriter.replaceOpWithNewOp<vivado_ops::QLinearOp>(
         op, output, input, weight,
-        fscl, iscl, oscl, wscl, bscl,
+        fscl, iscl, oscl, osclInv, wscl, bscl,
         inputZero, outputZero, bias,
         // Backend-specific attributes from PYNQConfig
         rewriter.getI32IntegerAttr(pynq::TileConfig::kDefaultTileM),  // tile_m
@@ -486,26 +568,33 @@ struct QAddLoweringPattern : public OpRewritePattern<allo_ops::QAddOp> {
     Value lhs = op.getLhs();
     Value rhs = op.getRhs();
     
-    // Pack x scale at compile time
+    // Pack x scale at compile time (baseName auto-inferred)
     Value xScale = convertScaleToPacked(
         rewriter, op.getLoc(), op->getParentOfType<ModuleOp>(),
-        op.getXScaleSign(), op.getXScaleCoe(), op.getXScaleRshift(), "x_scale"
+        op.getXScaleSign(), op.getXScaleCoe(), op.getXScaleRshift()
       );
     if (!xScale) return failure();
     
-    // Pack y scale at compile time
+    // Pack y scale at compile time (baseName auto-inferred)
     Value yScale = convertScaleToPacked(
         rewriter, op.getLoc(), op->getParentOfType<ModuleOp>(),
-        op.getYScaleSign(), op.getYScaleCoe(), op.getYScaleRshift(), "y_scale"
+        op.getYScaleSign(), op.getYScaleCoe(), op.getYScaleRshift()
       );
     if (!yScale) return failure();
     
-    // Pack o scale at compile time
+    // Pack o scale at compile time (baseName auto-inferred)
     Value oScale = convertScaleToPacked(
         rewriter, op.getLoc(), op->getParentOfType<ModuleOp>(),
-        op.getOScaleSign(), op.getOScaleCoe(), op.getOScaleRshift(), "o_scale"
+        op.getOScaleSign(), op.getOScaleCoe(), op.getOScaleRshift()
       );
     if (!oScale) return failure();
+    
+    // Pack o scale inv at compile time (baseName auto-inferred)
+    Value oScaleInv = convertScaleToPacked(
+        rewriter, op.getLoc(), op->getParentOfType<ModuleOp>(),
+        op.getOScaleInvSign(), op.getOScaleInvCoe(), op.getOScaleInvRshift()
+      );
+    if (!oScaleInv) return failure();
     
     Value xZero = op.getXZero();
     Value yZero = op.getYZero();
@@ -514,7 +603,7 @@ struct QAddLoweringPattern : public OpRewritePattern<allo_ops::QAddOp> {
     // Create vivado.qadd op with vectorization hints
     rewriter.replaceOpWithNewOp<vivado_ops::QAddOp>(
         op, output, lhs, rhs,
-        xScale, yScale, oScale,
+        xScale, yScale, oScale, oScaleInv,
         xZero, yZero, oZero,
         // Backend-specific attributes
         rewriter.getBoolAttr(false),  // fuse_into_producer
@@ -539,41 +628,48 @@ struct IntGELULoweringPattern : public OpRewritePattern<allo_ops::IntGELUOp> {
     Value output = op.getOutput();
     Value input = op.getInput();
     
-    // Pack input_scale at compile time
+    // Pack input_scale at compile time (baseName auto-inferred)
     Value inputScale = convertScaleToPacked(
         rewriter, op.getLoc(), op->getParentOfType<ModuleOp>(),
-        op.getInputScaleSign(), op.getInputScaleCoe(), op.getInputScaleRshift(), "input_scale"
+        op.getInputScaleSign(), op.getInputScaleCoe(), op.getInputScaleRshift()
       );
     if (!inputScale) return failure();
     
-    // Pack gelu_scale at compile time
+    // Pack gelu_scale at compile time (baseName auto-inferred)
     Value geluScale = convertScaleToPacked(
         rewriter, op.getLoc(), op->getParentOfType<ModuleOp>(),
-        op.getGeluScaleSign(), op.getGeluScaleCoe(), op.getGeluScaleRshift(), "gelu_scale"
+        op.getGeluScaleSign(), op.getGeluScaleCoe(), op.getGeluScaleRshift()
       );
     if (!geluScale) return failure();
     
-    // Pack fused_scale at compile time
+    // Pack fused_scale at compile time (baseName auto-inferred)
     Value fusedScale = convertScaleToPacked(
         rewriter, op.getLoc(), op->getParentOfType<ModuleOp>(),
-        op.getFusedScaleSign(), op.getFusedScaleCoe(), op.getFusedScaleRshift(), "fused_scale"
+        op.getFusedScaleSign(), op.getFusedScaleCoe(), op.getFusedScaleRshift()
       );
     if (!fusedScale) return failure();
     
-    // Pack output_scale at compile time
+    // Pack output_scale at compile time (baseName auto-inferred)
     Value outputScale = convertScaleToPacked(
         rewriter, op.getLoc(), op->getParentOfType<ModuleOp>(),
-        op.getOutputScaleSign(), op.getOutputScaleCoe(), op.getOutputScaleRshift(), "output_scale"
+        op.getOutputScaleSign(), op.getOutputScaleCoe(), op.getOutputScaleRshift()
       );
     if (!outputScale) return failure();
+    
+    // Pack output_scale_inv at compile time (baseName auto-inferred)
+    Value outputScaleInv = convertScaleToPacked(
+        rewriter, op.getLoc(), op->getParentOfType<ModuleOp>(),
+        op.getOutputScaleInvSign(), op.getOutputScaleInvCoe(), op.getOutputScaleInvRshift()
+      );
+    if (!outputScaleInv) return failure();
     
     Value inputZero = op.getInputZero();
     Value outputZero = op.getOutputZero();
 
-    // Create vivado.int_gelu with LUT implementation and all 4 scale groups
+    // Create vivado.int_gelu with LUT implementation and all 4 scale groups + inv
     rewriter.replaceOpWithNewOp<vivado_ops::IntGELUOp>(
         op, output, input,
-        inputScale, geluScale, fusedScale, outputScale,
+        inputScale, geluScale, fusedScale, outputScale, outputScaleInv,
         inputZero, outputZero,
         // Backend-specific attributes
         rewriter.getStringAttr("lut"),  // implementation: "lut" or "polynomial"
@@ -597,33 +693,42 @@ struct IntSoftmaxLoweringPattern : public OpRewritePattern<allo_ops::IntSoftmaxO
     Value output = op.getOutput();
     Value input = op.getInput();
     
-    // Pack input_scale at compile time
+    // Pack input_scale at compile time (baseName auto-inferred)
     Value inputScale = convertScaleToPacked(
         rewriter, op.getLoc(), op->getParentOfType<ModuleOp>(),
-        op.getInputScaleSign(), op.getInputScaleCoe(), op.getInputScaleRshift(), "input_scale"
+        op.getInputScaleSign(), op.getInputScaleCoe(), op.getInputScaleRshift()
       );
     if (!inputScale) return failure();
     
-    // Pack softmax_scale at compile time
+    // Pack softmax_scale at compile time (baseName auto-inferred)
     Value softmaxScale = convertScaleToPacked(
         rewriter, op.getLoc(), op->getParentOfType<ModuleOp>(),
-        op.getSoftmaxScaleSign(), op.getSoftmaxScaleCoe(), op.getSoftmaxScaleRshift(), "softmax_scale"
+        op.getSoftmaxScaleSign(), op.getSoftmaxScaleCoe(), op.getSoftmaxScaleRshift()
       );
     if (!softmaxScale) return failure();
 
-    // Pack fused_scale at compile time
-    Value fusedScale = convertScaleToPacked(
-        rewriter, op.getLoc(), op->getParentOfType<ModuleOp>(),
-        op.getFusedScaleSign(), op.getFusedScaleCoe(), op.getFusedScaleRshift(), "fused_scale"
-      );
-    if (!fusedScale) return failure();
-
-    // Pack output_scale at compile time
+    // Pack output_scale at compile time (baseName auto-inferred)
     Value outputScale = convertScaleToPacked(
         rewriter, op.getLoc(), op->getParentOfType<ModuleOp>(),
-        op.getOutputScaleSign(), op.getOutputScaleCoe(), op.getOutputScaleRshift(),   "output_scale"
+        op.getOutputScaleSign(), op.getOutputScaleCoe(), op.getOutputScaleRshift()
       );
     if (!outputScale) return failure();
+    
+    // Pack output_scale_inv at compile time (baseName auto-inferred)
+    Value outputScaleInv = convertScaleToPacked(
+        rewriter, op.getLoc(), op->getParentOfType<ModuleOp>(),
+        op.getOutputScaleInvSign(), op.getOutputScaleInvCoe(), op.getOutputScaleInvRshift()
+      );
+    if (!outputScaleInv) return failure();
+
+    // Pack fused_scale at compile time (optional, baseName auto-inferred)
+    Value fusedScale;
+    if (op.getFusedScaleSign()) {
+      fusedScale = convertScaleToPacked(
+          rewriter, op.getLoc(), op->getParentOfType<ModuleOp>(),
+          op.getFusedScaleSign(), op.getFusedScaleCoe(), op.getFusedScaleRshift()
+        );
+    }
     
     Value inputZero = op.getInputZero();
     Value outputZero = op.getOutputZero();
@@ -634,7 +739,7 @@ struct IntSoftmaxLoweringPattern : public OpRewritePattern<allo_ops::IntSoftmaxO
     // Create vivado.int_softmax with LUT implementation
     rewriter.replaceOpWithNewOp<vivado_ops::IntSoftmaxOp>(
         op, output, input,
-        inputScale, softmaxScale, outputScale, fusedScale,
+        inputScale, softmaxScale, outputScale, outputScaleInv, fusedScale,
         inputZero, outputZero,
         rewriter.getI64IntegerAttr(axis),
         // Backend-specific attributes
@@ -660,40 +765,47 @@ struct IntLayerNormLoweringPattern : public OpRewritePattern<allo_ops::IntLayerN
     Value input = op.getInput();
     Value biasInt = op.getBiasInt();
     
-    // Pack input_scale at compile time
+    // Pack input_scale at compile time (baseName auto-inferred)
     Value inputScale = convertScaleToPacked(
         rewriter, op.getLoc(), op->getParentOfType<ModuleOp>(),
-        op.getInputScaleSign(), op.getInputScaleCoe(), op.getInputScaleRshift(), "input_scale"
+        op.getInputScaleSign(), op.getInputScaleCoe(), op.getInputScaleRshift()
       );
     if (!inputScale) return failure();
 
-    // Pack layernorm_scale at compile time
+    // Pack layernorm_scale at compile time (baseName auto-inferred)
     Value layernormScale = convertScaleToPacked(
         rewriter, op.getLoc(), op->getParentOfType<ModuleOp>(),
-        op.getLayernormScaleSign(), op.getLayernormScaleCoe(), op.getLayernormScaleRshift(), "layernorm_scale"
+        op.getLayernormScaleSign(), op.getLayernormScaleCoe(), op.getLayernormScaleRshift()
       );
     if (!layernormScale) return failure();
     
-    // Pack bias_scale at compile time
+    // Pack bias_scale at compile time (baseName auto-inferred)
     Value biasScale = convertScaleToPacked(
         rewriter, op.getLoc(), op->getParentOfType<ModuleOp>(),
-        op.getBiasScaleSign(), op.getBiasScaleCoe(), op.getBiasScaleRshift(), "bias_scale"
+        op.getBiasScaleSign(), op.getBiasScaleCoe(), op.getBiasScaleRshift()
       );
     if (!biasScale) return failure();
 
-    // Pack fused_scale at compile time
+    // Pack fused_scale at compile time (baseName auto-inferred)
     Value fusedScale = convertScaleToPacked(
         rewriter, op.getLoc(), op->getParentOfType<ModuleOp>(),
-        op.getFusedScaleSign(), op.getFusedScaleCoe(), op.getFusedScaleRshift(), "fused_scale"
+        op.getFusedScaleSign(), op.getFusedScaleCoe(), op.getFusedScaleRshift()
       );
     if (!fusedScale) return failure();
 
-    // Pack output_scale at compile time
+    // Pack output_scale at compile time (baseName auto-inferred)
     Value outputScale = convertScaleToPacked(
         rewriter, op.getLoc(), op->getParentOfType<ModuleOp>(),
-        op.getOutputScaleSign(), op.getOutputScaleCoe(), op.getOutputScaleRshift(), "output_scale"
+        op.getOutputScaleSign(), op.getOutputScaleCoe(), op.getOutputScaleRshift()
       );
     if (!outputScale) return failure();
+    
+    // Pack output_scale_inv at compile time (baseName auto-inferred)
+    Value outputScaleInv = convertScaleToPacked(
+        rewriter, op.getLoc(), op->getParentOfType<ModuleOp>(),
+        op.getOutputScaleInvSign(), op.getOutputScaleInvCoe(), op.getOutputScaleInvRshift()
+      );
+    if (!outputScaleInv) return failure();
     
     Value inputZero = op.getInputZero();
     Value outputZero = op.getOutputZero();
@@ -704,7 +816,7 @@ struct IntLayerNormLoweringPattern : public OpRewritePattern<allo_ops::IntLayerN
     // Create vivado.int_layernorm with approx rsqrt
     rewriter.replaceOpWithNewOp<vivado_ops::IntLayerNormOp>(
         op, output, input, biasInt,
-        inputScale, layernormScale, biasScale, fusedScale, outputScale,
+        inputScale, layernormScale, biasScale, fusedScale, outputScale, outputScaleInv,
         inputZero, outputZero,
         rewriter.getF32FloatAttr(eps),
         // Backend-specific attributes
@@ -730,40 +842,49 @@ struct QConv2dLoweringPattern : public OpRewritePattern<allo_ops::QConv2dOp> {
     Value input = op.getInput();
     Value filter = op.getFilter();
     
-    // Pack fscl at compile time
+    // Pack fscl at compile time (baseName auto-inferred)
     Value fscale = convertScaleToPacked(
         rewriter, op.getLoc(), op->getParentOfType<ModuleOp>(),
-        op.getFsclSign(), op.getFsclCoe(), op.getFsclRshift(), "fscl"
+        op.getFsclSign(), op.getFsclCoe(), op.getFsclRshift()
       );
     if (!fscale) return failure();
     
-    // Pack iscl at compile time
+    // Pack iscl at compile time (baseName auto-inferred)
     Value iscale = convertScaleToPacked(
         rewriter, op.getLoc(), op->getParentOfType<ModuleOp>(),
-        op.getIsclSign(), op.getIsclCoe(), op.getIsclRshift(), "iscl"
+        op.getIsclSign(), op.getIsclCoe(), op.getIsclRshift()
       );
     if (!iscale) return failure();
     
-    // Pack oscl at compile time
+    // Pack oscl at compile time (baseName auto-inferred)
     Value oscale = convertScaleToPacked(
         rewriter, op.getLoc(), op->getParentOfType<ModuleOp>(),
-        op.getOsclSign(), op.getOsclCoe(), op.getOsclRshift(), "oscl"
+        op.getOsclSign(), op.getOsclCoe(), op.getOsclRshift()
       );
     if (!oscale) return failure();
     
-    // Pack wscl at compile time
+    // Pack oscl_inv at compile time (baseName auto-inferred)
+    Value oscaleInv = convertScaleToPacked(
+        rewriter, op.getLoc(), op->getParentOfType<ModuleOp>(),
+        op.getOsclInvSign(), op.getOsclInvCoe(), op.getOsclInvRshift()
+      );
+    if (!oscaleInv) return failure();
+    
+    // Pack wscl at compile time (baseName auto-inferred)
     Value wscale = convertScaleToPacked(
         rewriter, op.getLoc(), op->getParentOfType<ModuleOp>(),
-        op.getWsclSign(), op.getWsclCoe(), op.getWsclRshift(), "wscl"
+        op.getWsclSign(), op.getWsclCoe(), op.getWsclRshift()
       );
     if (!wscale) return failure();
     
-    // Pack bscl at compile time
-    Value bscale = convertScaleToPacked(
-        rewriter, op.getLoc(), op->getParentOfType<ModuleOp>(),
-        op.getBsclSign(), op.getBsclCoe(), op.getBsclRshift(), "bscl"
-      );
-    if (!bscale) return failure();
+    // Pack bscl at compile time (optional, baseName auto-inferred)
+    Value bscale;
+    if (op.getBsclSign()) {
+      bscale = convertScaleToPacked(
+          rewriter, op.getLoc(), op->getParentOfType<ModuleOp>(),
+          op.getBsclSign(), op.getBsclCoe(), op.getBsclRshift()
+        );
+    }
     
     Value inputZero = op.getInputZero();
     Value outputZero = op.getOutputZero();
@@ -773,7 +894,7 @@ struct QConv2dLoweringPattern : public OpRewritePattern<allo_ops::QConv2dOp> {
 
     rewriter.replaceOpWithNewOp<vivado_ops::QConv2dOp>(
         op, output, input, filter,
-        fscale, iscale, oscale, wscale, bscale,
+        fscale, iscale, oscale, oscaleInv, wscale, bscale,
         inputZero, outputZero, bias,
         rewriter.getDenseI64ArrayAttr(stride),
         // Backend-specific attributes from PYNQConfig
@@ -807,26 +928,33 @@ struct QMatMulIsqrtDLoweringPattern : public OpRewritePattern<allo_ops::QMatMulI
     Value lhs = op.getLhs();
     Value rhs = op.getRhs();
     
-    // Pack x scale at compile time
+    // Pack x scale at compile time (baseName auto-inferred)
     Value xScale = convertScaleToPacked(
         rewriter, op.getLoc(), op->getParentOfType<ModuleOp>(),
-        op.getXScaleSign(), op.getXScaleCoe(), op.getXScaleRshift(), "x_scale"
+        op.getXScaleSign(), op.getXScaleCoe(), op.getXScaleRshift()
       );
     if (!xScale) return failure();
     
-    // Pack y scale at compile time
+    // Pack y scale at compile time (baseName auto-inferred)
     Value yScale = convertScaleToPacked(
         rewriter, op.getLoc(), op->getParentOfType<ModuleOp>(),
-        op.getYScaleSign(), op.getYScaleCoe(), op.getYScaleRshift(), "y_scale"
+        op.getYScaleSign(), op.getYScaleCoe(), op.getYScaleRshift()
       );
     if (!yScale) return failure();
     
-    // Pack o scale at compile time
+    // Pack o scale at compile time (baseName auto-inferred)
     Value oScale = convertScaleToPacked(
         rewriter, op.getLoc(), op->getParentOfType<ModuleOp>(),
-        op.getOScaleSign(), op.getOScaleCoe(), op.getOScaleRshift(), "o_scale"
+        op.getOScaleSign(), op.getOScaleCoe(), op.getOScaleRshift()
       );
     if (!oScale) return failure();
+    
+    // Pack o scale inv at compile time (baseName auto-inferred)
+    Value oScaleInv = convertScaleToPacked(
+        rewriter, op.getLoc(), op->getParentOfType<ModuleOp>(),
+        op.getOScaleInvSign(), op.getOScaleInvCoe(), op.getOScaleInvRshift()
+      );
+    if (!oScaleInv) return failure();
     
     Value xZero = op.getXZero();
     Value yZero = op.getYZero();
@@ -834,7 +962,7 @@ struct QMatMulIsqrtDLoweringPattern : public OpRewritePattern<allo_ops::QMatMulI
 
     rewriter.replaceOpWithNewOp<vivado_ops::QMatMulIsqrtDOp>(
         op, output, lhs, rhs,
-        xScale, yScale, oScale,
+        xScale, yScale, oScale, oScaleInv,
         xZero, yZero, oZero,
         // Backend-specific attributes from PYNQConfig
         rewriter.getI32IntegerAttr(pynq::TileConfig::kDefaultTileM),  // tile_m
@@ -847,6 +975,90 @@ struct QMatMulIsqrtDLoweringPattern : public OpRewritePattern<allo_ops::QMatMulI
         nullptr,                         // hls_pragmas
         rewriter.getStringAttr("i32"),   // accumulator_type
         rewriter.getStringAttr("inline"), // requant_mode
+        rewriter.getStringAttr(kScalePackingAttr),
+        rewriter.getStringAttr(kScaleCoeModeAttr)
+    );
+
+    return success();
+  }
+};
+
+//===----------------------------------------------------------------------===//
+// Pattern: allo.quant -> vivado.quant
+//===----------------------------------------------------------------------===//
+
+struct QuantLoweringPattern : public OpRewritePattern<allo_ops::QuantOp> {
+  using OpRewritePattern<allo_ops::QuantOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(allo_ops::QuantOp op,
+                                 PatternRewriter &rewriter) const override {
+    Location loc = op.getLoc();
+    auto module = op->getParentOfType<ModuleOp>();
+
+    // Extract operands
+    Value output = op.getOutput();  // Integer output
+    Value input = op.getInput();    // Float input
+    
+    // Pack scale at compile time (baseName auto-inferred)
+    Value scale = convertScaleToPacked(
+        rewriter, loc, module,
+        op.getScaleSign(), op.getScaleCoe(), op.getScaleRshift());
+    if (!scale) {
+      return op.emitError("Failed to pack scale parameters");
+    }
+    
+    // Optional zero point
+    Value zero = op.getZero();
+    
+    // Get quant_mode attribute
+    int8_t quantMode = op.getQuantMode();
+
+    // Create vivado.quant op with packed scale
+    rewriter.replaceOpWithNewOp<vivado_ops::QuantOp>(
+        op, output, input, scale, zero,
+        rewriter.getI8IntegerAttr(quantMode),
+        rewriter.getStringAttr(kScalePackingAttr),
+        rewriter.getStringAttr(kScaleCoeModeAttr)
+    );
+
+    return success();
+  }
+};
+
+//===----------------------------------------------------------------------===//
+// Pattern: allo.dequant -> vivado.dequant
+//===----------------------------------------------------------------------===//
+
+struct DequantLoweringPattern : public OpRewritePattern<allo_ops::DequantOp> {
+  using OpRewritePattern<allo_ops::DequantOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(allo_ops::DequantOp op,
+                                 PatternRewriter &rewriter) const override {
+    Location loc = op.getLoc();
+    auto module = op->getParentOfType<ModuleOp>();
+
+    // Extract operands
+    Value output = op.getOutput();  // Float output
+    Value input = op.getInput();    // Integer input
+    
+    // Pack scale at compile time (baseName auto-inferred)
+    Value scale = convertScaleToPacked(
+        rewriter, loc, module,
+        op.getScaleSign(), op.getScaleCoe(), op.getScaleRshift());
+    if (!scale) {
+      return op.emitError("Failed to pack scale parameters");
+    }
+    
+    // Optional zero point
+    Value zero = op.getZero();
+    
+    // Get quant_mode attribute
+    int8_t quantMode = op.getQuantMode();
+
+    // Create vivado.dequant op with packed scale
+    rewriter.replaceOpWithNewOp<vivado_ops::DequantOp>(
+        op, output, input, scale, zero,
+        rewriter.getI8IntegerAttr(quantMode),
         rewriter.getStringAttr(kScalePackingAttr),
         rewriter.getStringAttr(kScaleCoeModeAttr)
     );
@@ -883,8 +1095,8 @@ bool applyLowerAlloQuantToVivado(ModuleOp &module, MLIRContext *context) {
   patterns.add<IntGELULoweringPattern>(context);
   patterns.add<IntSoftmaxLoweringPattern>(context);
   patterns.add<IntLayerNormLoweringPattern>(context);
-  patterns.add<QConv2dLoweringPattern>(context);
-  patterns.add<QMatMulIsqrtDLoweringPattern>(context);
+  patterns.add<QuantLoweringPattern>(context);
+  patterns.add<DequantLoweringPattern>(context);
 
   return !failed(applyPatternsAndFoldGreedily(module, std::move(patterns)));
 }
@@ -896,6 +1108,7 @@ struct LowerAlloQuantToVivadoPass
 
   void getDependentDialects(DialectRegistry &registry) const override {
     // Register Vivado dialect as dependency
+    registry.insert<allo_ops::AlloDialect>();
     registry.insert<vivado_ops::VivadoDialect>();
     registry.insert<func::FuncDialect>();
   }

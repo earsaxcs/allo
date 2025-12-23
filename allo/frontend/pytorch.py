@@ -15,11 +15,20 @@ try:
     from .tracer import AlloTracer
 except ImportError:
     pass
-from .library import CoreAttention_lib, KVCache_lib, ViTGetFirstToken_lib, ViTTokenExpand_lib
+from .library import (
+    CoreAttention_lib, 
+    KVCache_lib, 
+    ViTGetFirstToken_float32_lib, 
+    ViTGetFirstToken_int8_lib,
+    ViTTokenExpand_float32_lib,
+    ViTTokenExpand_int8_lib
+)
 from ..quant.quant_modules import *
 from .. import dsl
 from ..ir import types
 from ..customize import customize
+from ..quant.quant_config import DEFAULT_ACT_BIT, DEFAULT_WEIGHT_BIT, DEFAULT_BIAS_BIT
+from ..ops.vit import ViTGetFirstToken, ViTTokenExpand
 
 # Global configuration for quantization
 # SCALE_FIXED_BITS: Number of bits used to represent scale coefficient in [0.5, 1.0)
@@ -39,7 +48,6 @@ from ..customize import customize
 #   - Tail mode: stores low 16 bits (variant part)
 #   - Full mode: stores high 16 bits (including leading 1)
 SCALE_FIXED_BITS = 17
-
 
 # maybe used in pytorch_vivado.py
 def _process_quantized_params(gm, global_vars):
@@ -271,6 +279,16 @@ def _process_quantized_params(gm, global_vars):
             global_vars[var_prefix + "_output_scale_sign"] = sign.astype(np.int8)
             global_vars[var_prefix + "_output_scale_coe"] = coe.astype(np.int32)
             global_vars[var_prefix + "_output_scale_rshift"] = rshift.astype(np.int16)
+            
+            # Compute output_scale inverse: 1/output_scale
+            # Use epsilon to avoid division by zero (guard only near-zero values)
+            eps = 1e-10
+            scale_inv_data = np.where(np.abs(scale_data) < eps, 0.0, 1.0 / scale_data)
+            sign_inv, coe_inv, rshift_inv = float_to_fixed_point(scale_inv_data, fixed_bits=SCALE_FIXED_BITS)
+            
+            global_vars[var_prefix + "_output_scale_inv_sign"] = sign_inv.astype(np.int8)
+            global_vars[var_prefix + "_output_scale_inv_coe"] = coe_inv.astype(np.int32)
+            global_vars[var_prefix + "_output_scale_inv_rshift"] = rshift_inv.astype(np.int16)
         
         # fused_scale（最关键：用于运行时缩放）
         if hasattr(module, 'fused_scale'):
@@ -317,6 +335,16 @@ def _process_quantized_params(gm, global_vars):
                     global_vars[var_prefix + f"_{scale_name}_sign"] = sign.astype(np.int8)
                     global_vars[var_prefix + f"_{scale_name}_coe"] = coe.astype(np.int32)
                     global_vars[var_prefix + f"_{scale_name}_rshift"] = rshift.astype(np.int16)
+                    
+                    # Compute inverse for o_scale
+                    if scale_name == 'o_scale':
+                        eps = 1e-10
+                        scale_inv_data = 1.0 / (scale_data + eps)
+                        sign_inv, coe_inv, rshift_inv = float_to_fixed_point(scale_inv_data, fixed_bits=SCALE_FIXED_BITS)
+                        
+                        global_vars[var_prefix + "_o_scale_inv_sign"] = sign_inv.astype(np.int8)
+                        global_vars[var_prefix + "_o_scale_inv_coe"] = coe_inv.astype(np.int32)
+                        global_vars[var_prefix + "_o_scale_inv_rshift"] = rshift_inv.astype(np.int16)
             
             # zero points（保持整数）
             for zero_name in ['x_zero', 'y_zero', 'o_zero']:
@@ -348,6 +376,40 @@ def _process_quantized_params(gm, global_vars):
                 global_vars[var_prefix + "_gelu_scale_coe"] = coe.astype(np.int32)
                 global_vars[var_prefix + "_gelu_scale_rshift"] = rshift.astype(np.int16)
 
+def _convert_weight_to_int(weight_data, bits=8):
+    """
+    将伪量化的浮点权重转换为整数类型。
+    
+    假设输入的浮点权重已经是伪量化完毕的，即数值上是整数但以浮点形式存储。
+    例如：tensor([[-3.0, 2.0, 1.0], [0.0, -1.0, 4.0]]) → int8([[-3, 2, 1], [0, -1, 4]])
+    
+    Args:
+        weight_data: numpy 数组，伪量化的浮点权重
+        bits: 目标位宽，默认 8
+    
+    Returns:
+        numpy 数组，整数类型的权重
+    """
+    import numpy as np
+    
+    # 确定目标类型
+    if bits <= 8:
+        target_dtype = np.int8
+        min_val, max_val = -128, 127
+    elif bits <= 16:
+        target_dtype = np.int16
+        min_val, max_val = -32768, 32767
+    else:
+        target_dtype = np.int32
+        min_val, max_val = -2147483648, 2147483647
+    
+    # 四舍五入并裁剪到目标范围
+    weight_int = np.round(weight_data).astype(np.float64)
+    weight_int = np.clip(weight_int, min_val, max_val)
+    
+    return weight_int.astype(target_dtype)
+
+
 def from_pytorch(
     model,
     example_inputs,
@@ -357,7 +419,10 @@ def from_pytorch(
     target="llvm",
     mode="csim",
     project="top.prj",
+    enable_quant=True,  # 量化开关：默认开启
 ):
+    import numpy as np
+    
     sig = inspect.signature(model.forward)
     input_names = [
         p.name for i, p in enumerate(sig.parameters.values()) if i < len(example_inputs)
@@ -387,17 +452,81 @@ def from_pytorch(
     global_vars.update({"dsl": dsl})
     # Pass SCALE_FIXED_BITS to builder for quantization
     global_vars.update({"__allo_quant_fixed_bits__": SCALE_FIXED_BITS})
+    
+    # 定义量化模块类型
+    quantized_module_types = (
+        QLinear, QConv2d, IntGELU, IntSoftmax, 
+        IntLayerNorm, QAdd, QMatMul, QMatMulIsqrtD,
+    )
+    
+    # 收集量化模块信息，用于判断参数是否属于量化模块
+    quant_module_prefixes = set()
+    if enable_quant:
+        for module_name, module in gm.named_modules():
+            if isinstance(module, quantized_module_types):
+                quant_module_prefixes.add(module_name)
+    
     # 处理参数 (nn.Parameter)
-    for name, param in gm.named_parameters():
-        new_name = "g_" + name.replace(".", "_")
-        global_vars.update({new_name: param.detach().numpy()})
+    # 对于量化模块的权重，需要将伪量化的浮点转换为整数
+    # 定义需要量化的 embedding 参数后缀
+    # Currently empty for we don't need to quantize embedding or cls token
+    quant_embedding_suffixes = tuple() # ("_embedding", "_cls_token")
+    
+    for param_name, param in gm.named_parameters():
+        new_name = "g_" + param_name.replace(".", "_")
+        param_data = param.detach().numpy()
+        
+        if enable_quant:
+            converted = False
+            # 检查是否是量化模块的权重
+            for prefix in quant_module_prefixes:
+                if param_name.startswith(prefix + "."):
+                    # 这是量化模块的参数
+                    # 检查是否是权重参数
+                    param_suffix = param_name[len(prefix)+1:]  # 获取 "weight" 或 "bias" 等
+                    if param_suffix == "weight":
+                        # 量化模块的权重，转换为 int8
+                        param_data = _convert_weight_to_int(param_data, bits=TorchBuilder.QUANT_WEIGHT_BITS)
+                        converted = True
+                    elif param_suffix == "bias":
+                        # 偏置转换为 int32
+                        param_data = _convert_weight_to_int(param_data, bits=TorchBuilder.QUANT_BIAS_BITS)
+                        converted = True
+                    break
+            
+            # 如果不是量化模块参数，检查是否是需要量化的 embedding 参数
+            if not converted:
+                for suffix in quant_embedding_suffixes:
+                    if param_name.endswith(suffix):
+                        # embedding 参数使用激活值位宽 (int8)
+                        param_data = _convert_weight_to_int(param_data, bits=TorchBuilder.QUANT_ACT_BITS)
+                        break
+        
+        global_vars.update({new_name: param_data})
+    
     # 处理 buffers (register_buffer)
-    # 非FPGA必需量化的话，反而不需要_preprocess_quantized_params
-    for name, buffer in gm.named_buffers():
-        new_name = "g_" + name.replace(".", "_")
-        global_vars.update({new_name: buffer.detach().numpy()})
+    # 量化模块的 buffer（如 weight_int, bias_int）需要转换为整数类型
+    for buffer_name, buffer in gm.named_buffers():
+        new_name = "g_" + buffer_name.replace(".", "_")
+        buffer_data = buffer.detach().numpy()
+        
+        if enable_quant:
+            # 检查是否是量化模块的 buffer
+            for prefix in quant_module_prefixes:
+                if buffer_name.startswith(prefix + "."):
+                    buffer_suffix = buffer_name[len(prefix)+1:]
+                    # weight_int 应该转换为 int8
+                    if buffer_suffix == "weight_int":
+                        buffer_data = _convert_weight_to_int(buffer_data, bits=TorchBuilder.QUANT_WEIGHT_BITS)
+                    # bias_int 应该转换为 int32
+                    elif buffer_suffix == "bias_int":
+                        buffer_data = _convert_weight_to_int(buffer_data, bits=TorchBuilder.QUANT_BIAS_BITS)
+                    # scale 和 zero 相关的 buffer 保持原样（会在后续定点转换中处理）
+                    break
+        
+        global_vars.update({new_name: buffer_data})
 
-    builder = TorchBuilder(gm, example_inputs, leaf_modules)
+    builder = TorchBuilder(gm, example_inputs, leaf_modules, enable_quant=enable_quant)
     code = builder.build()
     s = customize(
         code, verbose=verbose, global_vars=global_vars, enable_tensor=enable_tensor
@@ -413,7 +542,15 @@ def get_var_name(node):
 
 
 class TorchBuilder:
-    def __init__(self, gm, example_inputs, leaf_modules=None):
+    # 量化位宽配置 - 用于确定量化模块的输入/输出/权重类型
+    # 可以通过修改这些类属性来调整全局默认位宽
+    QUANT_ACT_BITS = DEFAULT_ACT_BIT      # 激活值（输入/输出）的位宽
+    QUANT_WEIGHT_BITS = DEFAULT_WEIGHT_BIT   # 权重的位宽
+    QUANT_BIAS_BITS = DEFAULT_BIAS_BIT    # 偏置的位宽
+    
+    def __init__(self, gm, example_inputs, leaf_modules=None, 
+                 quant_act_bits=None, quant_weight_bits=None, quant_bias_bits=None,
+                 enable_quant=True):
         self.gm = gm
         self.code = []
         self.input_names = []
@@ -425,6 +562,438 @@ class TorchBuilder:
         self.named_buffers = gm.named_buffers()
         self.subfunctions = []
         self.output = []
+        
+        # 量化开关：控制是否启用量化类型转换
+        self.enable_quant = enable_quant
+        
+        # 实例级别的量化位宽配置（允许覆盖类级别的默认值）
+        self.quant_act_bits = quant_act_bits if quant_act_bits is not None else self.QUANT_ACT_BITS
+        self.quant_weight_bits = quant_weight_bits if quant_weight_bits is not None else self.QUANT_WEIGHT_BITS
+        self.quant_bias_bits = quant_bias_bits if quant_bias_bits is not None else self.QUANT_BIAS_BITS
+        
+        # 缓存：记录哪些输入节点被量化模块使用
+        self._quant_input_nodes = set()
+        self._quant_output_nodes = set()
+        self._quant_module_prefixes = set()
+        
+        # 边界检测：记录需要插入 quant/dequant 的位置
+        # key: (producer_node_name, consumer_node_name)
+        # value: dict with 'type' ('quant'/'dequant'), 'scale_source' (量化模块名用于获取scale)
+        self._boundary_conversions = {}
+        # 映射：节点名 -> 该节点对应的量化模块信息（用于获取scale）
+        self._node_quant_info = {}
+        # 映射：节点名 -> 输出类型 ('int8' or 'float32')
+        self._node_output_types = {}
+        
+        # 只有启用量化时才进行预处理
+        if self.enable_quant:
+            self._preprocess_quantized_io()
+            self._detect_quant_boundaries()
+    
+    def _preprocess_quantized_io(self):
+        """
+        预处理：分析计算图，找出哪些<<<placeholder>>>节点被量化模块使用，
+        以及哪些output节点是量化模块的输出。
+        这样在生成函数签名和返回类型时，可以正确地使用int8类型。
+        """
+        # 定义量化模块类型
+        quantized_module_types = (
+            QLinear, 
+            QConv2d, 
+            IntGELU, 
+            IntSoftmax, 
+            IntLayerNorm, 
+            QAdd, 
+            QMatMul, 
+            QMatMulIsqrtD, 
+        )
+        
+        # 收集量化模块前缀
+        for module_name, module in self.gm.named_modules():
+            if isinstance(module, quantized_module_types):
+                self._quant_module_prefixes.add(module_name)
+        
+        # 遍历所有节点
+        for node in self.gm.graph.nodes:
+            if node.op == 'call_module':
+                module = dict(self.gm.named_modules()).get(node.target)
+                if module is not None and isinstance(module, quantized_module_types):
+                    # 记录该量化模块的输入节点
+                    for arg in node.args:
+                        if isinstance(arg, fx.Node):
+                            # 追溯到placeholder节点
+                            self._trace_to_placeholder(arg, self._quant_input_nodes)
+                    
+                    # 记录该量化模块的输出节点名
+                    self._quant_output_nodes.add(node.name)
+                    # 记录节点的量化信息
+                    self._node_quant_info[node.name] = {
+                        'module_name': node.target,
+                        'module': module,
+                        'is_quant': True
+                    }
+    
+    def _detect_quant_boundaries(self):
+        """
+        检测量化/非量化边界，识别需要插入 quant/dequant 的位置。
+        
+        边界情况：
+        1. 非量化节点的输出 -> 量化模块的输入：需要插入 quant
+        2. 量化模块的输出 -> 非量化节点的输入：需要插入 dequant
+        3. call_function, call_method (如 cat, transpose) 与量化模块之间的边界
+        
+        使用边界处量化模块的 input_scale (quant) 或 output_scale (dequant)
+        """
+        quantized_module_types = (
+            QLinear, QConv2d, IntGELU, IntSoftmax, 
+            IntLayerNorm, QAdd, QMatMul, QMatMulIsqrtD,
+        )
+
+        leaf_module_function_types = (ViTGetFirstToken, ViTTokenExpand)
+
+        supported_tensor_ops = ("cat", "transpose", "view", "reshape", "permute", "flatten")
+        
+        modules_dict = dict(self.gm.named_modules())
+        
+        # 首先建立一个映射：节点 -> 输出类型（int8 或 float32）
+        # 这样可以追溯 call_function, call_method 节点 的输出类型
+        node_output_types = {}  # node_name -> 'int8' or 'float32'
+        
+        # 第一遍：标记所有量化模块的输出为 int8
+        for node in self.gm.graph.nodes:
+            if node.op == 'call_module':
+                module = modules_dict.get(node.target)
+                if module is not None and isinstance(module, quantized_module_types):
+                    node_output_types[node.name] = f'int{self.quant_act_bits}'
+                else:
+                    node_output_types[node.name] = 'float32'
+            elif node.op == 'placeholder':
+                # placeholder 默认是 float32（除非在 _quant_input_nodes 中）
+                node_output_types[node.name] = 'float32'
+        
+        # 第二遍：推断 call_function, call_method 的输出类型
+        # call_function 通常保持输入类型（如 cat, transpose, view 等）
+        for node in self.gm.graph.nodes:
+            if node.op == 'call_function' or \
+            node.op == 'call_method' or \
+            (node.op == 'call_module' and isinstance(modules_dict.get(node.target, None), leaf_module_function_types)):
+                # 检查第一个输入参数的类型
+                # 对于大多数操作（cat, transpose, view 等），输出类型 = 输入类型
+                input_type = 'float32'  # 默认
+                for arg in node.args:
+                    if isinstance(arg, fx.Node) and arg.name in node_output_types:
+                        input_type = node_output_types[arg.name]
+                        break  # 使用第一个有效输入的类型
+                node_output_types[node.name] = input_type
+        
+        # 第三遍：检测边界并插入转换
+        # TODO: 边界检测还没修改
+        for node in self.gm.graph.nodes:
+            if node.op == 'call_module' and not isinstance(modules_dict.get(node.target, None), leaf_module_function_types):
+                module = modules_dict.get(node.target)
+                if module is None:
+                    continue
+                
+                is_quant_module = isinstance(module, quantized_module_types)
+                
+                if is_quant_module:
+                    # 检查输入：非 int8 -> 量化模块 = 需要 quant
+                    for i, arg in enumerate(node.args):
+                        if not isinstance(arg, fx.Node):
+                            continue
+                        
+                        # 获取输入的输出类型
+                        input_type = node_output_types.get(arg.name, 'float32')
+                        
+                        if input_type == 'float32':
+                            # float32 -> 量化模块：需要 quant
+                            key = (arg.name, node.name, i)
+                            self._boundary_conversions[key] = {
+                                'type': 'quant',
+                                'consumer_module': node.target,
+                                'consumer_module_obj': module,
+                                'input_index': i
+                            }
+                else:
+                    # 非量化模块：检查输入是否来自 int 源
+                    for i, arg in enumerate(node.args):
+                        if not isinstance(arg, fx.Node):
+                            continue
+                        
+                        # 获取输入的输出类型
+                        input_type = node_output_types.get(arg.name, 'float32')
+                        
+                        if input_type == f'int{self.quant_act_bits}':
+                            # int8 -> 非量化模块：需要 dequant
+                            # 需要找到产生 int8 的量化模块
+                            producer_module_name, producer_module_obj = self._find_producer_quant_module(arg, modules_dict, quantized_module_types)
+                            
+                            if producer_module_name:
+                                key = (arg.name, node.name, i)
+                                self._boundary_conversions[key] = {
+                                    'type': 'dequant',
+                                    'producer_module': producer_module_name,
+                                    'producer_module_obj': producer_module_obj,
+                                    'input_index': i
+                                }
+            
+            elif node.op == 'call_function' or \
+            node.op == 'call_method' or \
+            (node.op == 'call_module' and isinstance(modules_dict.get(node.target, None), leaf_module_function_types)):
+                if node.op in ('call_function', 'call_method') and node.name.split('_')[0] not in supported_tensor_ops:
+                    continue
+                # call_function, call_method 也需要检查其输入
+                for i, arg in enumerate(node.args):
+                    if not isinstance(arg, fx.Node):
+                        continue
+                    
+                    # 获取输入的输出类型
+                    input_type = node_output_types.get(arg.name, 'float32')
+                    
+                    # 上面几个列出的 call_function, call_method 通常期望 输入等于输出类型
+                    if input_type != f'int{self.quant_act_bits}':
+                        # 需要找到产生 int8 的量化模块
+                        producer_module_name, producer_module_obj = self._find_producer_quant_module(arg, modules_dict, quantized_module_types)
+                        
+                        if producer_module_name:
+                            key = (arg.name, node.name, i)
+                            self._boundary_conversions[key] = {
+                                'type': 'dequant',
+                                'producer_module': producer_module_name,
+                                'producer_module_obj': producer_module_obj,
+                                'input_index': i
+                            }
+
+        # 保存到实例变量，供后续 build 方法查询
+        self._node_output_types = node_output_types
+    
+    def _find_producer_quant_module(self, node, modules_dict, quantized_module_types):
+        """
+        追溯节点，找到产生该节点输出的量化模块
+        
+        Args:
+            node: 当前节点
+            modules_dict: 模块字典
+            quantized_module_types: 量化模块类型元组
+        
+        Returns:
+            (module_name, module_obj): 量化模块的名称和对象，如果未找到则返回 (None, None)
+        """
+        # 如果节点本身就是量化模块，直接返回
+        if node.op == 'call_module':
+            module = modules_dict.get(node.target)
+            if module is not None and isinstance(module, quantized_module_types):
+                return node.target, module
+        
+        # 如果是 call_function 或 call_method，追溯其输入
+        if node.op == 'call_function' or node.op == 'call_method':
+            for arg in node.args:
+                if isinstance(arg, fx.Node):
+                    result = self._find_producer_quant_module(arg, modules_dict, quantized_module_types)
+                    if result[0] is not None:
+                        return result
+        
+        return None, None
+    
+    def _get_quant_mode_from_module(self, module):
+        """从量化模块获取量化模式编码"""
+        # 默认：symmetric, per-tensor
+        mode = 0
+        if hasattr(module, 'quant_mode'):
+            qmode = module.quant_mode
+            if qmode == 'asym':
+                mode |= 1  # asymmetric
+            if hasattr(module, 'per_token') and module.per_token:
+                mode |= 2  # per-token
+        return mode
+    
+    def _generate_boundary_conversion(self, conversion_info, producer_name, consumer_name, input_idx):
+        """生成边界转换的代码（quant 或 dequant）
+        
+        Returns:
+            (new_var_name, code_line) 或 None 如果不需要转换
+        """
+        conv_type = conversion_info['type']
+        
+        if conv_type == 'quant':
+            # 非量化 -> 量化：使用消费者（量化模块）的 input_scale
+            module_name = conversion_info['consumer_module'].replace(".", "_")
+            module_obj = conversion_info['consumer_module_obj']
+            quant_mode = self._get_quant_mode_from_module(module_obj)
+            
+            # 生成新变量名
+            new_var_name = f"{producer_name}_quant_{consumer_name}_{input_idx}"
+            
+            # 根据模块类型和输入索引选择正确的 scale 名称
+            scale_base_name = self._get_input_scale_name(module_obj, input_idx)
+            scale_sign = f"{module_name}_{scale_base_name}_sign"
+            scale_coe = f"{module_name}_{scale_base_name}_coe"
+            scale_rshift = f"{module_name}_{scale_base_name}_rshift"
+            
+            # 检查是否需要 zero point
+            zero = None
+            zero_attr_name = self._get_input_zero_name(module_obj, input_idx)
+            if zero_attr_name and hasattr(module_obj, zero_attr_name):
+                zero_val = getattr(module_obj, zero_attr_name)
+                if zero_val is not None:
+                    zero = f"{module_name}_{zero_attr_name}"
+            
+            code = self.generate_quant_call(
+                new_var_name, producer_name, quant_mode,
+                scale_sign, scale_coe, scale_rshift, zero
+            )
+            return new_var_name, code
+        
+        elif conv_type == 'dequant':
+            # 量化 -> 非量化：使用生产者（量化模块）的 output_scale
+            module_name = conversion_info['producer_module'].replace(".", "_")
+            module_obj = conversion_info['producer_module_obj']
+            quant_mode = self._get_quant_mode_from_module(module_obj)
+            
+            # 生成新变量名
+            new_var_name = f"{producer_name}_dequant_{consumer_name}_{input_idx}"
+            
+            # 根据模块类型选择正确的 output scale 名称
+            scale_base_name = self._get_output_scale_name(module_obj)
+            scale_sign = f"{module_name}_{scale_base_name}_sign"
+            scale_coe = f"{module_name}_{scale_base_name}_coe"
+            scale_rshift = f"{module_name}_{scale_base_name}_rshift"
+            
+            # 检查是否需要 zero point
+            zero = None
+            zero_attr_name = self._get_output_zero_name(module_obj)
+            if zero_attr_name and hasattr(module_obj, zero_attr_name):
+                zero_val = getattr(module_obj, zero_attr_name)
+                if zero_val is not None:
+                    zero = f"{module_name}_{zero_attr_name}"
+            
+            code = self.generate_dequant_call(
+                new_var_name, producer_name, quant_mode,
+                scale_sign, scale_coe, scale_rshift, zero
+            )
+            return new_var_name, code
+        
+    # NOTE: You need to determine the correct input scale name based on module type and input index. Update this method if the corresponding module is updated.
+    def _get_input_scale_name(self, module, input_idx):
+        """根据模块类型和输入索引获取正确的输入 scale 名称"""
+        # 双输入操作：QAdd, QMatMul, QMatMulIsqrtD
+        if isinstance(module, (QAdd, QMatMul, QMatMulIsqrtD)):
+            if input_idx == 0:
+                return "x_scale"
+            elif input_idx == 1:
+                return "y_scale"
+            else:
+                # 默认使用 x_scale（不应该到这里）
+                return "x_scale"
+        
+        # 单输入操作：QLinear, QConv2d, IntGELU, IntSoftmax, IntLayerNorm
+        return "input_scale"
+    
+    def _get_input_zero_name(self, module, input_idx):
+        """根据模块类型和输入索引获取正确的输入 zero point 名称"""
+        # 双输入操作：QAdd, QMatMul, QMatMulIsqrtD
+        if isinstance(module, (QAdd, QMatMul, QMatMulIsqrtD)):
+            if input_idx == 0:
+                return "x_zero"
+            elif input_idx == 1:
+                return "y_zero"
+            else:
+                return "x_zero"
+        
+        # 单输入操作
+        return "input_zero"
+    
+    def _get_output_scale_name(self, module):
+        """根据模块类型获取正确的输出 scale 名称"""
+        # 双输入操作：QAdd, QMatMul, QMatMulIsqrtD 使用 o_scale
+        if isinstance(module, (QAdd, QMatMul, QMatMulIsqrtD)):
+            return "o_scale"
+        
+        # 其他模块使用 output_scale
+        return "output_scale"
+    
+    def _get_output_zero_name(self, module):
+        """根据模块类型获取正确的输出 zero point 名称"""
+        # 双输入操作：QAdd, QMatMul, QMatMulIsqrtD 使用 o_zero
+        if isinstance(module, (QAdd, QMatMul, QMatMulIsqrtD)):
+            return "o_zero"
+        
+        # 其他模块使用 output_zero
+        return "output_zero"
+    def _trace_to_placeholder(self, node, result_set):
+        """
+        追溯节点到placeholder，将路径上的节点都标记为量化相关。
+        """
+        if node.op == 'placeholder':
+            result_set.add(node.name)
+        elif node.op == 'call_module':
+            # 检查是否是量化模块的输出
+            module = dict(self.gm.named_modules()).get(node.target)
+            quantized_module_types = (
+                QLinear, QConv2d, IntGELU, IntSoftmax, 
+                IntLayerNorm, QAdd, QMatMul, QMatMulIsqrtD,
+            )
+            if module is not None and isinstance(module, quantized_module_types):
+                # 量化模块的输出已经是int8，不需要再追溯
+                return
+        # 继续追溯输入
+        for arg in node.args:
+            if isinstance(arg, fx.Node):
+                self._trace_to_placeholder(arg, result_set)
+    
+    def _get_quant_dtype_str(self, bits, signed=True):
+        """
+        根据位宽返回对应的类型字符串。
+        """
+        if signed:
+            return f"int{bits}"
+        else:
+            return f"uint{bits}"
+    
+    # Deprecated Currently not affected
+    def _is_quantized_input(self, input_name):
+        """
+        检查某个输入是否被量化模块使用（仅在启用量化时有效）。
+        """
+        return False and self.enable_quant and input_name in self._quant_input_nodes
+    
+    # Deprecated Currently not affected
+    def _is_quantized_output(self, output_name):
+        """
+        检查某个输出是否来自量化模块（仅在启用量化时有效）。
+        """
+        return False and self.enable_quant and output_name in self._quant_output_nodes
+    
+    def _is_quant_module_param(self, param_name):
+        """
+        检查某个参数是否属于量化模块（仅在启用量化时有效）。
+        返回 (is_quant, param_suffix) 或 (False, None)
+        """
+        if not self.enable_quant:
+            return False, None
+        for prefix in self._quant_module_prefixes:
+            if param_name.startswith(prefix + "."):
+                param_suffix = param_name[len(prefix)+1:]
+                return True, param_suffix
+        return False, None
+
+    # Currently not affected
+    def _is_quant_embedding_param(self, param_name):
+        """
+        检查某个参数是否是需要量化的 embedding 参数。
+        这些参数（如 cls_token、）虽然不属于量化模块，
+        但会被传递给量化流程（如 ViTTokenExpand -> QAdd），因此可能需要量化。
+        仅在启用量化时有效。
+        """
+        if not self.enable_quant:
+            return False
+        # 定义需要量化的 embedding 参数后缀
+        quant_embedding_suffixes = tuple()
+        # 检查参数名是否以这些后缀结尾
+        for suffix in quant_embedding_suffixes:
+            if param_name.endswith(suffix):
+                return True
+        return False
 
     def build(self):
         for node in self.gm.graph.nodes:
@@ -444,14 +1013,24 @@ class TorchBuilder:
             elif isinstance(x, int):
                 self.input_shapes.append(None)
                 self.input_args.append(self.input_names[i])
-        args = [
-            (
-                f"{name}: float32[{', '.join([str(s) for s in shape])}]"
-                if shape
-                else f"{name}: int32"
-            )
-            for name, shape in zip(self.input_args, self.input_shapes)
-        ]
+        
+        # 生成函数参数类型
+        # 注意：即使内部使用了量化，函数签名仍然使用 float32
+        # quant/dequant 操作会在函数内部的边界处自动插入
+        args = []
+        for name, shape in zip(self.input_args, self.input_shapes):
+            if shape:
+                shape_str = ', '.join([str(s) for s in shape])
+                if self._is_quantized_input(name):
+                    # 量化输入使用 int8 类型
+                    dtype_str = self._get_quant_dtype_str(self.quant_act_bits)
+                    args.append(f"{name}: {dtype_str}[{shape_str}]")
+                else:
+                    # 非量化输入使用 float32
+                    args.append(f"{name}: float32[{shape_str}]")
+            else:
+                args.append(f"{name}: int32")
+        
         res = ""
         # top-level function
         res += f"def forward({', '.join(args)})".format()
@@ -460,24 +1039,34 @@ class TorchBuilder:
         # subfunctions
         if self.subfunctions:
             res += "\n".join(self.subfunctions) + "\n"
+        
+        # 处理命名参数声明
         if self.named_params:
             for name, param in self.named_params:
                 new_name = name.replace(".", "_")
-                res += f"    {new_name}: float32[{', '.join([str(s) for s in param.shape])}] = g_{new_name}\n"
-        # if self.named_buffers:
-        #     for name, buffer in self.named_buffers:
-        #         new_name = name.replace(".", "_")
-        #         # 根据 buffer 的实际 dtype 生成类型标注
-        #         dtype_str = str(buffer.dtype).replace("torch.", "")
-        #         if buffer.ndim == 0:
-        #             # 标量 buffer
-        #             res += f"    {new_name}: {dtype_str} = g_{new_name}\n"
-        #         else:
-        #             # 张量 buffer
-        #             res += f"    {new_name}: {dtype_str}[{', '.join([str(s) for s in buffer.shape])}] = g_{new_name}\n"
+                shape_str = ', '.join([str(s) for s in param.shape])
+                
+                # 默认类型
+                param_dtype = "float32"
+                
+                # 检查是否是量化模块的参数
+                is_quant, param_suffix = self._is_quant_module_param(name)
+                if is_quant:
+                    if param_suffix == "weight":
+                        param_dtype = self._get_quant_dtype_str(self.quant_weight_bits)
+                    elif param_suffix == "bias":
+                        param_dtype = self._get_quant_dtype_str(self.quant_bias_bits)
+                elif self.enable_quant:
+                    # 检查是否是需要量化的特殊 embedding 参数
+                    # 这些参数会被传递给量化流程
+                    if self._is_quant_embedding_param(name):
+                        param_dtype = self._get_quant_dtype_str(self.quant_act_bits)
+                
+                res += f"    {new_name}: {param_dtype}[{shape_str}] = g_{new_name}\n"
     
-        # ========== 新增：处理量化模块的定点参数 ==========
-        res += self._generate_quantized_param_declarations()
+        # 处理量化模块的定点参数（仅在启用量化时）
+        if self.enable_quant:
+            res += self._generate_quantized_param_declarations()
         
         # function body
         for line in self.code:
@@ -508,6 +1097,11 @@ class TorchBuilder:
         
         declarations = []
         
+        # 获取配置的位宽类型
+        weight_dtype = self._get_quant_dtype_str(self.quant_weight_bits)
+        bias_dtype = self._get_quant_dtype_str(self.quant_bias_bits)
+        act_dtype = self._get_quant_dtype_str(self.quant_act_bits)
+        
         # 遍历所有命名模块
         for module_name, module in self.gm.named_modules():
             if not isinstance(module, quantized_module_types):
@@ -518,18 +1112,18 @@ class TorchBuilder:
             
             # ========== 权重相关 ==========
             if hasattr(module, 'weight_int'):
-                # weight_int: int8[shape]
+                # weight_int: 使用配置的权重位宽
                 if hasattr(module.weight_int, 'shape'):
                     shape = module.weight_int.shape
                     shape_str = ', '.join(str(s) for s in shape)
-                    declarations.append(f"    {var_prefix}_weight_int: int8[{shape_str}] = g_{var_prefix}_weight_int")
+                    declarations.append(f"    {var_prefix}_weight_int: {weight_dtype}[{shape_str}] = g_{var_prefix}_weight_int")
                 
                 # weight_scale 的定点表示（sign, coe, rshift）
                 if hasattr(module, 'weight_scale'):
                     scale_shape = module.weight_scale.shape
                     if len(scale_shape) == 0:
                         # 标量
-                        # !!!: Please Notice here if you need to change the type (int8 here) of weight_scale_sign to other type
+                        # NOTE: !!!: Please Notice here if you need to change the type (int8 here) of weight_scale_sign to other type
                         declarations.append(f"    {var_prefix}_weight_scale_sign: int8 = g_{var_prefix}_weight_scale_sign")
                         declarations.append(f"    {var_prefix}_weight_scale_coe: int32 = g_{var_prefix}_weight_scale_coe")
                         declarations.append(f"    {var_prefix}_weight_scale_rshift: int16 = g_{var_prefix}_weight_scale_rshift")
@@ -545,7 +1139,7 @@ class TorchBuilder:
                 if hasattr(module.bias_int, 'shape'):
                     bias_shape = module.bias_int.shape
                     bias_shape_str = ', '.join(str(s) for s in bias_shape)
-                    declarations.append(f"    {var_prefix}_bias_int: int32[{bias_shape_str}] = g_{var_prefix}_bias_int")
+                    declarations.append(f"    {var_prefix}_bias_int: {bias_dtype}[{bias_shape_str}] = g_{var_prefix}_bias_int")
                 
                 if hasattr(module, 'bias_scale'):
                     scale_shape = module.bias_scale.shape
@@ -571,12 +1165,24 @@ class TorchBuilder:
                             declarations.append(f"    {var_prefix}_{scale_name}_sign: int8 = g_{var_prefix}_{scale_name}_sign")
                             declarations.append(f"    {var_prefix}_{scale_name}_coe: int32 = g_{var_prefix}_{scale_name}_coe")
                             declarations.append(f"    {var_prefix}_{scale_name}_rshift: int16 = g_{var_prefix}_{scale_name}_rshift")
+                            
+                            # Add inverse for output_scale
+                            if scale_name == 'output_scale':
+                                declarations.append(f"    {var_prefix}_output_scale_inv_sign: int8 = g_{var_prefix}_output_scale_inv_sign")
+                                declarations.append(f"    {var_prefix}_output_scale_inv_coe: int32 = g_{var_prefix}_output_scale_inv_coe")
+                                declarations.append(f"    {var_prefix}_output_scale_inv_rshift: int16 = g_{var_prefix}_output_scale_inv_rshift")
                         else:
                             # 向量/张量
                             shape_str = ', '.join(str(s) for s in scale_shape)
                             declarations.append(f"    {var_prefix}_{scale_name}_sign: int8[{shape_str}] = g_{var_prefix}_{scale_name}_sign")
                             declarations.append(f"    {var_prefix}_{scale_name}_coe: int32[{shape_str}] = g_{var_prefix}_{scale_name}_coe")
                             declarations.append(f"    {var_prefix}_{scale_name}_rshift: int16[{shape_str}] = g_{var_prefix}_{scale_name}_rshift")
+                            
+                            # Add inverse for output_scale
+                            if scale_name == 'output_scale':
+                                declarations.append(f"    {var_prefix}_output_scale_inv_sign: int8[{shape_str}] = g_{var_prefix}_output_scale_inv_sign")
+                                declarations.append(f"    {var_prefix}_output_scale_inv_coe: int32[{shape_str}] = g_{var_prefix}_output_scale_inv_coe")
+                                declarations.append(f"    {var_prefix}_output_scale_inv_rshift: int16[{shape_str}] = g_{var_prefix}_output_scale_inv_rshift")
             
             # ========== Zero points（非对称量化）==========
             zero_names = ['input_zero', 'output_zero']
@@ -586,10 +1192,10 @@ class TorchBuilder:
                     if zero_attr is not None and hasattr(zero_attr, 'shape'):
                         zero_shape = zero_attr.shape
                         if len(zero_shape) == 0:
-                            declarations.append(f"    {var_prefix}_{zero_name}: int8 = g_{var_prefix}_{zero_name}")
+                            declarations.append(f"    {var_prefix}_{zero_name}: {act_dtype} = g_{var_prefix}_{zero_name}")
                         else:
                             shape_str = ', '.join(str(s) for s in zero_shape)
-                            declarations.append(f"    {var_prefix}_{zero_name}: int8[{shape_str}] = g_{var_prefix}_{zero_name}")
+                            declarations.append(f"    {var_prefix}_{zero_name}: {act_dtype}[{shape_str}] = g_{var_prefix}_{zero_name}")
             
             # ========== 特殊处理：IntLayerNorm ==========
             if isinstance(module, IntLayerNorm):
@@ -616,11 +1222,23 @@ class TorchBuilder:
                                 declarations.append(f"    {var_prefix}_{scale_name}_sign: int8 = g_{var_prefix}_{scale_name}_sign")
                                 declarations.append(f"    {var_prefix}_{scale_name}_coe: int32 = g_{var_prefix}_{scale_name}_coe")
                                 declarations.append(f"    {var_prefix}_{scale_name}_rshift: int16 = g_{var_prefix}_{scale_name}_rshift")
+                                
+                                # Add inverse for o_scale
+                                if scale_name == 'o_scale':
+                                    declarations.append(f"    {var_prefix}_o_scale_inv_sign: int8 = g_{var_prefix}_o_scale_inv_sign")
+                                    declarations.append(f"    {var_prefix}_o_scale_inv_coe: int32 = g_{var_prefix}_o_scale_inv_coe")
+                                    declarations.append(f"    {var_prefix}_o_scale_inv_rshift: int16 = g_{var_prefix}_o_scale_inv_rshift")
                             else:
                                 shape_str = ', '.join(str(s) for s in scale_shape)
                                 declarations.append(f"    {var_prefix}_{scale_name}_sign: int8[{shape_str}] = g_{var_prefix}_{scale_name}_sign")
                                 declarations.append(f"    {var_prefix}_{scale_name}_coe: int32[{shape_str}] = g_{var_prefix}_{scale_name}_coe")
                                 declarations.append(f"    {var_prefix}_{scale_name}_rshift: int16[{shape_str}] = g_{var_prefix}_{scale_name}_rshift")
+                                
+                                # Add inverse for o_scale
+                                if scale_name == 'o_scale':
+                                    declarations.append(f"    {var_prefix}_o_scale_inv_sign: int8[{shape_str}] = g_{var_prefix}_o_scale_inv_sign")
+                                    declarations.append(f"    {var_prefix}_o_scale_inv_coe: int32[{shape_str}] = g_{var_prefix}_o_scale_inv_coe")
+                                    declarations.append(f"    {var_prefix}_o_scale_inv_rshift: int16[{shape_str}] = g_{var_prefix}_o_scale_inv_rshift")
                 
                 for zero_name in ['x_zero', 'y_zero', 'o_zero']:
                     if hasattr(module, zero_name):
@@ -628,10 +1246,10 @@ class TorchBuilder:
                         if zero_attr is not None and hasattr(zero_attr, 'shape'):
                             zero_shape = zero_attr.shape
                             if len(zero_shape) == 0:
-                                declarations.append(f"    {var_prefix}_{zero_name}: int8 = g_{var_prefix}_{zero_name}")
+                                declarations.append(f"    {var_prefix}_{zero_name}: {act_dtype} = g_{var_prefix}_{zero_name}")
                             else:
                                 shape_str = ', '.join(str(s) for s in zero_shape)
-                                declarations.append(f"    {var_prefix}_{zero_name}: int8[{shape_str}] = g_{var_prefix}_{zero_name}")
+                                declarations.append(f"    {var_prefix}_{zero_name}: {act_dtype}[{shape_str}] = g_{var_prefix}_{zero_name}")
             
             # ========== 特殊处理：IntSoftmax ==========
             if isinstance(module, IntSoftmax):
@@ -667,11 +1285,97 @@ class TorchBuilder:
         return '\n'.join(declarations) + '\n' if declarations else ''
 
     def __call__(self, node):
+        # 在生成当前节点代码之前，检查是否需要在边界处插入 quant/dequant
+        # 处理 call_module 和 call_function 节点
+        if self.enable_quant and node.op in {'call_module', 'call_function', 'call_method'}:
+            self._insert_boundary_conversions(node)
+        
         method = getattr(self, "build_" + node.op)
         ret = method(node)
         if ret:
             self.code.append(ret)
         return ret
+    
+    def _insert_boundary_conversions(self, node):
+        """为当前节点插入所需的边界转换代码（quant/dequant）"""
+        for i, arg in enumerate(node.args):
+            if not isinstance(arg, fx.Node):
+                continue
+            
+            key = (arg.name, node.name, i)
+            if key in self._boundary_conversions:
+                conv_info = self._boundary_conversions[key]
+                
+                # 检查是否真的需要类型转换
+                # 例如：int8 -> int8 就不需要 quant，float32 -> float32 就不需要 dequant
+                needs_conversion = self._check_if_conversion_needed(arg, node, conv_info)
+                
+                if needs_conversion:
+                    result = self._generate_boundary_conversion(conv_info, arg.name, node.name, i)
+                    if result:
+                        new_var_name, code = result
+                        # 插入转换代码
+                        self.code.append(code)
+                        # 记录变量替换（后续的 build 方法需要使用新变量名）
+                        if not hasattr(self, '_var_substitutions'):
+                            self._var_substitutions = {}
+                        self._var_substitutions[(node.name, i)] = new_var_name
+
+    def _check_if_conversion_needed(self, producer_node, consumer_node, conv_info):
+        """检查是否真的需要类型转换
+        
+        Args:
+            producer_node: 生产者节点（输入来源）
+            consumer_node: 消费者节点（当前节点）
+            conv_info: 转换信息字典
+        
+        Returns:
+            bool: 是否需要转换
+        """
+        # 获取生产者和消费者的模块
+        modules_dict = dict(self.gm.named_modules())
+        quantized_module_types = (
+            QLinear, QConv2d, IntGELU, IntSoftmax, 
+            IntLayerNorm, QAdd, QMatMul, QMatMulIsqrtD,
+        )
+        
+        producer_module = None
+        consumer_module = None
+        
+        if producer_node.op == 'call_module':
+            producer_module = modules_dict.get(producer_node.target)
+        if consumer_node.op == 'call_module':
+            consumer_module = modules_dict.get(consumer_node.target)
+        
+        conv_type = conv_info['type']
+        
+        if conv_type == 'quant':
+            # quant 转换：float -> int
+            # 如果生产者已经输出 int，就不需要 quant
+            if producer_module is not None and isinstance(producer_module, quantized_module_types):
+                # 生产者是量化模块，输出已经是 int，不需要 quant
+                return False
+            # 其他情况需要 quant（float -> int）
+            return True
+        
+        elif conv_type == 'dequant':
+            # dequant 转换：int -> float
+            # 如果消费者也接受 int 输入，就不需要 dequant
+            if consumer_module is not None and isinstance(consumer_module, quantized_module_types):
+                # 消费者是量化模块，可以接受 int 输入，不需要 dequant
+                return False
+            # 其他情况需要 dequant（int -> float）
+            return True
+        
+        return True
+    
+    def _get_substituted_var_name(self, node, arg, arg_index):
+        """获取可能被替换的变量名（用于边界转换后的变量）"""
+        if hasattr(self, '_var_substitutions'):
+            key = (node.name, arg_index)
+            if key in self._var_substitutions:
+                return self._var_substitutions[key]
+        return get_var_name(arg)
 
     def get_module(self, name):
         return dict(self.gm.named_modules())[name]
@@ -791,43 +1495,123 @@ class TorchBuilder:
             else None
         )
 
-    def append_output(self, output):
+    def append_output(self, output, output_name=None):
+        """
+        添加输出类型声明。
+        
+        Args:
+            output: TensorMetadata，包含shape和dtype
+            output_name: 输出节点名称，用于检查是否是量化输出
+        """
         shape = str(list(output.shape))
-        dtype = str(output.dtype)[6:]
+        
+        # 检查是否是量化模块的输出
+        if output_name and self._is_quantized_output(output_name):
+            # 量化输出使用 int8 类型
+            dtype = self._get_quant_dtype_str(self.quant_act_bits)
+        else:
+            dtype = str(output.dtype)[6:]
+        
         self.output.append(dtype + shape)
 
     def build_output(self, node):
+        # 获取返回的变量名称（用于检查是否是量化输出）
+        raw_name = get_var_name(node.args[0])
+        if isinstance(raw_name, dict):
+            output_names = list(raw_name.values())
+        elif isinstance(raw_name, (list, tuple)):
+            output_names = list(raw_name)
+        else:
+            output_names = [raw_name]
+        
+        # 将输出名称列表规范化
+        output_names_flat = []
+        for n in output_names:
+            if isinstance(n, fx.Node):
+                output_names_flat.append(n.name)
+            elif isinstance(n, str):
+                output_names_flat.append(n)
+            else:
+                output_names_flat.append(str(n))
+        
+        output_idx = [0]  # 使用列表以便在嵌套函数中修改
+        
+        def get_next_output_name():
+            if output_idx[0] < len(output_names_flat):
+                name = output_names_flat[output_idx[0]]
+                output_idx[0] += 1
+                return name
+            return None
+        
         if isinstance(node.meta["tensor_meta"], TensorMetadata):
-            self.append_output(node.meta["tensor_meta"])
+            self.append_output(node.meta["tensor_meta"], get_next_output_name())
         elif isinstance(node.meta["tensor_meta"], (list, tuple)):
             for output in node.meta["tensor_meta"]:
                 if isinstance(output, TensorMetadata):
-                    self.append_output(output)
+                    self.append_output(output, get_next_output_name())
                 elif isinstance(output, (list, tuple)):
                     for item in output:
                         if isinstance(item, TensorMetadata):
-                            self.append_output(item)
+                            self.append_output(item, get_next_output_name())
                 elif isinstance(output, dict):
                     for item in output.values():
                         if isinstance(item, TensorMetadata):
-                            self.append_output(item)
+                            self.append_output(item, get_next_output_name())
                         else:
                             raise NotImplementedError("Unsupported output type")
         elif isinstance(node.meta["tensor_meta"], dict):
             for output in node.meta["tensor_meta"].values():
                 if isinstance(output, TensorMetadata):
-                    self.append_output(output)
+                    self.append_output(output, get_next_output_name())
+        
+        # 检查是否需要在返回前插入 dequant（量化输出 -> float32 返回值）
+        # 因为函数签名总是 float32，如果返回的是量化值，需要 dequant
+        return_vars = []
+        if self.enable_quant and isinstance(node.args[0], fx.Node):
+            return_arg = node.args[0]
+            # 检查返回值是否来自量化模块
+            if return_arg.op == 'call_module':
+                modules_dict = dict(self.gm.named_modules())
+                producer_module = modules_dict.get(return_arg.target)
+                quantized_module_types = (
+                    QLinear, QConv2d, IntGELU, IntSoftmax, 
+                    IntLayerNorm, QAdd, QMatMul, QMatMulIsqrtD,
+                )
+                if producer_module is not None and isinstance(producer_module, quantized_module_types):
+                    # 需要在返回前插入 dequant
+                    dequant_var_name = f"{return_arg.name}_dequant_return"
+                    quant_mode = self._get_quant_mode_from_module(producer_module)
+                    scale_name = self._get_output_scale_name(producer_module)
+                    zero_name = self._get_output_zero_name(producer_module)
+                    
+                    # 生成 dequant 代码
+                    dequant_code = self.generate_dequant_call(
+                        dequant_var_name,
+                        return_arg.name,
+                        quant_mode,
+                        f"{return_arg.target.replace('.', '_')}_{scale_name}_sign",
+                        f"{return_arg.target.replace('.', '_')}_{scale_name}_coe",
+                        f"{return_arg.target.replace('.', '_')}_{scale_name}_rshift",
+                        f"{return_arg.target.replace('.', '_')}_{zero_name}" if hasattr(producer_module, zero_name) and getattr(producer_module, zero_name) is not None else None
+                    )
+                    self.code.append(dequant_code)
+                    return_vars.append(dequant_var_name)
+        
         # Unwrap all outputs and return them
-        name = get_var_name(node.args[0])
-        if isinstance(name, dict):
-            name = list(name.values())
-        return_name = (
-            str(name)
-            .replace("(", "")
-            .replace(")", "")
-            .replace("[", "")
-            .replace("]", "")
-        )
+        if not return_vars:
+            name = get_var_name(node.args[0])
+            if isinstance(name, dict):
+                name = list(name.values())
+            return_name = (
+                str(name)
+                .replace("(", "")
+                .replace(")", "")
+                .replace("[", "")
+                .replace("]", "")
+            )
+        else:
+            return_name = ', '.join(return_vars)
+        
         if return_name.endswith(","):
             return_name = return_name[:-1]
         return f"return ({return_name})"
@@ -1050,7 +1834,20 @@ class TorchBuilder:
     
     def build_ViTGetFirstToken(self, node, shape):
         shape = (self.example_inputs[0].shape[0], shape[1], shape[2])
-        src = inspect.getsource(ViTGetFirstToken_lib(*shape))
+        # 根据输入节点的实际类型选择数据类型
+        # 检查输入参数的类型（从 _node_output_types 查询）
+        dtype_str = "float32"  # 默认值
+        if self.enable_quant and hasattr(self, '_node_output_types'):
+            # 查找输入节点的类型
+            for arg in node.args:
+                if isinstance(arg, fx.Node) and arg.name in self._node_output_types:
+                    output_type = self._node_output_types[arg.name]
+                    if output_type == 'int8':
+                        dtype_str = self._get_quant_dtype_str(self.quant_act_bits)
+                    break
+        # 根据数据类型选择对应的 lib 函数
+        lib_func = ViTGetFirstToken_int8_lib if dtype_str == f"int{self.quant_act_bits}" else ViTGetFirstToken_float32_lib
+        src = inspect.getsource(lib_func(*shape))
         src = (
             src.replace("s_0", str(shape[0]))
             .replace("s_1", str(shape[1]))
@@ -1062,7 +1859,20 @@ class TorchBuilder:
     
     def build_ViTTokenExpand(self, node, shape):
         shape = (self.example_inputs[0].shape[0], shape[1], shape[2])
-        src = inspect.getsource(ViTTokenExpand_lib(*shape))
+        # 根据输入节点的实际类型选择数据类型
+        # 检查输入参数的类型（从 _node_output_types 查询）
+        dtype_str = "float32"  # 默认值
+        if self.enable_quant and hasattr(self, '_node_output_types'):
+            # 查找输入节点的类型
+            for arg in node.args:
+                if isinstance(arg, fx.Node) and arg.name in self._node_output_types:
+                    output_type = self._node_output_types[arg.name]
+                    if output_type == 'int8':
+                        dtype_str = self._get_quant_dtype_str(self.quant_act_bits)
+                    break
+        # 根据数据类型选择对应的 lib 函数
+        lib_func = ViTTokenExpand_int8_lib if dtype_str == f"int{self.quant_act_bits}" else ViTTokenExpand_float32_lib
+        src = inspect.getsource(lib_func(*shape))
         src = (
             src.replace("s_0", str(shape[0]))
             .replace("s_1", str(shape[1]))
@@ -1104,7 +1914,8 @@ class TorchBuilder:
     def build_QConv2d(self, node):
         module = self.get_module(node.target)
         target_name = node.target.replace(".", "_")
-        inp = get_var_name(node.args[0])
+        # 使用可能被边界转换替换的输入变量名
+        inp = self._get_substituted_var_name(node, node.args[0], 0)
         weight = get_var_name(target_name + "_weight_int")
         stride = tuple(module.stride) if isinstance(module.stride, (list, tuple)) else (module.stride, module.stride)
         
@@ -1123,6 +1934,11 @@ class TorchBuilder:
         output_scale_coe = get_var_name(target_name + "_output_scale_coe")
         output_scale_rshift = get_var_name(target_name + "_output_scale_rshift")
         
+        # output_scale_inv 的拆分参数
+        output_scale_inv_sign = get_var_name(target_name + "_output_scale_inv_sign")
+        output_scale_inv_coe = get_var_name(target_name + "_output_scale_inv_coe")
+        output_scale_inv_rshift = get_var_name(target_name + "_output_scale_inv_rshift")
+        
         # weight_scale 的拆分参数
         weight_scale_sign = get_var_name(target_name + "_weight_scale_sign")
         weight_scale_coe = get_var_name(target_name + "_weight_scale_coe")
@@ -1133,6 +1949,7 @@ class TorchBuilder:
             fused_scale_sign, fused_scale_coe, fused_scale_rshift,
             input_scale_sign, input_scale_coe, input_scale_rshift,
             output_scale_sign, output_scale_coe, output_scale_rshift,
+            output_scale_inv_sign, output_scale_inv_coe, output_scale_inv_rshift,
             weight_scale_sign, weight_scale_coe, weight_scale_rshift
         ]
         
@@ -1168,7 +1985,8 @@ class TorchBuilder:
     def build_QLinear(self, node):
         module = self.get_module(node.target)
         target_name = node.target.replace(".", "_")
-        inp = get_var_name(node.args[0])
+        # 使用可能被边界转换替换的输入变量名
+        inp = self._get_substituted_var_name(node, node.args[0], 0)
         weight = get_var_name(target_name + "_weight_int")
         
         # fused_scale 的拆分参数
@@ -1186,6 +2004,11 @@ class TorchBuilder:
         output_scale_coe = get_var_name(target_name + "_output_scale_coe")
         output_scale_rshift = get_var_name(target_name + "_output_scale_rshift")
         
+        # output_scale_inv 的拆分参数
+        output_scale_inv_sign = get_var_name(target_name + "_output_scale_inv_sign")
+        output_scale_inv_coe = get_var_name(target_name + "_output_scale_inv_coe")
+        output_scale_inv_rshift = get_var_name(target_name + "_output_scale_inv_rshift")
+        
         # weight_scale 的拆分参数
         weight_scale_sign = get_var_name(target_name + "_weight_scale_sign")
         weight_scale_coe = get_var_name(target_name + "_weight_scale_coe")
@@ -1196,6 +2019,7 @@ class TorchBuilder:
             fused_scale_sign, fused_scale_coe, fused_scale_rshift,
             input_scale_sign, input_scale_coe, input_scale_rshift,
             output_scale_sign, output_scale_coe, output_scale_rshift,
+            output_scale_inv_sign, output_scale_inv_coe, output_scale_inv_rshift,
             weight_scale_sign, weight_scale_coe, weight_scale_rshift
         ]
         
@@ -1232,8 +2056,9 @@ class TorchBuilder:
         """构建 QAdd 的 DSL 调用"""
         module = self.get_module(node.target)
         target_name = node.target.replace(".", "_")
-        inp1 = get_var_name(node.args[0])
-        inp2 = get_var_name(node.args[1])
+        # 使用可能被边界转换替换的输入变量名
+        inp1 = self._get_substituted_var_name(node, node.args[0], 0)
+        inp2 = self._get_substituted_var_name(node, node.args[1], 1)
         
         # 获取两个输入和一个输出的 scale 参数
         x_scale_sign = get_var_name(target_name + "_x_scale_sign")
@@ -1248,11 +2073,16 @@ class TorchBuilder:
         o_scale_coe = get_var_name(target_name + "_o_scale_coe")
         o_scale_rshift = get_var_name(target_name + "_o_scale_rshift")
         
+        o_scale_inv_sign = get_var_name(target_name + "_o_scale_inv_sign")
+        o_scale_inv_coe = get_var_name(target_name + "_o_scale_inv_coe")
+        o_scale_inv_rshift = get_var_name(target_name + "_o_scale_inv_rshift")
+        
         params = [
             inp1, inp2,
             x_scale_sign, x_scale_coe, x_scale_rshift,
             y_scale_sign, y_scale_coe, y_scale_rshift,
-            o_scale_sign, o_scale_coe, o_scale_rshift
+            o_scale_sign, o_scale_coe, o_scale_rshift,
+            o_scale_inv_sign, o_scale_inv_coe, o_scale_inv_rshift
         ]
         
         kwargs = []
@@ -1275,7 +2105,8 @@ class TorchBuilder:
         """构建 IntSoftmax 的 DSL 调用"""
         module = self.get_module(node.target)
         target_name = node.target.replace(".", "_")
-        inp = get_var_name(node.args[0])
+        # 使用可能被边界转换替换的输入变量名
+        inp = self._get_substituted_var_name(node, node.args[0], 0)
         
         # 获取 scale 参数
         input_scale_sign = get_var_name(target_name + "_input_scale_sign")
@@ -1286,6 +2117,10 @@ class TorchBuilder:
         output_scale_coe = get_var_name(target_name + "_output_scale_coe")
         output_scale_rshift = get_var_name(target_name + "_output_scale_rshift")
         
+        output_scale_inv_sign = get_var_name(target_name + "_output_scale_inv_sign")
+        output_scale_inv_coe = get_var_name(target_name + "_output_scale_inv_coe")
+        output_scale_inv_rshift = get_var_name(target_name + "_output_scale_inv_rshift")
+        
         softmax_scale_sign = get_var_name(target_name + "_softmax_scale_sign")
         softmax_scale_coe = get_var_name(target_name + "_softmax_scale_coe")
         softmax_scale_rshift = get_var_name(target_name + "_softmax_scale_rshift")
@@ -1294,7 +2129,8 @@ class TorchBuilder:
             inp,
             input_scale_sign, input_scale_coe, input_scale_rshift,
             softmax_scale_sign, softmax_scale_coe, softmax_scale_rshift,
-            output_scale_sign, output_scale_coe, output_scale_rshift
+            output_scale_sign, output_scale_coe, output_scale_rshift,
+            output_scale_inv_sign, output_scale_inv_coe, output_scale_inv_rshift
         ]
         
         kwargs = []
@@ -1324,7 +2160,8 @@ class TorchBuilder:
         """构建 IntLayerNorm 的 DSL 调用"""
         module = self.get_module(node.target)
         target_name = node.target.replace(".", "_")
-        inp = get_var_name(node.args[0])
+        # 使用可能被边界转换替换的输入变量名
+        inp = self._get_substituted_var_name(node, node.args[0], 0)
         
         # bias_int
         bias_int = get_var_name(target_name + "_bias_int")
@@ -1337,6 +2174,10 @@ class TorchBuilder:
         output_scale_sign = get_var_name(target_name + "_output_scale_sign")
         output_scale_coe = get_var_name(target_name + "_output_scale_coe")
         output_scale_rshift = get_var_name(target_name + "_output_scale_rshift")
+        
+        output_scale_inv_sign = get_var_name(target_name + "_output_scale_inv_sign")
+        output_scale_inv_coe = get_var_name(target_name + "_output_scale_inv_coe")
+        output_scale_inv_rshift = get_var_name(target_name + "_output_scale_inv_rshift")
         
         layernorm_scale_sign = get_var_name(target_name + "_layernorm_scale_sign")
         layernorm_scale_coe = get_var_name(target_name + "_layernorm_scale_coe")
@@ -1360,7 +2201,8 @@ class TorchBuilder:
             layernorm_scale_sign, layernorm_scale_coe, layernorm_scale_rshift,
             bias_scale_sign, bias_scale_coe, bias_scale_rshift,
             fused_scale_sign, fused_scale_coe, fused_scale_rshift,
-            output_scale_sign, output_scale_coe, output_scale_rshift
+            output_scale_sign, output_scale_coe, output_scale_rshift,
+            output_scale_inv_sign, output_scale_inv_coe, output_scale_inv_rshift
         ]
         
         kwargs = []
@@ -1381,7 +2223,8 @@ class TorchBuilder:
         """构建 IntGELU 的 DSL 调用"""
         module = self.get_module(node.target)
         target_name = node.target.replace(".", "_")
-        inp = get_var_name(node.args[0])
+        # 使用可能被边界转换替换的输入变量名
+        inp = self._get_substituted_var_name(node, node.args[0], 0)
         
         # 获取 4 组 scale 参数: input, gelu, fused, output
         input_scale_sign = get_var_name(target_name + "_input_scale_sign")
@@ -1400,12 +2243,17 @@ class TorchBuilder:
         output_scale_coe = get_var_name(target_name + "_output_scale_coe")
         output_scale_rshift = get_var_name(target_name + "_output_scale_rshift")
         
+        output_scale_inv_sign = get_var_name(target_name + "_output_scale_inv_sign")
+        output_scale_inv_coe = get_var_name(target_name + "_output_scale_inv_coe")
+        output_scale_inv_rshift = get_var_name(target_name + "_output_scale_inv_rshift")
+        
         params = [
             inp,
             input_scale_sign, input_scale_coe, input_scale_rshift,
             gelu_scale_sign, gelu_scale_coe, gelu_scale_rshift,
             fused_scale_sign, fused_scale_coe, fused_scale_rshift,
-            output_scale_sign, output_scale_coe, output_scale_rshift
+            output_scale_sign, output_scale_coe, output_scale_rshift,
+            output_scale_inv_sign, output_scale_inv_coe, output_scale_inv_rshift
         ]
         
         kwargs = []
@@ -1425,8 +2273,9 @@ class TorchBuilder:
         """构建 QMatMul 的 DSL 调用"""
         module = self.get_module(node.target)
         target_name = node.target.replace(".", "_")
-        inp1 = get_var_name(node.args[0])
-        inp2 = get_var_name(node.args[1])
+        # 使用可能被边界转换替换的输入变量名
+        inp1 = self._get_substituted_var_name(node, node.args[0], 0)
+        inp2 = self._get_substituted_var_name(node, node.args[1], 1)
         
         # 获取两个输入和一个输出的 scale 参数
         x_scale_sign = get_var_name(target_name + "_x_scale_sign")
@@ -1441,11 +2290,16 @@ class TorchBuilder:
         o_scale_coe = get_var_name(target_name + "_o_scale_coe")
         o_scale_rshift = get_var_name(target_name + "_o_scale_rshift")
         
+        o_scale_inv_sign = get_var_name(target_name + "_o_scale_inv_sign")
+        o_scale_inv_coe = get_var_name(target_name + "_o_scale_inv_coe")
+        o_scale_inv_rshift = get_var_name(target_name + "_o_scale_inv_rshift")
+        
         params = [
             inp1, inp2,
             x_scale_sign, x_scale_coe, x_scale_rshift,
             y_scale_sign, y_scale_coe, y_scale_rshift,
-            o_scale_sign, o_scale_coe, o_scale_rshift
+            o_scale_sign, o_scale_coe, o_scale_rshift,
+            o_scale_inv_sign, o_scale_inv_coe, o_scale_inv_rshift
         ]
         
         kwargs = []
@@ -1469,8 +2323,9 @@ class TorchBuilder:
         # 与 QMatMul 基本相同，只是函数名不同
         module = self.get_module(node.target)
         target_name = node.target.replace(".", "_")
-        inp1 = get_var_name(node.args[0])
-        inp2 = get_var_name(node.args[1])
+        # 使用可能被边界转换替换的输入变量名
+        inp1 = self._get_substituted_var_name(node, node.args[0], 0)
+        inp2 = self._get_substituted_var_name(node, node.args[1], 1)
         
         x_scale_sign = get_var_name(target_name + "_x_scale_sign")
         x_scale_coe = get_var_name(target_name + "_x_scale_coe")
@@ -1484,11 +2339,16 @@ class TorchBuilder:
         o_scale_coe = get_var_name(target_name + "_o_scale_coe")
         o_scale_rshift = get_var_name(target_name + "_o_scale_rshift")
         
+        o_scale_inv_sign = get_var_name(target_name + "_o_scale_inv_sign")
+        o_scale_inv_coe = get_var_name(target_name + "_o_scale_inv_coe")
+        o_scale_inv_rshift = get_var_name(target_name + "_o_scale_inv_rshift")
+        
         params = [
             inp1, inp2,
             x_scale_sign, x_scale_coe, x_scale_rshift,
             y_scale_sign, y_scale_coe, y_scale_rshift,
-            o_scale_sign, o_scale_coe, o_scale_rshift
+            o_scale_sign, o_scale_coe, o_scale_rshift,
+            o_scale_inv_sign, o_scale_inv_coe, o_scale_inv_rshift
         ]
         
         kwargs = []
@@ -1505,3 +2365,48 @@ class TorchBuilder:
             params_str += ', ' + ', '.join(kwargs)
         
         return f"{node.name} = dsl.qmatmul_isqrtd({params_str})"
+
+    # ==================== Quant / Dequant 操作 ====================
+    # 这些方法用于在量化/非量化边界处插入类型转换
+    
+    @staticmethod
+    def generate_quant_call(output_name, input_name, quant_mode, 
+                            scale_sign, scale_coe, scale_rshift, 
+                            zero=None):
+        """生成 quant DSL 调用代码
+        
+        Args:
+            output_name: 输出变量名
+            input_name: 输入变量名 (float)
+            quant_mode: 量化模式 (0=sym_tensor, 1=asym_tensor, 2=sym_token, 3=asym_token)
+            scale_sign, scale_coe, scale_rshift: scale 参数名
+            zero: 零点参数名 (可选，仅 asymmetric 模式)
+        
+        Returns:
+            DSL 代码字符串
+        """
+        params = [input_name, str(quant_mode), scale_sign, scale_coe, scale_rshift]
+        if zero is not None:
+            params.append(f"zero={zero}")
+        return f"{output_name} = dsl.quant({', '.join(params)})"
+    
+    @staticmethod
+    def generate_dequant_call(output_name, input_name, quant_mode,
+                              scale_sign, scale_coe, scale_rshift,
+                              zero=None):
+        """生成 dequant DSL 调用代码
+        
+        Args:
+            output_name: 输出变量名
+            input_name: 输入变量名 (int)
+            quant_mode: 量化模式 (0=sym_tensor, 1=asym_tensor, 2=sym_token, 3=asym_token)
+            scale_sign, scale_coe, scale_rshift: scale 参数名
+            zero: 零点参数名 (可选，仅 asymmetric 模式)
+        
+        Returns:
+            DSL 代码字符串
+        """
+        params = [input_name, str(quant_mode), scale_sign, scale_coe, scale_rshift]
+        if zero is not None:
+            params.append(f"zero={zero}")
+        return f"{output_name} = dsl.dequant({', '.join(params)})"

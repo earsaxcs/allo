@@ -27,6 +27,7 @@ from .types import (
     Struct,
     Stream,
 )
+from ..quant.quant_config import DEFAULT_ACT_BIT, DEFAULT_WEIGHT_BIT, DEFAULT_BIAS_BIT
 from .typing_rule import get_typing_rule
 from ..backend.ip import IPModule
 from ..utils import (
@@ -912,6 +913,24 @@ class TypeInferer(ASTVisitor):
             ), f"Quantized addition requires the same shape, got {new_args[0].shape} and {new_args[1].shape}"
             node.shape = new_args[0].shape
             node.dtype = new_args[0].dtype
+            return node
+
+        if op_name in {"quant", "dequant"}:
+            # quant: float -> int, dequant: int -> float
+            # Both preserve the shape of the input, but change the dtype
+            node.shape = new_args[0].shape
+            
+            # Determine output dtype based on operation type
+            if op_name == "quant":
+                # quant: float input -> int output
+                # Output type should be int8 (or the quantized type)
+                # Default to int8 for activation quantization
+                node.dtype = Int(DEFAULT_ACT_BIT)
+            else:  # dequant
+                # dequant: int input -> float output
+                # Output type should be float32
+                node.dtype = Float(32)
+            
             return node
 
         if op_name in {"matmul", "bmm", "linear", "conv2d", "sumpool", "maxpool", "qconv2d", "qlinear", "qmatmul", "qmatmul_isqrtd"}:

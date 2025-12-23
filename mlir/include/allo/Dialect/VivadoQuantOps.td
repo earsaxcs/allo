@@ -136,6 +136,7 @@ def Vivado_QMatMulOp : Vivado_Op<"qmatmul", [AttrSizedOperandSegments]> {
     ScaleType:$x_scale,
     ScaleType:$y_scale,
     ScaleType:$o_scale,
+    ScaleType:$o_scale_inv,
     Optional<ZeroType>:$x_zero,
     Optional<ZeroType>:$y_zero,
     Optional<ZeroType>:$o_zero,
@@ -159,12 +160,12 @@ def Vivado_QMatMulOp : Vivado_Op<"qmatmul", [AttrSizedOperandSegments]> {
   
   let assemblyFormat = [{
     `(` $output `,` $lhs `,` $rhs `,`
-        $x_scale `,` $y_scale `,` $o_scale
+        $x_scale `,` $y_scale `,` $o_scale `,` $o_scale_inv
         (`x_zero` `=` $x_zero^ `:` type($x_zero))?
         (`y_zero` `=` $y_zero^ `:` type($y_zero))?
         (`o_zero` `=` $o_zero^ `:` type($o_zero))? `)` attr-dict `:` 
         type($output) `,` type($lhs) `,` type($rhs) `,`
-        type($x_scale) `,` type($y_scale) `,` type($o_scale)
+        type($x_scale) `,` type($y_scale) `,` type($o_scale) `,` type($o_scale_inv)
   }];
   
   // let hasVerifier = 1;
@@ -198,6 +199,7 @@ def Vivado_QLinearOp : Vivado_Op<"qlinear", [AttrSizedOperandSegments]> {
     ScaleType:$fscl,
     ScaleType:$iscl,
     ScaleType:$oscl,
+    ScaleType:$oscl_inv,
     ScaleType:$wscl,
     Optional<ScaleType>:$bscl,
     Optional<ZeroType>:$input_zero,
@@ -224,13 +226,13 @@ def Vivado_QLinearOp : Vivado_Op<"qlinear", [AttrSizedOperandSegments]> {
   
   let assemblyFormat = [{
     `(` $output `,` $input `,` $weight `,`
-        $fscl `,` $iscl `,` $oscl `,` $wscl
+        $fscl `,` $iscl `,` $oscl `,` $oscl_inv `,` $wscl
         (`,` $bscl^)?
         (`input_zero` `=` $input_zero^ `:` type($input_zero))?
         (`output_zero` `=` $output_zero^ `:` type($output_zero))?
         (`bias` `=` $bias^ `:` type($bias))? `)` attr-dict `:` 
         type($output) `,` type($input) `,` type($weight) `,`
-        type($fscl) `,` type($iscl) `,` type($oscl) `,` type($wscl)
+        type($fscl) `,` type($iscl) `,` type($oscl) `,` type($oscl_inv) `,` type($wscl)
         (`,` type($bscl)^)?
   }];
   
@@ -263,6 +265,7 @@ def Vivado_QAddOp : Vivado_Op<"qadd", [AttrSizedOperandSegments]> {
     ScaleType:$x_scale,
     ScaleType:$y_scale,
     ScaleType:$o_scale,
+    ScaleType:$o_scale_inv,
     Optional<ZeroType>:$x_zero,
     Optional<ZeroType>:$y_zero,
     Optional<ZeroType>:$o_zero,
@@ -277,13 +280,13 @@ def Vivado_QAddOp : Vivado_Op<"qadd", [AttrSizedOperandSegments]> {
   
   let assemblyFormat = [{
     `(` $output `,` $lhs `,` $rhs `,`
-        $x_scale `,` $y_scale `,` $o_scale
+        $x_scale `,` $y_scale `,` $o_scale `,` $o_scale_inv
         (`x_zero` `=` $x_zero^ `:` type($x_zero))?
         (`y_zero` `=` $y_zero^ `:` type($y_zero))?
         (`o_zero` `=` $o_zero^ `:` type($o_zero))? `)`
         attr-dict `:` 
         type($output) `,` type($lhs) `,` type($rhs) `,`
-        type($x_scale) `,` type($y_scale) `,` type($o_scale)
+        type($x_scale) `,` type($y_scale) `,` type($o_scale) `,` type($o_scale_inv)
   }];
 }
 
@@ -315,6 +318,7 @@ def Vivado_IntGELUOp : Vivado_Op<"int_gelu", [AttrSizedOperandSegments]> {
     ScaleType:$gscl,
     ScaleType:$fscl,
     ScaleType:$oscl,
+    ScaleType:$oscl_inv,
     Optional<ZeroType>:$input_zero,
     Optional<ZeroType>:$output_zero,
     
@@ -327,11 +331,11 @@ def Vivado_IntGELUOp : Vivado_Op<"int_gelu", [AttrSizedOperandSegments]> {
   
   let assemblyFormat = [{
     `(` $output `,` $input `,`
-        $iscl `,` $gscl `,` $fscl `,` $oscl
+        $iscl `,` $gscl `,` $fscl `,` $oscl `,` $oscl_inv
         (`input_zero` `=` $input_zero^ `:` type($input_zero))?
         (`output_zero` `=` $output_zero^ `:` type($output_zero))? `)`
         attr-dict `:` type($output) `,` type($input) `,`
-        type($iscl) `,` type($gscl) `,` type($fscl) `,` type($oscl)
+        type($iscl) `,` type($gscl) `,` type($fscl) `,` type($oscl) `,` type($oscl_inv)
   }];
 }
 
@@ -348,6 +352,7 @@ def Vivado_IntSoftmaxOp : Vivado_Op<"int_softmax", [AttrSizedOperandSegments]> {
     ScaleType:$iscl,
     ScaleType:$sscl,
     ScaleType:$oscl,
+    ScaleType:$oscl_inv,
     Optional<ScaleType>:$fscl,
     Optional<ZeroType>:$input_zero,
     Optional<ZeroType>:$output_zero,
@@ -362,12 +367,12 @@ def Vivado_IntSoftmaxOp : Vivado_Op<"int_softmax", [AttrSizedOperandSegments]> {
   
   let assemblyFormat = [{
     `(` $output `,` $input `,`
-        $iscl `,` $sscl `,` $oscl
+        $iscl `,` $sscl `,` $oscl `,` $oscl_inv
         (`,` $fscl^)?
         (`input_zero` `=` $input_zero^ `:` type($input_zero))?
         (`output_zero` `=` $output_zero^ `:` type($output_zero))? `)` attr-dict `:` 
         type($output) `,` type($input) `,`
-        type($iscl) `,` type($sscl) `,` type($oscl)
+        type($iscl) `,` type($sscl) `,` type($oscl) `,` type($oscl_inv)
         (`,` type($fscl)^)?
   }];
 }
@@ -389,6 +394,7 @@ def Vivado_IntLayerNormOp : Vivado_Op<"int_layernorm", [AttrSizedOperandSegments
     ScaleType:$bscl,
     ScaleType:$fscl,
     ScaleType:$oscl,
+    ScaleType:$oscl_inv,
     Optional<ZeroType>:$input_zero,
     Optional<ZeroType>:$output_zero,
     F32Attr:$eps,
@@ -402,12 +408,12 @@ def Vivado_IntLayerNormOp : Vivado_Op<"int_layernorm", [AttrSizedOperandSegments
   
   let assemblyFormat = [{
     `(` $output `,` $input `,` $bias_int `,`
-        $iscl `,` $lscl `,` $bscl `,` $fscl `,` $oscl
+        $iscl `,` $lscl `,` $bscl `,` $fscl `,` $oscl `,` $oscl_inv
         (`input_zero` `=` $input_zero^ `:` type($input_zero))?
         (`output_zero` `=` $output_zero^ `:` type($output_zero))? `)`
         `eps` `=` $eps attr-dict `:` 
         type($output) `,` type($input) `,` type($bias_int) `,`
-        type($iscl) `,` type($lscl) `,` type($bscl) `,` type($fscl) `,` type($oscl)
+        type($iscl) `,` type($lscl) `,` type($bscl) `,` type($fscl) `,` type($oscl) `,` type($oscl_inv)
   }];
 }
 
@@ -434,6 +440,7 @@ def Vivado_QConv2dOp : Vivado_Op<"qconv2d", [AttrSizedOperandSegments]> {
     ScaleType:$fscl,
     ScaleType:$iscl,
     ScaleType:$oscl,
+    ScaleType:$oscl_inv,
     ScaleType:$wscl,
     Optional<ScaleType>:$bscl,
     Optional<ZeroType>:$input_zero,
@@ -459,14 +466,14 @@ def Vivado_QConv2dOp : Vivado_Op<"qconv2d", [AttrSizedOperandSegments]> {
   
   let assemblyFormat = [{
     `(` $output `,` $input `,` $filter `,`
-        $fscl `,` $iscl `,` $oscl `,` $wscl
+        $fscl `,` $iscl `,` $oscl `,` $oscl_inv `,` $wscl
         (`,` $bscl^)?
         (`input_zero` `=` $input_zero^ `:` type($input_zero))?
         (`output_zero` `=` $output_zero^ `:` type($output_zero))?
         (`bias` `=` $bias^ `:` type($bias))? `)`
         `stride` `=` $stride attr-dict `:` 
         type($output) `,` type($input) `,` type($filter) `,`
-        type($fscl) `,` type($iscl) `,` type($oscl) `,` type($wscl)
+        type($fscl) `,` type($iscl) `,` type($oscl) `,` type($oscl_inv) `,` type($wscl)
         (`,` type($bscl)^)?
   }];
 }
@@ -491,6 +498,7 @@ def Vivado_QMatMulIsqrtDOp : Vivado_Op<"qmatmul_isqrtd", [AttrSizedOperandSegmen
     ScaleType:$x_scale,
     ScaleType:$y_scale,
     ScaleType:$o_scale,
+    ScaleType:$o_scale_inv,
     Optional<ZeroType>:$x_zero,
     Optional<ZeroType>:$y_zero,
     Optional<ZeroType>:$o_zero,
@@ -514,13 +522,124 @@ def Vivado_QMatMulIsqrtDOp : Vivado_Op<"qmatmul_isqrtd", [AttrSizedOperandSegmen
   
   let assemblyFormat = [{
     `(` $output `,` $lhs `,` $rhs `,`
-        $x_scale `,` $y_scale `,` $o_scale
+        $x_scale `,` $y_scale `,` $o_scale `,` $o_scale_inv
         (`x_zero` `=` $x_zero^ `:` type($x_zero))?
         (`y_zero` `=` $y_zero^ `:` type($y_zero))?
         (`o_zero` `=` $o_zero^ `:` type($o_zero))? `)`
         attr-dict `:` 
         type($output) `,` type($lhs) `,` type($rhs) `,`
-        type($x_scale) `,` type($y_scale) `,` type($o_scale)
+        type($x_scale) `,` type($y_scale) `,` type($o_scale) `,` type($o_scale_inv)
   }];
 }
 
+//===----------------------------------------------------------------------===//
+// Vivado Integer/Float Element Type Constraints
+//===----------------------------------------------------------------------===//
+
+// Integer element types for quantized tensors (activations, weights)
+def Vivado_IntElementType : AnyTypeOf<[
+  MemRefOf<[AnySignlessInteger]>,
+  RankedTensorOf<[AnySignlessInteger]>
+]>;
+
+// Float element types for floating-point tensors
+def Vivado_FloatElementType : AnyTypeOf<[
+  MemRefOf<[AnyFloat]>,
+  RankedTensorOf<[AnyFloat]>
+]>;
+
+//===----------------------------------------------------------------------===//
+// Vivado Quantize Op
+//===----------------------------------------------------------------------===//
+
+def Vivado_QuantOp : Vivado_Op<"quant", []> {
+  let summary = "Backend-specific quantize operation for Vivado/PYNQ";
+  let description = [{
+    Converts floating-point tensor to integer tensor using packed scale.
+    
+    This operation performs: q = round(x / scale) [+ zero for asymmetric]
+    
+    **Relationship to allo.quant:**
+    - Inherits mathematical semantics from allo.quant
+    - Uses packed 32-bit scale instead of separate sign/coe/rshift
+    - Adds backend-specific attributes for hardware implementation
+    
+    **Quant Mode Encoding (2-bit):**
+    - 0: symmetric, per-tensor
+    - 1: asymmetric, per-tensor
+    - 2: symmetric, per-token
+    - 3: asymmetric, per-token
+    
+    **Lowering Target:**
+    Will be lowered to PYNQ CPU-side (PS) operations.
+  }];
+  
+  let arguments = (ins 
+    Vivado_IntElementType:$output,    // Output: integer tensor (pre-allocated)
+    Vivado_FloatElementType:$input,   // Input: float tensor
+    ScaleType:$scale,                 // Packed scale (sign, coe, rshift in 32-bit)
+    Optional<ZeroType>:$zero,         // Zero point (for asymmetric mode)
+    
+    // Backend-specific attributes
+    I8Attr:$quant_mode,               // Quantization mode (0-3)
+    DefaultValuedAttr<StrAttr, "\"8,24,8,16,16,0\"">:$scale_packing,
+    DefaultValuedAttr<StrAttr, "\"Tail\"">:$scale_coe_mode
+  );
+  
+  let results = (outs);
+  
+  let assemblyFormat = [{
+    `(` $output `,` $input `,` $scale
+        (`zero` `=` $zero^ `:` type($zero))? `)`
+        `quant_mode` `=` $quant_mode attr-dict `:` 
+        type($output) `,` type($input) `,` type($scale)
+  }];
+}
+
+//===----------------------------------------------------------------------===//
+// Vivado Dequantize Op
+//===----------------------------------------------------------------------===//
+
+def Vivado_DequantOp : Vivado_Op<"dequant", [/*AttrSizedOperandSegments*/]> {
+  let summary = "Backend-specific dequantize operation for Vivado/PYNQ";
+  let description = [{
+    Converts integer tensor to floating-point tensor using packed scale.
+    
+    This operation performs: x = (q [- zero]) * scale
+    
+    **Relationship to allo.dequant:**
+    - Inherits mathematical semantics from allo.dequant
+    - Uses packed 32-bit scale instead of separate sign/coe/rshift
+    - Adds backend-specific attributes for hardware implementation
+    
+    **Quant Mode Encoding (2-bit):**
+    - 0: symmetric, per-tensor
+    - 1: asymmetric, per-tensor
+    - 2: symmetric, per-token
+    - 3: asymmetric, per-token
+    
+    **Lowering Target:**
+    Will be lowered to PYNQ CPU-side (PS) operations.
+  }];
+  
+  let arguments = (ins 
+    Vivado_FloatElementType:$output,  // Output: float tensor (pre-allocated)
+    Vivado_IntElementType:$input,     // Input: integer tensor
+    ScaleType:$scale,                 // Packed scale (sign, coe, rshift in 32-bit)
+    Optional<ZeroType>:$zero,         // Zero point (for asymmetric mode)
+    
+    // Backend-specific attributes
+    I8Attr:$quant_mode,               // Quantization mode (0-3)
+    DefaultValuedAttr<StrAttr, "\"8,24,8,16,16,0\"">:$scale_packing,
+    DefaultValuedAttr<StrAttr, "\"Tail\"">:$scale_coe_mode
+  );
+  
+  let results = (outs);
+  
+  let assemblyFormat = [{
+    `(` $output `,` $input `,` $scale
+        (`zero` `=` $zero^ `:` type($zero))? `)`
+        `quant_mode` `=` $quant_mode attr-dict `:` 
+        type($output) `,` type($input) `,` type($scale)
+  }];
+}

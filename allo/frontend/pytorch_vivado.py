@@ -73,9 +73,9 @@ def from_pytorch_vivado(
     s = customize(
         code, verbose=verbose, global_vars=global_vars, enable_tensor=enable_tensor
     )
-    print(s.module)
+    # print(s.module)
     mod = s.build(target='vivado')
-    print(mod)
+    # print(mod)
     if verbose:
         print(s.module)
     return mod

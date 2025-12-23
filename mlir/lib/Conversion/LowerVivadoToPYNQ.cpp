@@ -477,6 +477,74 @@ struct VivadoQMatMulIsqrtDToPYNQPattern
 };
 
 //===----------------------------------------------------------------------===//
+// Pattern: vivado.quant -> pynq.quant (CPU-side quantization)
+//===----------------------------------------------------------------------===//
+
+struct VivadoQuantToPYNQPattern 
+    : public OpRewritePattern<vivado_ops::QuantOp> {
+  using OpRewritePattern<vivado_ops::QuantOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(vivado_ops::QuantOp op,
+                                 PatternRewriter &rewriter) const override {
+    // vivado.quant runs on CPU (PS), not FPGA accelerator (PL)
+    // This creates pynq.quant which will be lowered to CPU loop code
+    
+    Location loc = op.getLoc();
+    
+    // Extract operands
+    Value output = op.getOutput();  // Integer memref
+    Value input = op.getInput();    // Float memref
+    Value scale = op.getScale();    // Packed i32 scale
+    Value zero = op.getZero();      // Optional zero point
+    
+    // Get quant_mode attribute
+    int8_t quantMode = op.getQuantMode();
+    
+    // Create pynq.quant op (CPU-side operation)
+    rewriter.replaceOpWithNewOp<pynq_ops::QuantOp>(
+        op, output, input, scale, zero,
+        rewriter.getI8IntegerAttr(quantMode)
+    );
+    
+    return success();
+  }
+};
+
+//===----------------------------------------------------------------------===//
+// Pattern: vivado.dequant -> pynq.dequant (CPU-side dequantization)
+//===----------------------------------------------------------------------===//
+
+struct VivadoDequantToPYNQPattern 
+    : public OpRewritePattern<vivado_ops::DequantOp> {
+  using OpRewritePattern<vivado_ops::DequantOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(vivado_ops::DequantOp op,
+                                 PatternRewriter &rewriter) const override {
+    // vivado.dequant runs on CPU (PS), not FPGA accelerator (PL)
+    // This creates pynq.dequant which will be lowered to CPU loop code
+    
+    Location loc = op.getLoc();
+    
+    // Extract operands
+    Value output = op.getOutput();  // Float memref
+    Value input = op.getInput();    // Integer memref
+    Value scale = op.getScale();    // Packed i32 scale
+    Value zero = op.getZero();      // Optional zero point
+    
+    // Get quant_mode attribute
+    int8_t quantMode = op.getQuantMode();
+    
+    // Create pynq.dequant op (CPU-side operation)
+    rewriter.replaceOpWithNewOp<pynq_ops::DequantOp>(
+        op, output, input, scale, zero,
+        rewriter.getI8IntegerAttr(quantMode)
+    );
+    
+    return success();
+  }
+};
+
+//===----------------------------------------------------------------------===//
 // Pass Implementation
 //===----------------------------------------------------------------------===//
 
@@ -493,6 +561,8 @@ bool applyLowerVivadoToPYNQ(ModuleOp &module, MLIRContext *context) {
   patterns.add<VivadoIntLayerNormToPYNQPattern>(context);
   patterns.add<VivadoQConv2dToPYNQPattern>(context);
   patterns.add<VivadoQMatMulIsqrtDToPYNQPattern>(context);
+  patterns.add<VivadoQuantToPYNQPattern>(context);
+  patterns.add<VivadoDequantToPYNQPattern>(context);
 
   return !failed(applyPatternsAndFoldGreedily(module, std::move(patterns)));
 }

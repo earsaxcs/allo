@@ -74,6 +74,12 @@ def _run_pass_with_capture(pm, module):
             # Flush buffers before restoring
             sys.stdout.flush()
             sys.stderr.flush()
+        except Exception:
+            print("!!!!!!!!!!!!!!!!!!!!")
+            tmpf.seek(0)
+            with open("./compile_error.log", 'w') as f:
+                f.write(tmpf.read().decode('utf-8'))
+            raise Exception("Compilation Error raised")
         finally:
             # Restore original file descriptors
             os.dup2(saved_stdout, stdout_fd)
@@ -207,7 +213,7 @@ class VivadoModule:
         self,
         mod,
         top_func_name,
-        platform="vivado_hls",
+        platform="vivado",
         mode=None,
         project=None,
         ext_libs=None,
@@ -262,13 +268,16 @@ class VivadoModule:
             # )
             pm = PassManager.parse(
                 "builtin.module("
-                "empty-tensor-to-alloc-tensor,"
-                "lower-allo-quant-to-vivado"
+                    "empty-tensor-to-alloc-tensor,"
+                    "lower-allo-quant-to-vivado"
+                    # "repack-vivado-scales"
                 ")"
             )
 
             if self.debug_mode:
-                pm.enable_ir_printing()
+                pm.enable_ir_printing(
+                    print_after_all=True,
+                )
                 # Run passes with IR output capture
                 captured_output = _run_pass_with_capture(pm, self.module)
                 # Save captured IR printing output
@@ -285,14 +294,14 @@ class VivadoModule:
             
         buf = io.StringIO()
         match platform:
-            case "tapa":
-                allo_d.emit_thls(self.module, buf)
-            case "intel_hls":
-                allo_d.emit_ihls(self.module, buf)
+            case "vivado":
+                allo_d.emit_vivado_c(self.module, buf)
             case _:
-                allo_d.emit_vhls(self.module, buf)
+                allo_d.emit_vivado_c(self.module, buf)
         buf.seek(0)
-        self.hls_code = buf.read()
+        self.c_code = buf.read()
+
+        # TODO: Vivado Code Handle
         if project is not None:
             assert mode is not None, "mode must be specified when project is specified"
             os.makedirs(project, exist_ok=True)
@@ -328,10 +337,10 @@ class VivadoModule:
                     update_makefile(
                         os.path.join(project, f"makefile_{postfix}.mk"), self.ext_libs
                     )
-                header, self.args = separate_header(self.hls_code, self.top_func_name)
+                header, self.args = separate_header(self.c_code, self.top_func_name)
                 with open(f"{project}/kernel.h", "w", encoding="utf-8") as outfile:
                     outfile.write(header)
-                self.hls_code = postprocess_hls_code(self.hls_code, self.top_func_name)
+                self.c_code = postprocess_hls_code(self.c_code, self.top_func_name)
                 for lib in self.ext_libs:
                     for header in lib.headers:
                         header = header.split("/")[-1]
@@ -389,14 +398,14 @@ class VivadoModule:
                 self.tapa_host = codegen_tapa_host(
                     self.top_func_name,
                     self.module,
-                    self.hls_code,
+                    self.c_code,
                 )
                 with open(f"{project}/tapa_host.cpp", "w", encoding="utf-8") as outfile:
                     outfile.write(self.tapa_host)
             else:
                 self.host_code = ""
             with open(f"{project}/kernel.cpp", "w", encoding="utf-8") as outfile:
-                outfile.write(self.hls_code)
+                outfile.write(self.c_code)
             with open(f"{project}/host.cpp", "w", encoding="utf-8") as outfile:
                 outfile.write(self.host_code)
             if len(ext_libs) > 0:
@@ -434,7 +443,7 @@ class VivadoModule:
 
     def __repr__(self):
         if self.mode is None:
-            return self.hls_code
+            return self.c_code
         return f"VivadoModule({self.top_func_name}, {self.mode}, {self.project})"
 
     def __call__(self, *args, shell=True):

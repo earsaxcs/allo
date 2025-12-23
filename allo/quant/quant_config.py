@@ -42,6 +42,10 @@ except ImportError:
     MatMul = None
     MatMulIsqrtD = None
 
+# GLOBAL SETTINGS
+DEFAULT_ACT_BIT = 8
+DEFAULT_WEIGHT_BIT = 8
+DEFAULT_BIAS_BIT = 32
 
 @dataclass
 class LayerQuantConfig:
@@ -102,7 +106,7 @@ class QuantConfig:
     # Mapping from original module types to quantized module classes
     QUANT_MODULE_MAP: Dict[Type[nn.Module], Type[nn.Module]] = {
         nn.Linear: QLinear,
-        nn.Conv2d: QConv2d,
+        # nn.Conv2d: QConv2d,
         nn.GELU: IntGELU,
         nn.Softmax: IntSoftmax,
         nn.LayerNorm: IntLayerNorm,
@@ -295,6 +299,7 @@ def get_vit_optimized_config() -> QuantConfig:
     
     # Linear layers: per-channel weights
     config.set_layer_type_config(nn.Linear, wgt_per_channel=False)
+    # TODO: ... config.set_layer_name_config("attention.linear_q", act_quant_mode="sym")
     
     # Conv2d: per-channel weights
     config.set_layer_type_config(nn.Conv2d, wgt_per_channel=False)

@@ -78,13 +78,15 @@ def build_quant_placeholder(ctx, node, attr, new_args, output_buffer, transforme
         x_scl_sign, x_scl_coe, x_scl_rshift = arg_results[2], arg_results[3], arg_results[4]
         y_scl_sign, y_scl_coe, y_scl_rshift = arg_results[5], arg_results[6], arg_results[7]
         o_scl_sign, o_scl_coe, o_scl_rshift = arg_results[8], arg_results[9], arg_results[10]
+        o_scl_inv_sign, o_scl_inv_coe, o_scl_inv_rshift = arg_results[11], arg_results[12], arg_results[13]
         
-        x_zero = get_kwarg("x_zero", 11, arg_results)
-        y_zero = get_kwarg("y_zero", 12, arg_results)
-        o_zero = get_kwarg("o_zero", 13, arg_results)
+        x_zero = get_kwarg("x_zero", 14, arg_results)
+        y_zero = get_kwarg("y_zero", 15, arg_results)
+        o_zero = get_kwarg("o_zero", 16, arg_results)
         
         allo_d.QMatMulOp(output_buffer, lhs, rhs, x_scl_sign, x_scl_coe, x_scl_rshift, 
                          y_scl_sign, y_scl_coe, y_scl_rshift, o_scl_sign, o_scl_coe, o_scl_rshift,
+                         o_scl_inv_sign, o_scl_inv_coe, o_scl_inv_rshift,
                          x_zero=x_zero, y_zero=y_zero, o_zero=o_zero, ip=ip)
         return output_buffer
     
@@ -97,13 +99,15 @@ def build_quant_placeholder(ctx, node, attr, new_args, output_buffer, transforme
         x_scl_sign, x_scl_coe, x_scl_rshift = arg_results[2], arg_results[3], arg_results[4]
         y_scl_sign, y_scl_coe, y_scl_rshift = arg_results[5], arg_results[6], arg_results[7]
         o_scl_sign, o_scl_coe, o_scl_rshift = arg_results[8], arg_results[9], arg_results[10]
+        o_scl_inv_sign, o_scl_inv_coe, o_scl_inv_rshift = arg_results[11], arg_results[12], arg_results[13]
         
-        x_zero = get_kwarg("x_zero", 11, arg_results)
-        y_zero = get_kwarg("y_zero", 12, arg_results)
-        o_zero = get_kwarg("o_zero", 13, arg_results)
+        x_zero = get_kwarg("x_zero", 14, arg_results)
+        y_zero = get_kwarg("y_zero", 15, arg_results)
+        o_zero = get_kwarg("o_zero", 16, arg_results)
         
         allo_d.QMatMulIsqrtDOp(output_buffer, lhs, rhs, x_scl_sign, x_scl_coe, x_scl_rshift, 
                                y_scl_sign, y_scl_coe, y_scl_rshift, o_scl_sign, o_scl_coe, o_scl_rshift,
+                               o_scl_inv_sign, o_scl_inv_coe, o_scl_inv_rshift,
                                x_zero=x_zero, y_zero=y_zero, o_zero=o_zero, ip=ip)
         return output_buffer
     
@@ -141,20 +145,22 @@ def build_quant_placeholder(ctx, node, attr, new_args, output_buffer, transforme
         fscl_sign, fscl_coe, fscl_rshift = filtered_results[2], filtered_results[3], filtered_results[4]
         iscl_sign, iscl_coe, iscl_rshift = filtered_results[5], filtered_results[6], filtered_results[7]
         oscl_sign, oscl_coe, oscl_rshift = filtered_results[8], filtered_results[9], filtered_results[10]
-        wscl_sign, wscl_coe, wscl_rshift = filtered_results[11], filtered_results[12], filtered_results[13]
+        oscl_inv_sign, oscl_inv_coe, oscl_inv_rshift = filtered_results[11], filtered_results[12], filtered_results[13]
+        wscl_sign, wscl_coe, wscl_rshift = filtered_results[14], filtered_results[15], filtered_results[16]
         
-        bscl_sign = get_kwarg("bscl_sign", 14, filtered_results)
-        bscl_coe = get_kwarg("bscl_coe", 15, filtered_results)
-        bscl_rshift = get_kwarg("bscl_rshift", 16, filtered_results)
+        bscl_sign = get_kwarg("bscl_sign", 17, filtered_results)
+        bscl_coe = get_kwarg("bscl_coe", 18, filtered_results)
+        bscl_rshift = get_kwarg("bscl_rshift", 19, filtered_results)
         
-        input_zero = get_kwarg("izr", 17, filtered_results)
-        output_zero = get_kwarg("ozr", 18, filtered_results)
-        bias = get_kwarg("bias", 19, filtered_results)
+        input_zero = get_kwarg("izr", 20, filtered_results)
+        output_zero = get_kwarg("ozr", 21, filtered_results)
+        bias = get_kwarg("bias", 22, filtered_results)
         
         allo_d.QConv2dOp(output_buffer, input_val, filter_val, 
                          fscl_sign, fscl_coe, fscl_rshift,
                          iscl_sign, iscl_coe, iscl_rshift,
                          oscl_sign, oscl_coe, oscl_rshift,
+                         oscl_inv_sign, oscl_inv_coe, oscl_inv_rshift,
                          wscl_sign, wscl_coe, wscl_rshift,
                          bscl_sign=bscl_sign, bscl_coe=bscl_coe, bscl_rshift=bscl_rshift,
                          input_zero=input_zero, output_zero=output_zero, bias=bias, stride=stride_attr, ip=ip)
@@ -170,20 +176,22 @@ def build_quant_placeholder(ctx, node, attr, new_args, output_buffer, transforme
         fscl_sign, fscl_coe, fscl_rshift = arg_results[2], arg_results[3], arg_results[4]
         iscl_sign, iscl_coe, iscl_rshift = arg_results[5], arg_results[6], arg_results[7]
         oscl_sign, oscl_coe, oscl_rshift = arg_results[8], arg_results[9], arg_results[10]
-        wscl_sign, wscl_coe, wscl_rshift = arg_results[11], arg_results[12], arg_results[13]
+        oscl_inv_sign, oscl_inv_coe, oscl_inv_rshift = arg_results[11], arg_results[12], arg_results[13]
+        wscl_sign, wscl_coe, wscl_rshift = arg_results[14], arg_results[15], arg_results[16]
         
-        bscl_sign = get_kwarg("bscl_sign", 14, arg_results)
-        bscl_coe = get_kwarg("bscl_coe", 15, arg_results)
-        bscl_rshift = get_kwarg("bscl_rshift", 16, arg_results)
+        bscl_sign = get_kwarg("bscl_sign", 17, arg_results)
+        bscl_coe = get_kwarg("bscl_coe", 18, arg_results)
+        bscl_rshift = get_kwarg("bscl_rshift", 19, arg_results)
         
-        input_zero = get_kwarg("izr", 17, arg_results)
-        output_zero = get_kwarg("ozr", 18, arg_results)
-        bias = get_kwarg("bias", 19, arg_results)
+        input_zero = get_kwarg("izr", 20, arg_results)
+        output_zero = get_kwarg("ozr", 21, arg_results)
+        bias = get_kwarg("bias", 22, arg_results)
         
         allo_d.QLinearOp(output_buffer, input_val, weight_val,
                          fscl_sign, fscl_coe, fscl_rshift,
                          iscl_sign, iscl_coe, iscl_rshift,
                          oscl_sign, oscl_coe, oscl_rshift,
+                         oscl_inv_sign, oscl_inv_coe, oscl_inv_rshift,
                          wscl_sign, wscl_coe, wscl_rshift,
                          bscl_sign=bscl_sign, bscl_coe=bscl_coe, bscl_rshift=bscl_rshift,
                          input_zero=input_zero, output_zero=output_zero, bias=bias, ip=ip)
@@ -199,15 +207,17 @@ def build_quant_placeholder(ctx, node, attr, new_args, output_buffer, transforme
         x_scl_sign, x_scl_coe, x_scl_rshift = arg_results[2], arg_results[3], arg_results[4]
         y_scl_sign, y_scl_coe, y_scl_rshift = arg_results[5], arg_results[6], arg_results[7]
         o_scl_sign, o_scl_coe, o_scl_rshift = arg_results[8], arg_results[9], arg_results[10]
+        o_scl_inv_sign, o_scl_inv_coe, o_scl_inv_rshift = arg_results[11], arg_results[12], arg_results[13]
         
-        x_zero = get_kwarg("x_zero", 11, arg_results)
-        y_zero = get_kwarg("y_zero", 12, arg_results)
-        o_zero = get_kwarg("o_zero", 13, arg_results)
+        x_zero = get_kwarg("x_zero", 14, arg_results)
+        y_zero = get_kwarg("y_zero", 15, arg_results)
+        o_zero = get_kwarg("o_zero", 16, arg_results)
         
         allo_d.QAddOp(output_buffer, lhs, rhs, 
                       x_scl_sign, x_scl_coe, x_scl_rshift, 
                       y_scl_sign, y_scl_coe, y_scl_rshift, 
                       o_scl_sign, o_scl_coe, o_scl_rshift,
+                      o_scl_inv_sign, o_scl_inv_coe, o_scl_inv_rshift,
                       x_zero=x_zero, y_zero=y_zero, o_zero=o_zero, ip=ip)
         return output_buffer
     
@@ -222,15 +232,17 @@ def build_quant_placeholder(ctx, node, attr, new_args, output_buffer, transforme
         gelu_scl_sign, gelu_scl_coe, gelu_scl_rshift = arg_results[4], arg_results[5], arg_results[6]
         fused_scl_sign, fused_scl_coe, fused_scl_rshift = arg_results[7], arg_results[8], arg_results[9]
         out_scl_sign, out_scl_coe, out_scl_rshift = arg_results[10], arg_results[11], arg_results[12]
+        out_scl_inv_sign, out_scl_inv_coe, out_scl_inv_rshift = arg_results[13], arg_results[14], arg_results[15]
         
-        input_zero = get_kwarg("input_zero", 13, arg_results)
-        output_zero = get_kwarg("output_zero", 14, arg_results)
+        input_zero = get_kwarg("input_zero", 16, arg_results)
+        output_zero = get_kwarg("output_zero", 17, arg_results)
         
         allo_d.IntGELUOp(output_buffer, input_val, 
                          in_scl_sign, in_scl_coe, in_scl_rshift,
                          gelu_scl_sign, gelu_scl_coe, gelu_scl_rshift,
                          fused_scl_sign, fused_scl_coe, fused_scl_rshift,
                          out_scl_sign, out_scl_coe, out_scl_rshift,
+                         out_scl_inv_sign, out_scl_inv_coe, out_scl_inv_rshift,
                          input_zero=input_zero, output_zero=output_zero, ip=ip)
         return output_buffer
     
@@ -245,18 +257,20 @@ def build_quant_placeholder(ctx, node, attr, new_args, output_buffer, transforme
         soft_scl_sign, soft_scl_coe, soft_scl_rshift = arg_results[4], arg_results[5], arg_results[6]
         # Note: dsl.py has output_scale BEFORE fused_scale
         out_scl_sign, out_scl_coe, out_scl_rshift = arg_results[7], arg_results[8], arg_results[9]
+        out_scl_inv_sign, out_scl_inv_coe, out_scl_inv_rshift = arg_results[10], arg_results[11], arg_results[12]
         
-        fused_scl_sign = get_kwarg("fused_scale_sign", 10, arg_results)
-        fused_scl_coe = get_kwarg("fused_scale_coe", 11, arg_results)
-        fused_scl_rshift = get_kwarg("fused_scale_rshift", 12, arg_results)
+        fused_scl_sign = get_kwarg("fused_scale_sign", 13, arg_results)
+        fused_scl_coe = get_kwarg("fused_scale_coe", 14, arg_results)
+        fused_scl_rshift = get_kwarg("fused_scale_rshift", 15, arg_results)
         
-        input_zero = get_kwarg("input_zero", 13, arg_results)
-        output_zero = get_kwarg("output_zero", 14, arg_results)
+        input_zero = get_kwarg("input_zero", 16, arg_results)
+        output_zero = get_kwarg("output_zero", 17, arg_results)
         
         allo_d.IntSoftmaxOp(output_buffer, input_val, 
                             in_scl_sign, in_scl_coe, in_scl_rshift,
                             soft_scl_sign, soft_scl_coe, soft_scl_rshift,
                             out_scl_sign, out_scl_coe, out_scl_rshift,
+                            out_scl_inv_sign, out_scl_inv_coe, out_scl_inv_rshift,
                             fused_scale_sign=fused_scl_sign, fused_scale_coe=fused_scl_coe, fused_scale_rshift=fused_scl_rshift,
                             input_zero=input_zero, output_zero=output_zero, ip=ip)
         return output_buffer
@@ -273,9 +287,10 @@ def build_quant_placeholder(ctx, node, attr, new_args, output_buffer, transforme
         bias_scl_sign, bias_scl_coe, bias_scl_rshift = arg_results[8], arg_results[9], arg_results[10]
         fused_scl_sign, fused_scl_coe, fused_scl_rshift = arg_results[11], arg_results[12], arg_results[13]
         out_scl_sign, out_scl_coe, out_scl_rshift = arg_results[14], arg_results[15], arg_results[16]
+        out_scl_inv_sign, out_scl_inv_coe, out_scl_inv_rshift = arg_results[17], arg_results[18], arg_results[19]
         
-        input_zero = get_kwarg("input_zero", 17, arg_results)
-        output_zero = get_kwarg("output_zero", 18, arg_results)
+        input_zero = get_kwarg("input_zero", 20, arg_results)
+        output_zero = get_kwarg("output_zero", 21, arg_results)
         
         allo_d.IntLayerNormOp(output_buffer, input_val, bias_int,
                               in_scl_sign, in_scl_coe, in_scl_rshift,
@@ -283,7 +298,61 @@ def build_quant_placeholder(ctx, node, attr, new_args, output_buffer, transforme
                               bias_scl_sign, bias_scl_coe, bias_scl_rshift,
                               fused_scl_sign, fused_scl_coe, fused_scl_rshift,
                               out_scl_sign, out_scl_coe, out_scl_rshift,
+                              out_scl_inv_sign, out_scl_inv_coe, out_scl_inv_rshift,
                               input_zero=input_zero, output_zero=output_zero, ip=ip)
+        return output_buffer
+    
+    elif attr == "quant":
+        # DSL call: quant(x, quant_mode, scale_sign, scale_coe, scale_rshift, zero=?)
+        # Python binding: QuantOp(output, input, scale_sign, scale_coe, scale_rshift, zero=?, quant_mode=N)
+        # x: float input, output: int
+        if len(arg_results) < 5:
+            raise ValueError(f"quant requires at least 5 operands (x, quant_mode, scale_sign, scale_coe, scale_rshift), got {len(arg_results)}")
+        
+        input_val = arg_results[0]
+        # quant_mode is passed as second positional arg (index 1)
+        # Extract it as integer value for attribute
+        quant_mode_arg = new_args[1]  # Use new_args to get the original MockConstant
+        if isinstance(quant_mode_arg, MockConstant):
+            quant_mode = int(quant_mode_arg.val)
+        else:
+            quant_mode = 0  # Default: symmetric, per-tensor
+        
+        scl_sign, scl_coe, scl_rshift = arg_results[2], arg_results[3], arg_results[4]
+        zero = get_kwarg("zero", 5, arg_results)
+        
+        from .._mlir.ir import IntegerAttr, IntegerType
+        quant_mode_attr = IntegerAttr.get(IntegerType.get_signless(8), quant_mode)
+        
+        allo_d.QuantOp(output_buffer, input_val,
+                       scl_sign, scl_coe, scl_rshift,
+                       zero=zero, quant_mode=quant_mode_attr, ip=ip)
+        return output_buffer
+    
+    elif attr == "dequant":
+        # DSL call: dequant(x, quant_mode, scale_sign, scale_coe, scale_rshift, zero=?)
+        # Python binding: DequantOp(output, input, scale_sign, scale_coe, scale_rshift, zero=?, quant_mode=N)
+        # x: int input, output: float
+        if len(arg_results) < 5:
+            raise ValueError(f"dequant requires at least 5 operands (x, quant_mode, scale_sign, scale_coe, scale_rshift), got {len(arg_results)}")
+        
+        input_val = arg_results[0]
+        # quant_mode is passed as second positional arg (index 1)
+        quant_mode_arg = new_args[1]  # Use new_args to get the original MockConstant
+        if isinstance(quant_mode_arg, MockConstant):
+            quant_mode = int(quant_mode_arg.val)
+        else:
+            quant_mode = 0  # Default: symmetric, per-tensor
+        
+        scl_sign, scl_coe, scl_rshift = arg_results[2], arg_results[3], arg_results[4]
+        zero = get_kwarg("zero", 5, arg_results)
+        
+        from .._mlir.ir import IntegerAttr, IntegerType
+        quant_mode_attr = IntegerAttr.get(IntegerType.get_signless(8), quant_mode)
+        
+        allo_d.DequantOp(output_buffer, input_val,
+                         scl_sign, scl_coe, scl_rshift,
+                         zero=zero, quant_mode=quant_mode_attr, ip=ip)
         return output_buffer
     
     else:

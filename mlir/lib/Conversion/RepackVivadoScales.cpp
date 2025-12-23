@@ -367,12 +367,12 @@ struct RepackQMatMulPattern : public RepackVivadoOpPattern<vivado_ops::QMatMulOp
                                  PatternRewriter &rewriter) const override {
     auto convertedScales = convertScaleOperands(
         rewriter, op.getLoc(),
-        {op.getXScale(), op.getYScale(), op.getOScale()});
+        {op.getXScale(), op.getYScale(), op.getOScale(), op.getOScaleInv()});
     
     rewriter.replaceOpWithNewOp<vivado_ops::QMatMulOp>(
         op,
         op.getOutput(), op.getLhs(), op.getRhs(),
-        convertedScales[0], convertedScales[1], convertedScales[2],
+        convertedScales[0], convertedScales[1], convertedScales[2], convertedScales[3],
         op.getXZero(), op.getYZero(), op.getOZero(),
         op.getTileMAttr(), op.getTileNAttr(), op.getTileKAttr(),
         op.getBufferStrategyAttr(), op.getBufferIdsAttr(),
@@ -393,7 +393,7 @@ struct RepackQLinearPattern : public RepackVivadoOpPattern<vivado_ops::QLinearOp
   
   LogicalResult matchAndRewrite(vivado_ops::QLinearOp op,
                                  PatternRewriter &rewriter) const override {
-    SmallVector<Value> scales = {op.getFscl(), op.getIscl(), op.getOscl(), op.getWscl()};
+    SmallVector<Value> scales = {op.getFscl(), op.getIscl(), op.getOscl(), op.getOsclInv(), op.getWscl()};
     if (op.getBscl()) scales.push_back(op.getBscl());
     
     auto convertedScales = convertScaleOperands(rewriter, op.getLoc(), scales);
@@ -401,8 +401,8 @@ struct RepackQLinearPattern : public RepackVivadoOpPattern<vivado_ops::QLinearOp
     rewriter.replaceOpWithNewOp<vivado_ops::QLinearOp>(
         op,
         op.getOutput(), op.getInput(), op.getWeight(),
-        convertedScales[0], convertedScales[1], convertedScales[2], convertedScales[3],
-        convertedScales.size() > 4 ? convertedScales[4] : Value(),
+        convertedScales[0], convertedScales[1], convertedScales[2], convertedScales[3], convertedScales[4],
+        convertedScales.size() > 5 ? convertedScales[5] : Value(),
         op.getInputZero(), op.getOutputZero(), op.getBias(),
         op.getTileMAttr(), op.getTileNAttr(), op.getTileKAttr(),
         op.getBufferStrategyAttr(), op.getBufferIdsAttr(),
@@ -425,12 +425,12 @@ struct RepackQAddPattern : public RepackVivadoOpPattern<vivado_ops::QAddOp> {
                                  PatternRewriter &rewriter) const override {
     auto convertedScales = convertScaleOperands(
         rewriter, op.getLoc(),
-        {op.getXScale(), op.getYScale(), op.getOScale()});
+        {op.getXScale(), op.getYScale(), op.getOScale(), op.getOScaleInv()});
     
     rewriter.replaceOpWithNewOp<vivado_ops::QAddOp>(
         op,
         op.getOutput(), op.getLhs(), op.getRhs(),
-        convertedScales[0], convertedScales[1], convertedScales[2],
+        convertedScales[0], convertedScales[1], convertedScales[2], convertedScales[3],
         op.getXZero(), op.getYZero(), op.getOZero(),
         op.getFuseIntoProducerAttr(), op.getVectorizeAttr(),
         rewriter.getStringAttr(kTargetPackingAttr),
@@ -449,12 +449,12 @@ struct RepackIntGELUPattern : public RepackVivadoOpPattern<vivado_ops::IntGELUOp
                                  PatternRewriter &rewriter) const override {
     auto convertedScales = convertScaleOperands(
         rewriter, op.getLoc(),
-        {op.getIscl(), op.getGscl(), op.getFscl(), op.getOscl()});
+        {op.getIscl(), op.getGscl(), op.getFscl(), op.getOscl(), op.getOsclInv()});
     
     rewriter.replaceOpWithNewOp<vivado_ops::IntGELUOp>(
         op,
         op.getOutput(), op.getInput(),
-        convertedScales[0], convertedScales[1], convertedScales[2], convertedScales[3],
+        convertedScales[0], convertedScales[1], convertedScales[2], convertedScales[3], convertedScales[4],
         op.getInputZero(), op.getOutputZero(),
         op.getImplementationAttr(),
         rewriter.getStringAttr(kTargetPackingAttr),
@@ -473,12 +473,12 @@ struct RepackIntSoftmaxPattern : public RepackVivadoOpPattern<vivado_ops::IntSof
                                  PatternRewriter &rewriter) const override {
     auto convertedScales = convertScaleOperands(
         rewriter, op.getLoc(),
-        {op.getIscl(), op.getSscl(), op.getOscl(), op.getFscl()});
+        {op.getIscl(), op.getSscl(), op.getOscl(), op.getOsclInv(), op.getFscl()});
     
     rewriter.replaceOpWithNewOp<vivado_ops::IntSoftmaxOp>(
         op,
         op.getOutput(), op.getInput(),
-        convertedScales[0], convertedScales[1], convertedScales[2], convertedScales[3],
+        convertedScales[0], convertedScales[1], convertedScales[2], convertedScales[3], convertedScales[4],
         op.getInputZero(), op.getOutputZero(),
         op.getAxisAttr(), op.getImplementationAttr(),
         rewriter.getStringAttr(kTargetPackingAttr),
@@ -498,13 +498,13 @@ struct RepackIntLayerNormPattern : public RepackVivadoOpPattern<vivado_ops::IntL
     auto convertedScales = convertScaleOperands(
         rewriter, op.getLoc(),
         {op.getIscl(), op.getLscl(), op.getBscl(), 
-         op.getFscl(), op.getOscl()});
+         op.getFscl(), op.getOscl(), op.getOsclInv()});
     
     rewriter.replaceOpWithNewOp<vivado_ops::IntLayerNormOp>(
         op,
         op.getOutput(), op.getInput(), op.getBiasInt(),
         convertedScales[0], convertedScales[1], convertedScales[2], 
-        convertedScales[3], convertedScales[4],
+        convertedScales[3], convertedScales[4], convertedScales[5],
         op.getInputZero(), op.getOutputZero(),
         op.getEpsAttr(), op.getRsqrtMethodAttr(),
         rewriter.getStringAttr(kTargetPackingAttr),
@@ -523,13 +523,13 @@ struct RepackQConv2dPattern : public RepackVivadoOpPattern<vivado_ops::QConv2dOp
                                  PatternRewriter &rewriter) const override {
     auto convertedScales = convertScaleOperands(
         rewriter, op.getLoc(),
-        {op.getFscl(), op.getIscl(), op.getOscl(), op.getWscl(), op.getBscl()});
+        {op.getFscl(), op.getIscl(), op.getOscl(), op.getOsclInv(), op.getWscl(), op.getBscl()});
     
     rewriter.replaceOpWithNewOp<vivado_ops::QConv2dOp>(
         op,
         op.getOutput(), op.getInput(), op.getFilter(),
         convertedScales[0], convertedScales[1], convertedScales[2], 
-        convertedScales[3], convertedScales[4],
+        convertedScales[3], convertedScales[4], convertedScales[5],
         op.getInputZero(), op.getOutputZero(), op.getBias(),
         op.getStrideAttr(),
         op.getTileHAttr(), op.getTileWAttr(), op.getTileCAttr(),
@@ -552,18 +552,66 @@ struct RepackQMatMulIsqrtDPattern : public RepackVivadoOpPattern<vivado_ops::QMa
                                  PatternRewriter &rewriter) const override {
     auto convertedScales = convertScaleOperands(
         rewriter, op.getLoc(),
-        {op.getXScale(), op.getYScale(), op.getOScale()});
+        {op.getXScale(), op.getYScale(), op.getOScale(), op.getOScaleInv()});
     
     rewriter.replaceOpWithNewOp<vivado_ops::QMatMulIsqrtDOp>(
         op,
         op.getOutput(), op.getLhs(), op.getRhs(),
-        convertedScales[0], convertedScales[1], convertedScales[2],
+        convertedScales[0], convertedScales[1], convertedScales[2], convertedScales[3],
         op.getXZero(), op.getYZero(), op.getOZero(),
         op.getTileMAttr(), op.getTileNAttr(), op.getTileKAttr(),
         op.getBufferStrategyAttr(), op.getBufferIdsAttr(),
         op.getEnableBiasAttr(), op.getTransposeWeightAttr(),
         op.getHlsPragmasAttr(), op.getAccumulatorTypeAttr(),
         op.getRequantModeAttr(),
+        rewriter.getStringAttr(kTargetPackingAttr),
+        rewriter.getStringAttr(kTargetCoeModeAttr)
+    );
+    
+    return success();
+  }
+};
+
+// Pattern for vivado.quant
+// Note: Although global scales are repacked in-place during the first pass,
+// we still need this pattern to update the scale_packing and scale_coe_mode attributes.
+struct RepackQuantPattern : public RepackVivadoOpPattern<vivado_ops::QuantOp> {
+  using RepackVivadoOpPattern::RepackVivadoOpPattern;
+  
+  LogicalResult matchAndRewrite(vivado_ops::QuantOp op,
+                                 PatternRewriter &rewriter) const override {
+    auto convertedScales = convertScaleOperands(
+        rewriter, op.getLoc(), {op.getScale()});
+    
+    rewriter.replaceOpWithNewOp<vivado_ops::QuantOp>(
+        op,
+        op.getOutput(), op.getInput(),
+        convertedScales[0], op.getZero(),
+        op.getQuantModeAttr(),
+        rewriter.getStringAttr(kTargetPackingAttr),
+        rewriter.getStringAttr(kTargetCoeModeAttr)
+    );
+    
+    return success();
+  }
+};
+
+// Pattern for vivado.dequant
+// Note: Although global scales are repacked in-place during the first pass,
+// we still need this pattern to update the scale_packing and scale_coe_mode attributes.
+struct RepackDequantPattern : public RepackVivadoOpPattern<vivado_ops::DequantOp> {
+  using RepackVivadoOpPattern::RepackVivadoOpPattern;
+  
+  LogicalResult matchAndRewrite(vivado_ops::DequantOp op,
+                                 PatternRewriter &rewriter) const override {
+    auto convertedScales = convertScaleOperands(
+        rewriter, op.getLoc(), {op.getScale()});
+    
+    rewriter.replaceOpWithNewOp<vivado_ops::DequantOp>(
+        op,
+        op.getOutput(), op.getInput(),
+        convertedScales[0], op.getZero(),
+        op.getQuantModeAttr(),
         rewriter.getStringAttr(kTargetPackingAttr),
         rewriter.getStringAttr(kTargetCoeModeAttr)
     );
@@ -617,6 +665,8 @@ struct RepackVivadoScalesPass
     patterns.add<RepackIntLayerNormPattern>(context);
     patterns.add<RepackQConv2dPattern>(context);
     patterns.add<RepackQMatMulIsqrtDPattern>(context);
+    patterns.add<RepackQuantPattern>(context);
+    patterns.add<RepackDequantPattern>(context);
     
     if (failed(applyPatternsAndFoldGreedily(module, std::move(patterns)))) {
       signalPassFailure();
