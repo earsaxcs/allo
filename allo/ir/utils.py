@@ -191,6 +191,8 @@ class MockConstant(MockOp):
         elif isinstance(self.val, int):
             dtype = IntegerType.get_signless(32)
             value_attr = IntegerAttr.get(dtype, self.val)
+        elif isinstance(self.val, str):
+            return self.val
         else:
             dtype = F32Type.get()
             value_attr = FloatAttr.get(dtype, self.val)

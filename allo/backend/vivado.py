@@ -252,7 +252,8 @@ class VivadoModule:
                 with open(os.path.join(self.debug_output_dir, "0_initial.mlir"), "w") as f:
                     f.write(str(self.module))
 
-            _mlir_lower_pipeline(self.module, lower_linalg=True)
+            # _mlir_lower_pipeline(self.module, lower_linalg=True)
+            
             # Run through lowering passes
             # pm = PassManager.parse(
             #     "builtin.module("
@@ -269,8 +270,15 @@ class VivadoModule:
             pm = PassManager.parse(
                 "builtin.module("
                     "empty-tensor-to-alloc-tensor,"
-                    "lower-allo-quant-to-vivado"
-                    # "repack-vivado-scales"
+                    "lower-allo-quant-to-vivado,"
+                    "repack-vivado-scales,"
+                    "toggle-vivado-transpose,"
+                    "vivado-padding,"
+                    "vivado-separate-bias,"
+                    "vivado-qlinear-k-split,"
+                    "insert-scale-conversion-after-layernorm,"
+                    "symbol-dce,"
+                    "canonicalize"
                 ")"
             )
 

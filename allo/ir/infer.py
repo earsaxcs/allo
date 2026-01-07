@@ -979,6 +979,11 @@ class TypeInferer(ASTVisitor):
                     assert argBshape[0] == new_args[2].shape[0]
                 node.shape = argAshape[:-1] + argBshape[:-1]
             return node
+        if op_name in {"vit_get_first_token"}:
+            argAshape = new_args[0].shape
+            node.shape = (argAshape[0], 1) + argAshape[2:]
+            node.dtype = new_args[0].dtype
+            return node
         if op_name in {"transpose"}:
             assert (
                 len(new_args) <= 2

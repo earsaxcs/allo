@@ -69,44 +69,62 @@ def build_quant_placeholder(ctx, node, attr, new_args, output_buffer, transforme
     # Dispatch to the appropriate quantized operation
     # Note: Python bindings use destination-passing style - output buffer as first operand
     if attr == "qmatmul":
-        # DSL call: qmatmul(x, y, x_scale_sign, x_scale_coe, x_scale_rshift, y_scale..., o_scale..., x_zero?, y_zero?, o_zero?)
-        # Python binding: QMatMulOp(output, lhs, rhs, x_scale_sign, x_scale_coe, x_scale_rshift, y_scale..., o_scale..., x_zero=?, y_zero=?, o_zero=?)
-        if len(arg_results) < 11:
-            raise ValueError(f"qmatmul requires at least 11 operands (x, y, 3 scales x 3 components), got {len(arg_results)}")
+        # DSL call:
+        # qmatmul(x, y,
+        #        x_scale(sign,coe,rshift), y_scale(sign,coe,rshift),
+        #        fused_scale(sign,coe,rshift),
+        #        o_scale(sign,coe,rshift), o_scale_inv(sign,coe,rshift),
+        #        x_zero?, y_zero?, o_zero?)
+        # Python binding: QMatMulOp(output, lhs, rhs, x_scale..., y_scale..., fused_scale..., o_scale..., o_scale_inv..., x_zero=?, y_zero=?, o_zero=?)
+        if len(arg_results) < 17:
+            raise ValueError(
+                f"qmatmul requires at least 17 operands (x, y, 5 scales x 3 components), got {len(arg_results)}"
+            )
         lhs, rhs = arg_results[0], arg_results[1]
         # scales: each has (sign, coe, rshift) = 3 values
         x_scl_sign, x_scl_coe, x_scl_rshift = arg_results[2], arg_results[3], arg_results[4]
         y_scl_sign, y_scl_coe, y_scl_rshift = arg_results[5], arg_results[6], arg_results[7]
-        o_scl_sign, o_scl_coe, o_scl_rshift = arg_results[8], arg_results[9], arg_results[10]
-        o_scl_inv_sign, o_scl_inv_coe, o_scl_inv_rshift = arg_results[11], arg_results[12], arg_results[13]
+        fused_scl_sign, fused_scl_coe, fused_scl_rshift = arg_results[8], arg_results[9], arg_results[10]
+        o_scl_sign, o_scl_coe, o_scl_rshift = arg_results[11], arg_results[12], arg_results[13]
+        o_scl_inv_sign, o_scl_inv_coe, o_scl_inv_rshift = arg_results[14], arg_results[15], arg_results[16]
         
-        x_zero = get_kwarg("x_zero", 14, arg_results)
-        y_zero = get_kwarg("y_zero", 15, arg_results)
-        o_zero = get_kwarg("o_zero", 16, arg_results)
+        x_zero = get_kwarg("x_zero", 17, arg_results)
+        y_zero = get_kwarg("y_zero", 18, arg_results)
+        o_zero = get_kwarg("o_zero", 19, arg_results)
         
         allo_d.QMatMulOp(output_buffer, lhs, rhs, x_scl_sign, x_scl_coe, x_scl_rshift, 
-                         y_scl_sign, y_scl_coe, y_scl_rshift, o_scl_sign, o_scl_coe, o_scl_rshift,
+                         y_scl_sign, y_scl_coe, y_scl_rshift,
+                         fused_scl_sign, fused_scl_coe, fused_scl_rshift,
+                         o_scl_sign, o_scl_coe, o_scl_rshift,
                          o_scl_inv_sign, o_scl_inv_coe, o_scl_inv_rshift,
                          x_zero=x_zero, y_zero=y_zero, o_zero=o_zero, ip=ip)
         return output_buffer
     
     elif attr == "qmatmul_isqrtd":
-        # DSL: qmatmul_isqrtd(x, y, x_scale..., y_scale..., o_scale..., isqrtd_scale..., x_zero?, y_zero?, o_zero?)
-        # Binding: QMatMulIsqrtDOp(output, lhs, rhs, x_scale..., y_scale..., o_scale..., x_zero=?, y_zero=?, o_zero=?)
-        if len(arg_results) < 11:
-            raise ValueError(f"qmatmul_isqrtd requires at least 11 operands, got {len(arg_results)}")
+        # DSL:
+        # qmatmul_isqrtd(x, y,
+        #              x_scale(sign,coe,rshift), y_scale(sign,coe,rshift),
+        #              fused_scale(sign,coe,rshift),
+        #              o_scale(sign,coe,rshift), o_scale_inv(sign,coe,rshift),
+        #              x_zero?, y_zero?, o_zero?)
+        # Binding: QMatMulIsqrtDOp(output, lhs, rhs, x_scale..., y_scale..., fused_scale..., o_scale..., o_scale_inv..., x_zero=?, y_zero=?, o_zero=?)
+        if len(arg_results) < 17:
+            raise ValueError(f"qmatmul_isqrtd requires at least 17 operands, got {len(arg_results)}")
         lhs, rhs = arg_results[0], arg_results[1]
         x_scl_sign, x_scl_coe, x_scl_rshift = arg_results[2], arg_results[3], arg_results[4]
         y_scl_sign, y_scl_coe, y_scl_rshift = arg_results[5], arg_results[6], arg_results[7]
-        o_scl_sign, o_scl_coe, o_scl_rshift = arg_results[8], arg_results[9], arg_results[10]
-        o_scl_inv_sign, o_scl_inv_coe, o_scl_inv_rshift = arg_results[11], arg_results[12], arg_results[13]
+        fused_scl_sign, fused_scl_coe, fused_scl_rshift = arg_results[8], arg_results[9], arg_results[10]
+        o_scl_sign, o_scl_coe, o_scl_rshift = arg_results[11], arg_results[12], arg_results[13]
+        o_scl_inv_sign, o_scl_inv_coe, o_scl_inv_rshift = arg_results[14], arg_results[15], arg_results[16]
         
-        x_zero = get_kwarg("x_zero", 14, arg_results)
-        y_zero = get_kwarg("y_zero", 15, arg_results)
-        o_zero = get_kwarg("o_zero", 16, arg_results)
+        x_zero = get_kwarg("x_zero", 17, arg_results)
+        y_zero = get_kwarg("y_zero", 18, arg_results)
+        o_zero = get_kwarg("o_zero", 19, arg_results)
         
         allo_d.QMatMulIsqrtDOp(output_buffer, lhs, rhs, x_scl_sign, x_scl_coe, x_scl_rshift, 
-                               y_scl_sign, y_scl_coe, y_scl_rshift, o_scl_sign, o_scl_coe, o_scl_rshift,
+                               y_scl_sign, y_scl_coe, y_scl_rshift,
+                               fused_scl_sign, fused_scl_coe, fused_scl_rshift,
+                               o_scl_sign, o_scl_coe, o_scl_rshift,
                                o_scl_inv_sign, o_scl_inv_coe, o_scl_inv_rshift,
                                x_zero=x_zero, y_zero=y_zero, o_zero=o_zero, ip=ip)
         return output_buffer
@@ -167,8 +185,8 @@ def build_quant_placeholder(ctx, node, attr, new_args, output_buffer, transforme
         return output_buffer
     
     elif attr == "qlinear":
-        # DSL call: qlinear(input, weight, fused_scl_sign, fused_scl_coe, fused_scl_rshift, input_scl..., output_scl..., weight_scl..., bias_scl..., bias=?)
-        # Python binding: QLinearOp(output, input, weight, fscl..., iscl..., oscl..., wscl..., bscl..., input_zero=?, output_zero=?, bias=?)
+        # DSL call: qlinear(input, weight, fused_scl_sign, fused_scl_coe, fused_scl_rshift, input_scl..., output_scl..., weight_scl..., bias_scl..., bias=?, layer_type=?)
+        # Python binding: QLinearOp(output, input, weight, fscl..., iscl..., oscl..., wscl..., bscl..., input_zero=?, output_zero=?, bias=?, layer_type=?)
         if len(arg_results) < 14:
             raise ValueError(f"qlinear requires at least 14 operands (input, weight, 4 scales x 3 components), got {len(arg_results)}")
         
@@ -187,6 +205,13 @@ def build_quant_placeholder(ctx, node, attr, new_args, output_buffer, transforme
         output_zero = get_kwarg("ozr", 21, arg_results)
         bias = get_kwarg("bias", 22, arg_results)
         
+        # Extract layer_type from keyword arguments or use default "unknown"
+        layer_type = get_kwarg("layer_type", 23, arg_results)
+        
+        # Build the QLinearOp with layer_type attribute
+        from .._mlir.ir import StringAttr
+        layer_type_attr = StringAttr.get(layer_type if layer_type else "unknown")
+        
         allo_d.QLinearOp(output_buffer, input_val, weight_val,
                          fscl_sign, fscl_coe, fscl_rshift,
                          iscl_sign, iscl_coe, iscl_rshift,
@@ -194,7 +219,8 @@ def build_quant_placeholder(ctx, node, attr, new_args, output_buffer, transforme
                          oscl_inv_sign, oscl_inv_coe, oscl_inv_rshift,
                          wscl_sign, wscl_coe, wscl_rshift,
                          bscl_sign=bscl_sign, bscl_coe=bscl_coe, bscl_rshift=bscl_rshift,
-                         input_zero=input_zero, output_zero=output_zero, bias=bias, ip=ip)
+                         input_zero=input_zero, output_zero=output_zero, bias=bias,
+                         layer_type=layer_type_attr, ip=ip)
         return output_buffer
     
     elif attr == "qadd":

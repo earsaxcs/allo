@@ -7,6 +7,7 @@
 #define ALLO_PYNQ_CONFIG_H
 
 #include <cstdint>
+#include <string>
 
 namespace mlir {
 namespace allo {
@@ -80,9 +81,15 @@ struct InstrConfig {
   
   /// Tile count field width (3 bits, represents 1-8 tiles)
   static constexpr unsigned kTileCountWidth = 3;
-  
+
+  /// Tile Size (32 Bytes)
+  static constexpr int32_t kTileSize = 32;
+
   /// Package count field width (12 bits, 0-4095)
   static constexpr unsigned kPackageCountWidth = 12;
+
+  /// Package size (32 Bytes)
+  static constexpr int32_t kPackageSize = 32;
   
   /// Reduce K field width (8 bits, 0-255)
   static constexpr unsigned kReduceKWidth = 8;
@@ -120,6 +127,101 @@ struct VectorOpCode {
   
   /// Layer normalization
   static constexpr unsigned kLayerNorm = 3;
+};
+
+/// Scale mode enumeration for quantization
+struct ScaleMode {
+  /// Per-tensor quantization: single scale for entire tensor
+  static constexpr unsigned kPerTensor = 0;
+  
+  /// Per-channel quantization: separate scale per channel (output dimension)
+  static constexpr unsigned kPerChannel = 1;
+  
+  /// Per-token quantization: separate scale per token (sequence dimension)
+  static constexpr unsigned kPerToken = 2;
+};
+
+/// QLinear layer type identification
+struct QLinearLayerType {
+  /// Query projection in multi-head attention
+  static constexpr const char* kQKVGemmProjQ = "qkvgemm.proj_q";
+  
+  /// Key projection in multi-head attention
+  static constexpr const char* kQKVGemmProjK = "qkvgemm.proj_k";
+  
+  /// Value projection in multi-head attention
+  static constexpr const char* kQKVGemmProjV = "qkvgemm.proj_v";
+  
+  /// Attention output projection
+  static constexpr const char* kAttnGemmProj = "attngemm.proj";
+  
+  /// First FC layer in feed-forward network
+  static constexpr const char* kFFNFC1 = "ffn.fc1";
+  
+  /// Second FC layer in feed-forward network
+  static constexpr const char* kFFNFC2 = "ffn.fc2";
+  
+  /// Classification head dense layer
+  static constexpr const char* kClassifierDense = "classifier.dense";
+  
+  /// Unknown or unspecified layer type
+  static constexpr const char* kUnknown = "unknown";
+  
+  /// Check if layer type is Query projection
+  static bool isQKVGemmProjQ(llvm::StringRef layerType) {
+    return layerType == kQKVGemmProjQ;
+  }
+  
+  /// Check if layer type is Key projection
+  static bool isQKVGemmProjK(llvm::StringRef layerType) {
+    return layerType == kQKVGemmProjK;
+  }
+  
+  /// Check if layer type is Value projection
+  static bool isQKVGemmProjV(llvm::StringRef layerType) {
+    return layerType == kQKVGemmProjV;
+  }
+  
+  /// Check if layer type is any Q/K/V projection
+  static bool isQKVGemmProj(llvm::StringRef layerType) {
+    return isQKVGemmProjQ(layerType) || isQKVGemmProjK(layerType) || 
+           isQKVGemmProjV(layerType);
+  }
+  
+  /// Check if layer type is Attention output projection
+  static bool isAttnGemmProj(llvm::StringRef layerType) {
+    return layerType == kAttnGemmProj;
+  }
+  
+  /// Check if layer type is FFN first FC layer
+  static bool isFFNFC1(llvm::StringRef layerType) {
+    return layerType == kFFNFC1;
+  }
+  
+  /// Check if layer type is FFN second FC layer
+  static bool isFFNFC2(llvm::StringRef layerType) {
+    return layerType == kFFNFC2;
+  }
+  
+  /// Check if layer type is any FFN layer
+  static bool isFFNLayer(llvm::StringRef layerType) {
+    return isFFNFC1(layerType) || isFFNFC2(layerType);
+  }
+  
+  /// Check if layer type is Classifier dense layer
+  static bool isClassifierDense(llvm::StringRef layerType) {
+    return layerType == kClassifierDense;
+  }
+  
+  /// Check if layer type is Unknown
+  static bool isUnknown(llvm::StringRef layerType) {
+    return layerType == kUnknown;
+  }
+  
+  /// Check if layer type is in multi-head attention block (Q/K/V or attention proj)
+  static bool isAttentionLayer(llvm::StringRef layerType) {
+    return isQKVGemmProj(layerType) || isAttnGemmProj(layerType);
+  }
 };
 
 //===----------------------------------------------------------------------===//

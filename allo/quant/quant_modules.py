@@ -51,7 +51,7 @@ class QLinear(QuantizableModule):
                  out_features, 
                  bias: bool = True, 
                  weight_bit: int = 8,
-                 bias_bit: int = 32,
+                 bias_bit: int = 8, # 32,
                  act_bit: int = 8,
                  act_quant_mode: str = "sym",
                  act_per_token: bool = False,
@@ -147,14 +147,23 @@ class QLinear(QuantizableModule):
 
         # no bias_zero
         # NOTICE: since perchannel and pertoken would not be used at the same time, here is secure
-        b_scale = x_scale * w_scale
+        # TODO: bias per_token need duplicate and vary in token dimension???
+        
+        # b_scale = x_scale * w_scale
+        b_scale, _ = max_min_quantize_params(
+            input_tensor=self.bias.data,
+            bitwidth=self.bias_bit,
+            quant_mode="sym",
+            per_channel=False, # No per-channel
+            is_weight=False,
+        )
 
         # insert quant params
         self.input_scale.data = x_scale
         self.output_scale.data = y_scale
         self.weight_scale.data = w_scale
         self.bias_scale.data = b_scale
-        self.fused_scale.data = b_scale / y_scale
+        self.fused_scale.data = x_scale * w_scale / y_scale
         self.weight_int.data = symmetric_linear_quantize(
             bits=self.weight_bit, 
             input=self.weight.data, 
@@ -185,15 +194,21 @@ class QLinear(QuantizableModule):
             # asymmetric
             x_int = x_int - self.input_zero
 
+        xw_scale = self.input_scale * self.weight_scale
         if self.wgt_per_channel:
             fused_scale = self.fused_scale[None, :]
+            xw_scale = xw_scale[None, :]
         elif self.act_per_token:
             fused_scale = self.fused_scale[:, None]
+            xw_scale = xw_scale[:, None]
         else:
             fused_scale = self.fused_scale
 
-        o_int = F.linear(x_int, self.weight_int, self.bias_int)
-        o_int = torch.round(o_int * fused_scale) # automatically broadcast Batchsize and Channel/Token
+        # o_int = F.linear(x_int, self.weight_int, self.bias_int)
+        broadcast_bias = torch.unsqueeze(self.bias_int[None, :] * self.bias_scale / xw_scale, 0).expand(x_int.shape[0], -1, -1).reshape(-1, self.bias_int.shape[-1])
+        o_int = F.linear(x_int, self.weight_int, broadcast_bias)
+        # automatically broadcast Batchsize and Channel/Token
+        o_int = torch.round(o_int * fused_scale)
         
         if self.act_quant_mode == "asym":
             o_int = o_int + self.output_zero
@@ -254,6 +269,8 @@ class QLinear(QuantizableModule):
 
 # ----- QConv2d -----
 
+# NOTE: Currently not used.
+# TODO: bias update same as QLinear
 class QConv2d(QuantizableModule):
     weight_scale: Any
     bias_scale: Any
@@ -927,11 +944,13 @@ class IntLayerNorm(QuantizableModule):
             out_act_bit: int = 8,
             act_quant_mode: str = "sym",
             act_per_channel: bool = False,
+            int_cal_mode: str = "I-ViT",
         ):
         super(IntLayerNorm, self).__init__()
         self.normalized_shape = normalized_shape
         self.eps = eps
         self.elementwise_affine = elementwise_affine
+        self.int_cal_mode = int_cal_mode
         if self.elementwise_affine:
             self.weight = nn.Parameter(torch.empty(self.normalized_shape))
             if bias:
@@ -1026,20 +1045,39 @@ class IntLayerNorm(QuantizableModule):
 
         self.input_scale.data = x_scale
         self.output_scale.data = y_scale
+        # TODO: update bias_scale algorithm to adapt to backend not this forward_int
         if self.bias is not None:
-            self.bias_scale.data = self.dim_sqrt / 2 ** 30
-            self.layernorm_scale.data = self.bias_scale * self.weight
+            if self.int_cal_mode == "I-ViT":
+                self.bias_scale.data = self.dim_sqrt / 2 ** 30
+                self.layernorm_scale.data = self.bias_scale * self.weight
 
-            self.bias_int.data = symmetric_linear_quantize(
-                bits=32,
-                input=self.bias / self.weight,
-                scale=self.bias_scale,
-                is_weight=True,
-            )
+                self.bias_int.data = symmetric_linear_quantize(
+                    bits=32, # NOTE: hardcoded for now
+                    input=self.bias / self.weight,
+                    scale=self.bias_scale,
+                    is_weight=True,
+                )
+            elif self.int_cal_mode == "Vivado-PYNQ":
+                self.bias_scale.data = torch.Tensor([1 / (2 ** 16)]) # NOTE: hardcoded for now, please refer to pynq config
+                self.layernorm_scale.data = self.bias_scale * self.weight
+
+                self.bias_int.data = symmetric_linear_quantize(
+                    bits=32, # NOTE: hardcoded for now
+                    input=self.bias / self.weight,
+                    scale=self.bias_scale,
+                    is_weight=True,
+                )
+            else:
+                raise NotImplementedError("unsupported int_cal_mode: {}".format(self.int_cal_mode))
 
         # self.qact.fused_scale.data = self.layernorm_scale / self.output_scale
-        self.fused_scale.data = self.layernorm_scale / self.output_scale
-        
+        if self.int_cal_mode == "I-ViT":
+            self.fused_scale.data = self.layernorm_scale / self.output_scale
+        elif self.int_cal_mode == "Vivado-PYNQ":
+            self.fused_scale.data = self.weight / self.output_scale
+        else:
+            raise NotImplementedError("unsupported int_cal_mode: {}".format(self.int_cal_mode))
+
         if self.act_quant_mode == "sym":
             pass
         elif self.act_quant_mode == "asym":
@@ -1052,6 +1090,15 @@ class IntLayerNorm(QuantizableModule):
 
     def forward_int(self, x_int):
         # Normalization: computes mean and variance(std)
+        if self.int_cal_mode == "I-ViT":
+            pass
+        elif self.int_cal_mode == "Vivado-PYNQ":
+            return x_int # NOTE: just a placeholder for Vivado-PYNQ to keep the shape while ShapeProp
+            # layernorm doesn't change the shape
+            # TODO: you can realize the truly int fake quant calculation for vivado pynq later here
+        else:
+            raise NotImplementedError("unsupported int_cal_mode: {}".format(self.int_cal_mode))
+
         if self.act_quant_mode == "asym":
             x_int = x_int - self.input_zero
 
@@ -1112,14 +1159,16 @@ class IntLayerNorm(QuantizableModule):
             in_act_bit: int = 8,
             out_act_bit: int = 8,
             act_quant_mode: str = "sym",
-            act_per_channel: bool = False,):
+            act_per_channel: bool = False,
+            int_cal_mode: str = "I-ViT"):
         return cls(normalized_shape=layernorm.normalized_shape, 
             elementwise_affine=layernorm.elementwise_affine,
             bias=layernorm.bias != None,
             in_act_bit=in_act_bit,
             out_act_bit=out_act_bit,
             act_quant_mode=act_quant_mode,
-            act_per_channel=act_per_channel).copy_from(layernorm)
+            act_per_channel=act_per_channel, 
+            int_cal_mode=int_cal_mode,).copy_from(layernorm)
 
 # ----- QAdd -----
 
@@ -1336,7 +1385,7 @@ class QMatMul(QuantizableModule):
         super(QMatMul, self).__init__()
         self.act_bit = act_bit
         self.act_quant_mode = act_quant_mode
-        self.act_per_token = act_per_token
+        self.act_per_token = act_per_token # just affect on x1 or input1 and output
 
         if act_per_token:
             x_quant_param_shape = (1,)
@@ -1398,10 +1447,6 @@ class QMatMul(QuantizableModule):
         self.o_scale.data = y_scale
         # TODO: if per_channel?
         self.fused_scale.data = x1_scale * x2_scale / y_scale
-
-        # for it's children ISqrtD
-        if hasattr(self, "sqrt_dim"):
-            self.fused_scale.data = self.fused_scale / self.sqrt_dim
 
         if self.act_quant_mode == "sym":
             pass
@@ -1465,6 +1510,14 @@ class QMatMulIsqrtD(QMatMul):
 
     def forward_float(self, x_float, y_float):
         return super().forward_float(x_float, y_float) / self.sqrt_dim
+
+    def calibrate(self, x1_float, x2_float):
+        # Keep QMatMul generic: fuse sqrt(dim) only for this variant.
+        y = super().calibrate(x1_float, x2_float)
+        # fused_scale == x_scale * y_scale / o_scale, and for ISqrtD we need an
+        # extra 1/sqrt(dim) so that dequant restores (x@y)/sqrt(dim).
+        self.fused_scale.data = self.fused_scale / self.sqrt_dim
+        return y
     
     def forward_int(self, x_int, y_int):
         # NOTICE: Here we fuse the sqrt_dim into output_scale and cofused_scalee

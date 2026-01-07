@@ -196,7 +196,7 @@ def concat(x, y, axis=0):
 def qlinear(X, W, fscl_sign, fscl_coe, fscl_rshift, iscl_sign, iscl_coe, iscl_rshift, 
             oscl_sign, oscl_coe, oscl_rshift, oscl_inv_sign, oscl_inv_coe, oscl_inv_rshift,
             wscl_sign, wscl_coe, wscl_rshift, 
-            bscl_sign=None, bscl_coe=None, bscl_rshift=None, izr=None, ozr=None, bias=None, name=None):
+            bscl_sign=None, bscl_coe=None, bscl_rshift=None, izr=None, ozr=None, bias=None, layer_type="unknown", name=None):
     if bias is None:
         return matmul(X, W.T)
     return matmul(X, W.T) + bias
@@ -258,6 +258,7 @@ def int_layernorm(x, bias_int,
 def qmatmul(lhs, rhs, 
             x_scale_sign, x_scale_coe, x_scale_rshift,
             y_scale_sign, y_scale_coe, y_scale_rshift,
+        fused_scale_sign, fused_scale_coe, fused_scale_rshift,
             o_scale_sign, o_scale_coe, o_scale_rshift,
             o_scale_inv_sign, o_scale_inv_coe, o_scale_inv_rshift,
             x_zero=None, y_zero=None, o_zero=None, name=None):
@@ -267,6 +268,7 @@ def qmatmul(lhs, rhs,
 def qmatmul_isqrtd(lhs, rhs, 
             x_scale_sign, x_scale_coe, x_scale_rshift,
             y_scale_sign, y_scale_coe, y_scale_rshift,
+        fused_scale_sign, fused_scale_coe, fused_scale_rshift,
             o_scale_sign, o_scale_coe, o_scale_rshift,
             o_scale_inv_sign, o_scale_inv_coe, o_scale_inv_rshift,
             x_zero=None, y_zero=None, o_zero=None, name=None):
@@ -355,6 +357,28 @@ def dequant(x, quant_mode, scale_sign, scale_coe, scale_rshift, zero=None, name=
     Dequantization formula:
         symmetric:  x = q * scale
         asymmetric: x = (q - zero) * scale
+    """
+    # Python simulation (placeholder)
+    pass
+
+
+def vit_get_first_token(x, name=None):
+    """ViT Get First Token: extract first token from [B, L, D] -> [B, 1, D]
+    
+    从输入张量中提取第一个 token（用于 ViT 架构中提取 CLS token）。
+    
+    Args:
+        x: 输入张量，形状 [B, L, D]
+            B: batch size
+            L: sequence length
+            D: embedding dimension
+        name: 操作名称 (可选)
+    
+    Returns:
+        输出张量，形状 [B, 1, D]，包含每个 batch 的第一个 token
+    
+    Example:
+        x: [2, 197, 768] -> output: [2, 1, 768]
     """
     # Python simulation (placeholder)
     pass

@@ -10,6 +10,7 @@
 #include "mlir/Pass/Pass.h"
 
 #include "allo/Dialect/PYNQDialect.h"
+#include "allo/Dialect/VivadoDialect.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 
 namespace mlir {
@@ -25,6 +26,12 @@ std::unique_ptr<OperationPass<ModuleOp>> createDataPlacementPass();
 std::unique_ptr<OperationPass<ModuleOp>> createMergeSubviewAndCopyPass();
 std::unique_ptr<OperationPass<ModuleOp>> createPYNQHoistBufferAllocPass();
 std::unique_ptr<OperationPass<ModuleOp>> createPYNQBufferAllocationPass();
+std::unique_ptr<OperationPass<ModuleOp>> createVivadoQLinearKSplitPass();
+std::unique_ptr<OperationPass<ModuleOp>> createRepackVivadoScalesPass();
+std::unique_ptr<OperationPass<ModuleOp>> createToggleVivadoTransposePass();
+std::unique_ptr<OperationPass<ModuleOp>> createVivadoPaddingPass();
+std::unique_ptr<OperationPass<ModuleOp>> createVivadoSeparateBiasPass();
+std::unique_ptr<OperationPass<ModuleOp>> createInsertScaleConversionAfterLayerNormPass();
 
 bool applyLoopTransformation(ModuleOp &f);
 bool applyAnyWidthInteger(ModuleOp &module);
@@ -34,7 +41,14 @@ bool applyRemoveStrideMap(ModuleOp &module);
 bool applyMemRefDCE(ModuleOp &module);
 bool applyDataPlacement(ModuleOp &module);
 bool applyMergeSubviewAndCopy(ModuleOp &module, MLIRContext* ctxPtr);
+bool applyRepackVivadoScales(ModuleOp &module, MLIRContext *context);
+bool applyToggleVivadoTranspose(ModuleOp &module, MLIRContext *context);
+bool applyVivadoPadding(ModuleOp &module, MLIRContext *context);
+bool applyVivadoSeparateBias(ModuleOp &module, MLIRContext *context);
+bool applyInsertScaleConversionAfterLayerNorm(ModuleOp &module, MLIRContext *context);
 ModuleOp applyUnifyKernels(ModuleOp &module1, ModuleOp &module2, int loop_num);
+// deprecated
+// bool applyVivadoQLinearKSplit(ModuleOp &module, MLIRContext *context);
 
 /// Registers all Allo transformation passes
 void registerAlloPasses();

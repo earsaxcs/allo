@@ -17,6 +17,11 @@ include "allo/Dialect/AlloAttrs.td"
 include "mlir/IR/OpBase.td"
 include "mlir/Interfaces/SideEffectInterfaces.td"
 
+// NOTE: Quant_Mode currently by checking scale coe is single element or multiple elements to decide
+// for layernorm, it means per-tensor or per-channel quantization
+// for others, it means per-tensor or per-token quantization
+// you can later add direct quant mode
+
 // Type constraints for quantization parameters based on pytorch.py conversion
 // sign: i8 scalar or shaped (int8 sign, truly signed)
 def SignType : AnyTypeOf<[I8, AnyTypeOf<[MemRefOf<[I8]>, RankedTensorOf<[I8]>]>]>;
@@ -57,6 +62,7 @@ def FloatElementType : AnyTypeOf<[
 
 // Quantized MatMul: (output, lhs, rhs, x_scale_sign, x_scale_coe, x_scale_rshift, 
 //                     y_scale_sign, y_scale_coe, y_scale_rshift,
+//                     fused_scale_sign, fused_scale_coe, fused_scale_rshift,
 //                     o_scale_sign, o_scale_coe, o_scale_rshift,
 //                     o_scale_inv_sign, o_scale_inv_coe, o_scale_inv_rshift [, x_zero, y_zero, o_zero])
 // Destination-passing style: output buffer is passed as first argument
@@ -81,6 +87,9 @@ def Allo_QMatMulOp : Allo_Op<"qmatmul", [AttrSizedOperandSegments]> {
     SignType:$y_scale_sign,
     CoeType:$y_scale_coe,
     RshiftType:$y_scale_rshift,
+    SignType:$fused_scale_sign,
+    CoeType:$fused_scale_coe,
+    RshiftType:$fused_scale_rshift,
     SignType:$o_scale_sign,
     CoeType:$o_scale_coe,
     RshiftType:$o_scale_rshift,
@@ -95,6 +104,7 @@ def Allo_QMatMulOp : Allo_Op<"qmatmul", [AttrSizedOperandSegments]> {
   let assemblyFormat = [{
     `(` $output `,` $lhs `,` $rhs `,` $x_scale_sign `,` $x_scale_coe `,` $x_scale_rshift `,`
         $y_scale_sign `,` $y_scale_coe `,` $y_scale_rshift `,`
+        $fused_scale_sign `,` $fused_scale_coe `,` $fused_scale_rshift `,`
         $o_scale_sign `,` $o_scale_coe `,` $o_scale_rshift `,`
         $o_scale_inv_sign `,` $o_scale_inv_coe `,` $o_scale_inv_rshift
         (`x_zero` `=` $x_zero^ `:` type($x_zero))?
@@ -102,6 +112,7 @@ def Allo_QMatMulOp : Allo_Op<"qmatmul", [AttrSizedOperandSegments]> {
         (`o_zero` `=` $o_zero^ `:` type($o_zero))? `)` attr-dict `:` type($output) `,` type($lhs) `,` type($rhs) `,`
         type($x_scale_sign) `,` type($x_scale_coe) `,` type($x_scale_rshift) `,`
         type($y_scale_sign) `,` type($y_scale_coe) `,` type($y_scale_rshift) `,`
+        type($fused_scale_sign) `,` type($fused_scale_coe) `,` type($fused_scale_rshift) `,`
         type($o_scale_sign) `,` type($o_scale_coe) `,` type($o_scale_rshift) `,`
         type($o_scale_inv_sign) `,` type($o_scale_inv_coe) `,` type($o_scale_inv_rshift)
   }];
@@ -128,6 +139,9 @@ def Allo_QMatMulIsqrtDOp : Allo_Op<"qmatmul_isqrtd", [AttrSizedOperandSegments]>
     SignType:$y_scale_sign,
     CoeType:$y_scale_coe,
     RshiftType:$y_scale_rshift,
+    SignType:$fused_scale_sign,
+    CoeType:$fused_scale_coe,
+    RshiftType:$fused_scale_rshift,
     SignType:$o_scale_sign,
     CoeType:$o_scale_coe,
     RshiftType:$o_scale_rshift,
@@ -142,6 +156,7 @@ def Allo_QMatMulIsqrtDOp : Allo_Op<"qmatmul_isqrtd", [AttrSizedOperandSegments]>
   let assemblyFormat = [{
     `(` $output `,` $lhs `,` $rhs `,` $x_scale_sign `,` $x_scale_coe `,` $x_scale_rshift `,`
         $y_scale_sign `,` $y_scale_coe `,` $y_scale_rshift `,`
+        $fused_scale_sign `,` $fused_scale_coe `,` $fused_scale_rshift `,`
         $o_scale_sign `,` $o_scale_coe `,` $o_scale_rshift `,`
         $o_scale_inv_sign `,` $o_scale_inv_coe `,` $o_scale_inv_rshift
         (`x_zero` `=` $x_zero^ `:` type($x_zero))?
@@ -149,6 +164,7 @@ def Allo_QMatMulIsqrtDOp : Allo_Op<"qmatmul_isqrtd", [AttrSizedOperandSegments]>
         (`o_zero` `=` $o_zero^ `:` type($o_zero))? `)` attr-dict `:` type($output) `,` type($lhs) `,` type($rhs) `,`
         type($x_scale_sign) `,` type($x_scale_coe) `,` type($x_scale_rshift) `,`
         type($y_scale_sign) `,` type($y_scale_coe) `,` type($y_scale_rshift) `,`
+        type($fused_scale_sign) `,` type($fused_scale_coe) `,` type($fused_scale_rshift) `,`
         type($o_scale_sign) `,` type($o_scale_coe) `,` type($o_scale_rshift) `,`
         type($o_scale_inv_sign) `,` type($o_scale_inv_coe) `,` type($o_scale_inv_rshift)
   }];
@@ -213,6 +229,17 @@ def Allo_QLinearOp : Allo_Op<"qlinear", [AttrSizedOperandSegments]> {
     Output buffer must be pre-allocated by caller.
     
     Type constraints: All data operands must have integer element types.
+    
+    **Layer Type Attribute:**
+    The layer_type attribute identifies the role of this linear layer in the network:
+    - "qkvgemm.proj_q": Query projection in multi-head attention
+    - "qkvgemm.proj_k": Key projection in multi-head attention
+    - "qkvgemm.proj_v": Value projection in multi-head attention
+    - "attngemm.proj": Output projection after attention
+    - "ffn.fc1": First FC layer in feed-forward network
+    - "ffn.fc2": Second FC layer in feed-forward network
+    - "classifier.dense": Classification head
+    - "unknown": Default for unspecified layers
   }];
   let arguments = (ins 
     IntElementType:$output,
@@ -226,7 +253,10 @@ def Allo_QLinearOp : Allo_Op<"qlinear", [AttrSizedOperandSegments]> {
     Optional<SignType>:$bscl_sign, Optional<CoeType>:$bscl_coe, Optional<RshiftType>:$bscl_rshift,
     Optional<ZeroType>:$input_zero,
     Optional<ZeroType>:$output_zero,
-    Optional<IntElementType>:$bias
+    Optional<IntElementType>:$bias,
+    
+    // Layer type identification for optimization
+    DefaultValuedAttr<StrAttr, "\"unknown\"">:$layer_type
   );
   let results = (outs);
   let assemblyFormat = [{
@@ -523,5 +553,30 @@ def Allo_DequantOp : Allo_Op<"dequant", []> {
         `quant_mode` `=` $quant_mode attr-dict `:` 
         type($output) `,` type($input) `,`
         type($scale_sign) `,` type($scale_coe) `,` type($scale_rshift)
+  }];
+}
+
+// ==================== ViT-specific Operations ====================
+
+// ViT Get First Token: extract [B, 1, D] from [B, L, D]
+def Allo_ViTGetFirstTokenOp : Allo_Op<"vit_get_first_token", []> {
+  let summary = "Extract first token from sequence (destination-passing style)";
+  let description = [{
+    Extracts the first token (typically CLS token) from a sequence.
+    Input shape: [B, L, D] where B=batch, L=sequence length, D=embedding dim.
+    Output shape: [B, 1, D].
+    
+    This operation is commonly used in Vision Transformer architectures to
+    extract the classification token before feeding to the classifier head.
+    
+    Type constraints: Input and output must have the same element type.
+  }];
+  let arguments = (ins 
+    AnyShaped:$output,    // Output: [B, 1, D]
+    AnyShaped:$input      // Input: [B, L, D]
+  );
+  let results = (outs);
+  let assemblyFormat = [{
+    `(` $output `,` $input `)` attr-dict `:` type($output) `,` type($input)
   }];
 }

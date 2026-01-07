@@ -447,12 +447,14 @@ struct QMatMulLoweringPattern : public OpRewritePattern<allo_ops::QMatMulOp> {
         op.getXScaleSign(), op.getXScaleCoe(), op.getXScaleRshift());
     Value yScale = convertScaleToPacked(rewriter, loc, module,
         op.getYScaleSign(), op.getYScaleCoe(), op.getYScaleRshift());
+    Value fusedScale = convertScaleToPacked(rewriter, loc, module,
+      op.getFusedScaleSign(), op.getFusedScaleCoe(), op.getFusedScaleRshift());
     Value oScale = convertScaleToPacked(rewriter, loc, module,
         op.getOScaleSign(), op.getOScaleCoe(), op.getOScaleRshift());
     Value oScaleInv = convertScaleToPacked(rewriter, loc, module,
         op.getOScaleInvSign(), op.getOScaleInvCoe(), op.getOScaleInvRshift());
     
-    if (!xScale || !yScale || !oScale || !oScaleInv) {
+    if (!xScale || !yScale || !fusedScale || !oScale || !oScaleInv) {
       return op.emitError("Failed to pack scale parameters");
     }
     
@@ -464,7 +466,7 @@ struct QMatMulLoweringPattern : public OpRewritePattern<allo_ops::QMatMulOp> {
     // Create vivado.qmatmul op with packed scales
     rewriter.replaceOpWithNewOp<vivado_ops::QMatMulOp>(
         op, output, lhs, rhs,
-        xScale, yScale, oScale, oScaleInv,
+      xScale, yScale, fusedScale, oScale, oScaleInv,
         xZero, yZero, oZero,
         // Backend-specific attributes with defaults from PYNQConfig
         rewriter.getI32IntegerAttr(pynq::TileConfig::kDefaultTileM),  // tile_m
@@ -478,7 +480,11 @@ struct QMatMulLoweringPattern : public OpRewritePattern<allo_ops::QMatMulOp> {
         rewriter.getStringAttr("i32"),   // accumulator_type
         rewriter.getStringAttr("inline"), // requant_mode
         rewriter.getStringAttr(kScalePackingAttr), // scale_packing
-        rewriter.getStringAttr(kScaleCoeModeAttr)   // scale_coe_mode
+        rewriter.getStringAttr(kScaleCoeModeAttr),  // scale_coe_mode
+        rewriter.getBoolAttr(false),                // transpose_mode
+        rewriter.getBoolAttr(false),                // is_transposed
+        rewriter.getStringAttr("bhld"),            // rhs_layout
+        rewriter.getI32IntegerAttr(2)               // reduce_dim (L dim for bhld)
     );
 
     return success();
@@ -529,6 +535,9 @@ struct QLinearLoweringPattern : public OpRewritePattern<allo_ops::QLinearOp> {
     Value inputZero = op.getInputZero();
     Value outputZero = op.getOutputZero();
     Value bias = op.getBias();
+    
+    // Extract layer_type attribute
+    StringAttr layerType = op.getLayerTypeAttr();
 
     // Create vivado.qlinear op with packed scales
     rewriter.replaceOpWithNewOp<vivado_ops::QLinearOp>(
@@ -548,7 +557,10 @@ struct QLinearLoweringPattern : public OpRewritePattern<allo_ops::QLinearOp> {
         rewriter.getStringAttr("i32"),   // accumulator_type
         rewriter.getStringAttr("inline"), // requant_mode
         rewriter.getStringAttr(kScalePackingAttr), // scale_packing
-        rewriter.getStringAttr(kScaleCoeModeAttr)   // scale_coe_mode
+        rewriter.getStringAttr(kScaleCoeModeAttr),  // scale_coe_mode
+        rewriter.getBoolAttr(false),     // transpose_mode
+        rewriter.getBoolAttr(false),     // is_transposed
+        layerType                        // layer_type
     );
 
     return success();
@@ -609,7 +621,9 @@ struct QAddLoweringPattern : public OpRewritePattern<allo_ops::QAddOp> {
         rewriter.getBoolAttr(false),  // fuse_into_producer
         rewriter.getBoolAttr(true),    // vectorize
         rewriter.getStringAttr(kScalePackingAttr),
-        rewriter.getStringAttr(kScaleCoeModeAttr)
+        rewriter.getStringAttr(kScaleCoeModeAttr),
+        rewriter.getBoolAttr(false),  // transpose_mode
+        rewriter.getBoolAttr(false)   // is_transposed
     );
 
     return success();
@@ -674,7 +688,9 @@ struct IntGELULoweringPattern : public OpRewritePattern<allo_ops::IntGELUOp> {
         // Backend-specific attributes
         rewriter.getStringAttr("lut"),  // implementation: "lut" or "polynomial"
         rewriter.getStringAttr(kScalePackingAttr),
-        rewriter.getStringAttr(kScaleCoeModeAttr)
+      rewriter.getStringAttr(kScaleCoeModeAttr),
+      rewriter.getBoolAttr(false),  // transpose_mode
+      rewriter.getBoolAttr(false)   // is_transposed
     );
 
     return success();
@@ -745,7 +761,9 @@ struct IntSoftmaxLoweringPattern : public OpRewritePattern<allo_ops::IntSoftmaxO
         // Backend-specific attributes
         rewriter.getStringAttr("lut"),  // implementation
         rewriter.getStringAttr(kScalePackingAttr),
-        rewriter.getStringAttr(kScaleCoeModeAttr)
+      rewriter.getStringAttr(kScaleCoeModeAttr),
+      rewriter.getBoolAttr(false),  // transpose_mode
+      rewriter.getBoolAttr(false)   // is_transposed
     );
 
     return success();
@@ -822,7 +840,9 @@ struct IntLayerNormLoweringPattern : public OpRewritePattern<allo_ops::IntLayerN
         // Backend-specific attributes
         rewriter.getStringAttr("approx"),  // rsqrt_method
         rewriter.getStringAttr(kScalePackingAttr),
-        rewriter.getStringAttr(kScaleCoeModeAttr)
+      rewriter.getStringAttr(kScaleCoeModeAttr),
+      rewriter.getBoolAttr(false),  // transpose_mode
+      rewriter.getBoolAttr(false)   // is_transposed
     );
 
     return success();
@@ -908,7 +928,9 @@ struct QConv2dLoweringPattern : public OpRewritePattern<allo_ops::QConv2dOp> {
         rewriter.getStringAttr("i32"),   // accumulator_type
         rewriter.getStringAttr("inline"), // requant_mode
         rewriter.getStringAttr(kScalePackingAttr),
-        rewriter.getStringAttr(kScaleCoeModeAttr)
+        rewriter.getStringAttr(kScaleCoeModeAttr),
+        rewriter.getBoolAttr(false),  // transpose_mode
+        rewriter.getBoolAttr(false)   // is_transposed
     );
 
     return success();
@@ -941,6 +963,13 @@ struct QMatMulIsqrtDLoweringPattern : public OpRewritePattern<allo_ops::QMatMulI
         op.getYScaleSign(), op.getYScaleCoe(), op.getYScaleRshift()
       );
     if (!yScale) return failure();
+
+    // Pack fused scale at compile time (baseName auto-inferred)
+    Value fusedScale = convertScaleToPacked(
+        rewriter, op.getLoc(), op->getParentOfType<ModuleOp>(),
+        op.getFusedScaleSign(), op.getFusedScaleCoe(), op.getFusedScaleRshift()
+      );
+    if (!fusedScale) return failure();
     
     // Pack o scale at compile time (baseName auto-inferred)
     Value oScale = convertScaleToPacked(
@@ -962,7 +991,7 @@ struct QMatMulIsqrtDLoweringPattern : public OpRewritePattern<allo_ops::QMatMulI
 
     rewriter.replaceOpWithNewOp<vivado_ops::QMatMulIsqrtDOp>(
         op, output, lhs, rhs,
-        xScale, yScale, oScale, oScaleInv,
+      xScale, yScale, fusedScale, oScale, oScaleInv,
         xZero, yZero, oZero,
         // Backend-specific attributes from PYNQConfig
         rewriter.getI32IntegerAttr(pynq::TileConfig::kDefaultTileM),  // tile_m
@@ -976,7 +1005,11 @@ struct QMatMulIsqrtDLoweringPattern : public OpRewritePattern<allo_ops::QMatMulI
         rewriter.getStringAttr("i32"),   // accumulator_type
         rewriter.getStringAttr("inline"), // requant_mode
         rewriter.getStringAttr(kScalePackingAttr),
-        rewriter.getStringAttr(kScaleCoeModeAttr)
+        rewriter.getStringAttr(kScaleCoeModeAttr),
+        rewriter.getBoolAttr(false),                // transpose_mode
+        rewriter.getBoolAttr(false),                // is_transposed
+        rewriter.getStringAttr("bhdl"),            // rhs_layout
+        rewriter.getI32IntegerAttr(3)               // reduce_dim (L dim for bhdl)
     );
 
     return success();
@@ -1018,7 +1051,9 @@ struct QuantLoweringPattern : public OpRewritePattern<allo_ops::QuantOp> {
         op, output, input, scale, zero,
         rewriter.getI8IntegerAttr(quantMode),
         rewriter.getStringAttr(kScalePackingAttr),
-        rewriter.getStringAttr(kScaleCoeModeAttr)
+      rewriter.getStringAttr(kScaleCoeModeAttr),
+      rewriter.getBoolAttr(false),  // transpose_mode
+      rewriter.getBoolAttr(false)   // is_transposed
     );
 
     return success();
@@ -1060,9 +1095,32 @@ struct DequantLoweringPattern : public OpRewritePattern<allo_ops::DequantOp> {
         op, output, input, scale, zero,
         rewriter.getI8IntegerAttr(quantMode),
         rewriter.getStringAttr(kScalePackingAttr),
-        rewriter.getStringAttr(kScaleCoeModeAttr)
+      rewriter.getStringAttr(kScaleCoeModeAttr),
+      rewriter.getBoolAttr(false),  // transpose_mode
+      rewriter.getBoolAttr(false)   // is_transposed
     );
 
+    return success();
+  }
+};
+
+//===----------------------------------------------------------------------===//
+// ViT Get First Token Lowering Pattern
+//===----------------------------------------------------------------------===//
+
+struct ViTGetFirstTokenLoweringPattern 
+    : public OpRewritePattern<allo_ops::ViTGetFirstTokenOp> {
+  using OpRewritePattern<allo_ops::ViTGetFirstTokenOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(allo_ops::ViTGetFirstTokenOp op,
+                                 PatternRewriter &rewriter) const override {
+    // Simple 1:1 lowering from allo.vit_get_first_token to vivado.vit_get_first_token
+    // No scale packing or complex transformations needed
+    rewriter.replaceOpWithNewOp<vivado_ops::ViTGetFirstTokenOp>(
+        op, op.getOutput(), op.getInput(),
+        rewriter.getBoolAttr(false),  // transpose_mode
+        rewriter.getBoolAttr(false)   // is_transposed
+    );
     return success();
   }
 };
@@ -1097,6 +1155,7 @@ bool applyLowerAlloQuantToVivado(ModuleOp &module, MLIRContext *context) {
   patterns.add<IntLayerNormLoweringPattern>(context);
   patterns.add<QuantLoweringPattern>(context);
   patterns.add<DequantLoweringPattern>(context);
+  patterns.add<ViTGetFirstTokenLoweringPattern>(context);
 
   return !failed(applyPatternsAndFoldGreedily(module, std::move(patterns)));
 }

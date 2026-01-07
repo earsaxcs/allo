@@ -146,4 +146,205 @@ def PYNQBufferAllocation : Pass<"pynq-buffer-allocation", "ModuleOp"> {
   ];
 }
 
+//===----------------------------------------------------------------------===//
+// Vivado Backend Passes
+//===----------------------------------------------------------------------===//
+
+def VivadoQLinearKSplit : Pass<"vivado-qlinear-k-split", "ModuleOp"> {
+  let summary = "Split vivado.qlinear ops with K dimension exceeding tile size";
+  let description = [{
+    This pass handles the case where the K dimension (reduction dimension) of
+    vivado.qlinear operations exceeds the hardware tile size limit (TileConfig::kDefaultTileK).
+    
+    **Motivation:**
+    In FC2 layers of transformer models, the weight matrix dimensions can be quite large.
+    When K (the reduction/input dimension) exceeds the tile size limit:
+    - For M and N dimensions: can be handled later during Vivado->PYNQ lowering as
+      independent tiles without data dependencies
+    - For K dimension: must be split early because partial results have data dependencies
+      (each K-tile produces a partial sum that must be accumulated via QAdd)
+    
+    **Transformation:**
+    ```mlir
+    // Before: QLinear with K > TileK
+    vivado.qlinear(%output, %input, %weight, ...) 
+      : [B,L,K_large] x [OC,K_large] -> [B,L,OC]
+    
+    // After: Multiple QLinear + QAdd chain
+    %input_0 = memref.subview %input[..., 0:TileK]
+    %weight_0 = memref.subview %weight[..., 0:TileK]
+    %partial_0 = memref.alloc()
+    vivado.qlinear(%partial_0, %input_0, %weight_0, ...)
+    
+    %input_1 = memref.subview %input[..., TileK:2*TileK]
+    %weight_1 = memref.subview %weight[..., TileK:2*TileK]
+    %partial_1 = memref.alloc()
+    vivado.qlinear(%partial_1, %input_1, %weight_1, ...)
+    
+    // Accumulate via QAdd chain
+    vivado.qadd(%output, %partial_0, %partial_1, %o_scale, %o_scale, ...)
+    ```
+    
+    **Key Design Decisions:**
+    1. QAdd uses original QLinear's o_scale (packed, not inv) for both inputs
+       since all partial results share the same quantization scale.
+    2. K dimension split is done here; M/N splits are deferred to PYNQ lowering.
+    3. The is_transposed attribute determines K dimension location.
+    
+    This pass should run before LowerVivadoToPYNQ.
+  }];
+  let constructor = "mlir::allo::createVivadoQLinearKSplitPass()";
+  
+  let dependentDialects = [
+    "mlir::allo::vivado::VivadoDialect",
+    "mlir::func::FuncDialect",
+    "mlir::memref::MemRefDialect",
+    "mlir::arith::ArithDialect"
+  ];
+}
+
+def RepackVivadoScales : Pass<"repack-vivado-scales", "ModuleOp"> {
+  let summary = "Repack Vivado quantized op scale parameters";
+  let description = [{
+    This pass transforms packed scale parameters from one format to another
+    according to global packing configuration strings. The primary use case is
+    converting scale formats after lowering to Vivado ops.
+    
+    Transformation details:
+    - Source format example: "8,24,8,16,16,0" (Tail mode)
+      Layout: sign[31:24] | rshift[23:16] | coe[15:0]
+    - Target format example: "0,22,6,16,16,0" (Full mode, sign-fused)
+      Layout: rshift[27:22] | coe[21:0] (two's complement)
+    
+    The pass performs:
+    1. Tail->Full mode conversion (adds explicit leading 1 to coefficient)
+    2. Sign fusion (converts signed coefficient to two's complement)
+    3. Bit width adjustments (e.g., 16->22 bits for coefficient)
+    4. rshift correction for bit width changes
+    
+    Supports all Vivado quantized operations:
+    - vivado.qmatmul, vivado.qlinear, vivado.qadd
+    - vivado.int_gelu, vivado.int_softmax, vivado.int_layernorm
+    - vivado.qconv2d, vivado.qmatmul_isqrtd
+  }];
+  let constructor = "mlir::allo::createRepackVivadoScalesPass()";
+  let dependentDialects = ["mlir::allo::vivado::VivadoDialect"];
+}
+
+def InsertScaleConversionAfterLayerNorm : Pass<"insert-scale-conversion-after-layernorm", "ModuleOp"> {
+  let summary = "Insert missing scale conversions after LayerNorm";
+  let description = [{
+    This pass inspects vivado.int_layernorm outputs and inserts a
+    vivado.scale_conversion before every consumer whose quantization
+    parameters expect a different scale mode (per-token vs per-channel).
+    The goal is to automatically bridge the LayerNorm legacy per-channel
+    output scales with downstream ops that may expect per-token scales.
+  }];
+  let constructor = "mlir::allo::createInsertScaleConversionAfterLayerNormPass()";
+  let dependentDialects = [
+    "mlir::allo::vivado::VivadoDialect",
+    "mlir::memref::MemRefDialect"
+  ];
+}
+
+def ToggleVivadoTranspose : Pass<"toggle-vivado-transpose", "ModuleOp"> {
+  let summary = "Toggle is_transposed attribute for Vivado quantized operations";
+  let description = [{
+    This pass toggles the is_transposed attribute for all Vivado quantized operations
+    (qlinear, qmatmul, qadd, etc.) in the module. This is useful for switching between
+    different layout conventions (e.g., (B,L,D) vs (B,D,L) for activations).
+    
+    The pass modifies:
+    - vivado.qlinear: toggles is_transposed attribute
+    - vivado.qmatmul: toggles is_transposed attribute
+    - vivado.qadd: toggles is_transposed attribute
+    - vivado.int_gelu: toggles is_transposed attribute
+    - vivado.int_softmax: toggles is_transposed attribute
+    - vivado.int_layernorm: toggles is_transposed attribute
+    - vivado.qconv2d: toggles is_transposed attribute (if applicable)
+    
+    When is_transposed changes from false to true:
+    - Input layout: (B, L, D) → (B, D, L)
+    - Weight layout: (OC, IC) → (IC, OC) for qlinear
+    - Output layout: (B, L, OC) → (B, OC, L)
+    
+    This pass is typically used for:
+    1. Adapting to different hardware layout requirements
+    2. Testing performance of different memory layouts
+    3. Interfacing with external frameworks that use different conventions
+  }];
+  let constructor = "mlir::allo::createToggleVivadoTransposePass()";
+  let dependentDialects = ["mlir::allo::vivado::VivadoDialect"];
+}
+
+def VivadoPadding : Pass<"vivado-padding", "ModuleOp"> {
+  let summary = "Pad weight/bias/activations to hardware tile-size alignment";
+  let description = [{
+    This pass performs the Vivado/PYNQ *padding* step only.
+
+    **Alignment rule:**
+    Pad the *last dimension* so that:
+    padded_last_dim * element_bytes is a multiple of InstrConfig::kTileSize (bytes).
+    Example: ?x197xi8 with kTileSize=32B -> ?x224xi8.
+
+    **What gets padded:**
+    - Weight globals (2D): pad last dim only, zero-filled
+    - Bias globals (2D only): pad last dim only, zero-filled
+    - Activations (rank 2/3/4): only adjust *types* (last dim) for buffers inside
+      the quantized region; boundary copies are represented explicitly by
+      vivado.activation_dynamic_pad inserted right after vivado.quant and right
+      before vivado.dequant.
+
+    **Important:**
+    - This pass does NOT perform any transpose. Transpose is handled elsewhere.
+    - IntLayerNorm bias_int must NOT be padded.
+  }];
+  let constructor = "mlir::allo::createVivadoPaddingPass()";
+  let dependentDialects = [
+    "mlir::allo::vivado::VivadoDialect",
+    "mlir::memref::MemRefDialect"
+  ];
+}
+
+def VivadoSeparateBias : Pass<"vivado-separate-bias", "ModuleOp"> {
+  let summary = "Separate fused bias from vivado.qlinear into explicit vivado.qadd";
+  let description = [{
+    This pass separates the fused bias from vivado.qlinear operations into
+    separate vivado.qadd operations.
+    
+    **Motivation:**
+    - Some hardware implementations don't support fused bias in matmul
+    - Explicit bias operations allow different quantization parameters
+    - Useful for debugging or analysis requiring explicit bias operations
+    
+    **Transformation:**
+    ```mlir
+    // Before: QLinear with fused bias
+    vivado.qlinear(%output, %input, %weight, ..., %bscl, ..., %bias)
+      {fuse_bias = true}
+    
+    // After: QLinear without bias + QAdd for bias
+    %temp = memref.alloc : memref<...>
+    vivado.qlinear(%temp, %input, %weight, ..., /*no bscl*/, ..., /*no bias*/)
+      {fuse_bias = false}
+    vivado.qadd(%output, %temp, %bias, %oscl, %bscl, %oscl, %oscl_inv, ...)
+    ```
+    
+    **Scale Mapping:**
+    - QAdd's x_scale = QLinear's output scale (oscl)
+    - QAdd's y_scale = QLinear's bias scale (bscl)
+    - QAdd's o_scale = QLinear's output scale (oscl)
+    
+    **Important:**
+    The bias tensor must be pre-broadcasted to match the output shape.
+    QAddOp's verifier will emit an error if lhs and rhs shapes don't match.
+    For bias from QLinear, ensure it's shaped as [B, L, OC] not [OC].
+  }];
+  let constructor = "mlir::allo::createVivadoSeparateBiasPass()";
+  let dependentDialects = [
+    "mlir::allo::vivado::VivadoDialect",
+    "mlir::memref::MemRefDialect"
+  ];
+}
+
 #endif // ALLO_MLIR_PASSES

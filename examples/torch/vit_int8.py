@@ -22,6 +22,7 @@ from allo.quant.quant_config import (
     Calibrator,
     get_default_config,
     get_vit_optimized_config,
+    set_extra_compile_param_for_config,
 )
 from allo.quant.quant_modules import (
     QLinear, QConv2d, IntGELU, IntSoftmax, IntLayerNorm, QAdd, QMatMul,
@@ -167,6 +168,8 @@ def test_calibrate_vit(
     print("\n[4] Replacing modules with quantized versions...")
     # quant_config = get_default_config() 
     quant_config = get_vit_optimized_config()
+    if run_compile:
+        set_extra_compile_param_for_config(quant_config)
     vit = replace_module_with_quantized(vit, config=quant_config)
 
     # Calibrate
@@ -182,6 +185,7 @@ def test_calibrate_vit(
             vit,
             example_inputs=[example_inputs[:2]],
             leaf_modules=[ViTGetFirstToken, ViTTokenExpand, QLinear, QConv2d, IntLayerNorm, IntSoftmax, IntGELU, QAdd, QMatMul],
+            quant_config=quant_config,
             verbose=False,
         )
         print("    Compilation completed!")

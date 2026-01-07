@@ -30,27 +30,9 @@ from ..customize import customize
 from ..quant.quant_config import DEFAULT_ACT_BIT, DEFAULT_WEIGHT_BIT, DEFAULT_BIAS_BIT
 from ..ops.vit import ViTGetFirstToken, ViTTokenExpand
 
-# Global configuration for quantization
-# SCALE_FIXED_BITS: Number of bits used to represent scale coefficient in [0.5, 1.0)
-# Default: 17 bits (coe ∈ [65536, 131071] represents [0.5, 1.0))
-# This value should match kExpectedAlloFixedBits in LowerAlloQuantToVivado.cpp
-#
-# Configuration Flow:
-# 1. Set SCALE_FIXED_BITS here (default: 17)
-# 2. float_to_fixed_point() uses this to convert scales: coe = value * 2^SCALE_FIXED_BITS
-# 3. In LowerAlloQuantToVivado.cpp, kExpectedAlloFixedBits should match this value
-# 4. The lowering pass validates and packs coe according to scale_coe_mode (Tail/Full)
-#
-# Example:
-#   SCALE_FIXED_BITS = 17 means:
-#   - scale 0.5 → coe = 0.5 * 2^17 = 65536 = 0b10000000000000000
-#   - scale 0.625 → coe = 0.625 * 2^17 = 81920 = 0b10100000000000000
-#   - Tail mode: stores low 16 bits (variant part)
-#   - Full mode: stores high 16 bits (including leading 1)
-SCALE_FIXED_BITS = 17
 
 # maybe used in pytorch_vivado.py
-def _process_quantized_params(gm, global_vars):
+def _process_quantized_params(gm, global_vars, quant_config=None):
     """
     处理量化模块的参数和buffers，将浮点权重/偏置替换为整数版本，
     并注入所有量化相关的scale/zero常量到global_vars中。
@@ -66,6 +48,8 @@ def _process_quantized_params(gm, global_vars):
         None (就地修改global_vars)
     """
     import numpy as np
+    if quant_config is None:
+        raise ValueError("quant_config must be provided to process quantized parameters")
     
     def float_to_fixed_point(scale_float, fixed_bits=16):
         """
@@ -238,7 +222,7 @@ def _process_quantized_params(gm, global_vars):
                 # 注入weight_scale（定点表示）
                 if hasattr(module, 'weight_scale'):
                     scale_data = module.weight_scale.data.detach().numpy()
-                    sign, coe, rshift = float_to_fixed_point(scale_data, fixed_bits=SCALE_FIXED_BITS)
+                    sign, coe, rshift = float_to_fixed_point(scale_data, fixed_bits=quant_config.scale_fixed_bits)
                     
                     global_vars[var_prefix + "_weight_scale_sign"] = sign.astype(np.int8)
                     global_vars[var_prefix + "_weight_scale_coe"] = coe.astype(np.int32)
@@ -246,15 +230,29 @@ def _process_quantized_params(gm, global_vars):
         
         # ========== 处理偏置 (bias) ==========
         if hasattr(module, 'bias') and module.bias is not None:
+            dtype_str = "int32"
             if hasattr(module, 'bias_int'):
-                bias_int_data = module.bias_int.data.detach().numpy()
+                bias_int = module.bias_int.data
+                if isinstance(module, QLinear):
+                    if module.wgt_per_channel:
+                        raise NotImplementedError("wgt_per_channel not supported")
+                    elif module.act_per_token or not module.act_per_token:
+                        # NOTE: Here is hardcoded for classifier, please note if you change the model's module name, you need to change this line
+                        if 'classifier' not in module_name:
+                            bias_int = bias_int[None, :].expand(quant_config.seq_len, -1).contiguous() # Also need to broadcast when build
+                        else:
+                            bias_int = bias_int[None, :].contiguous()
+                        dtype_str = f"int{module.bias_bit}"
+                    else:
+                        raise NotImplementedError("Currently Per-Tensor quantization also applys 2d bias")
+                bias_int_data = bias_int.detach().numpy()
                 bias_key = var_prefix + "_bias_int"
-                global_vars[bias_key] = bias_int_data.astype(np.int32)
+                global_vars[bias_key] = bias_int_data.astype(dtype_str)
                 
                 # 注入bias_scale（定点表示）
                 if hasattr(module, 'bias_scale'):
                     scale_data = module.bias_scale.data.detach().numpy()
-                    sign, coe, rshift = float_to_fixed_point(scale_data, fixed_bits=SCALE_FIXED_BITS)
+                    sign, coe, rshift = float_to_fixed_point(scale_data, fixed_bits=quant_config.scale_fixed_bits)
                     
                     global_vars[var_prefix + "_bias_scale_sign"] = sign.astype(np.int8)
                     global_vars[var_prefix + "_bias_scale_coe"] = coe.astype(np.int32)
@@ -265,7 +263,7 @@ def _process_quantized_params(gm, global_vars):
         # input_scale
         if hasattr(module, 'input_scale'):
             scale_data = module.input_scale.data.detach().numpy()
-            sign, coe, rshift = float_to_fixed_point(scale_data, fixed_bits=SCALE_FIXED_BITS)
+            sign, coe, rshift = float_to_fixed_point(scale_data, fixed_bits=quant_config.scale_fixed_bits)
             
             global_vars[var_prefix + "_input_scale_sign"] = sign.astype(np.int8)
             global_vars[var_prefix + "_input_scale_coe"] = coe.astype(np.int32)
@@ -274,7 +272,7 @@ def _process_quantized_params(gm, global_vars):
         # output_scale
         if hasattr(module, 'output_scale'):
             scale_data = module.output_scale.data.detach().numpy()
-            sign, coe, rshift = float_to_fixed_point(scale_data, fixed_bits=SCALE_FIXED_BITS)
+            sign, coe, rshift = float_to_fixed_point(scale_data, fixed_bits=quant_config.scale_fixed_bits)
             
             global_vars[var_prefix + "_output_scale_sign"] = sign.astype(np.int8)
             global_vars[var_prefix + "_output_scale_coe"] = coe.astype(np.int32)
@@ -284,7 +282,7 @@ def _process_quantized_params(gm, global_vars):
             # Use epsilon to avoid division by zero (guard only near-zero values)
             eps = 1e-10
             scale_inv_data = np.where(np.abs(scale_data) < eps, 0.0, 1.0 / scale_data)
-            sign_inv, coe_inv, rshift_inv = float_to_fixed_point(scale_inv_data, fixed_bits=SCALE_FIXED_BITS)
+            sign_inv, coe_inv, rshift_inv = float_to_fixed_point(scale_inv_data, fixed_bits=quant_config.scale_fixed_bits)
             
             global_vars[var_prefix + "_output_scale_inv_sign"] = sign_inv.astype(np.int8)
             global_vars[var_prefix + "_output_scale_inv_coe"] = coe_inv.astype(np.int32)
@@ -293,7 +291,7 @@ def _process_quantized_params(gm, global_vars):
         # fused_scale（最关键：用于运行时缩放）
         if hasattr(module, 'fused_scale'):
             scale_data = module.fused_scale.data.detach().numpy()
-            sign, coe, rshift = float_to_fixed_point(scale_data, fixed_bits=SCALE_FIXED_BITS)
+            sign, coe, rshift = float_to_fixed_point(scale_data, fixed_bits=quant_config.scale_fixed_bits)
             
             global_vars[var_prefix + "_fused_scale_sign"] = sign.astype(np.int8)
             global_vars[var_prefix + "_fused_scale_coe"] = coe.astype(np.int32)
@@ -314,23 +312,28 @@ def _process_quantized_params(gm, global_vars):
         if isinstance(module, IntLayerNorm):
             if hasattr(module, 'layernorm_scale'):
                 scale_data = module.layernorm_scale.data.detach().numpy()
-                sign, coe, rshift = float_to_fixed_point(scale_data, fixed_bits=SCALE_FIXED_BITS)
+                sign, coe, rshift = float_to_fixed_point(scale_data, fixed_bits=quant_config.scale_fixed_bits)
                 
                 global_vars[var_prefix + "_layernorm_scale_sign"] = sign.astype(np.int8)
                 global_vars[var_prefix + "_layernorm_scale_coe"] = coe.astype(np.int32)
                 global_vars[var_prefix + "_layernorm_scale_rshift"] = rshift.astype(np.int16)
             
-            if hasattr(module, 'bias_int'):
-                bias_int_data = module.bias_int.data.detach().numpy()
-                global_vars[var_prefix + "_bias_int"] = bias_int_data.astype(np.int32)
+            # it will be publicly assign above, so no need to assign again
+            # if hasattr(module, 'bias_int'):
+            #     bias_int_data = module.bias_int.data.detach().numpy()
+            #     global_vars[var_prefix + "_bias_int"] = bias_int_data.astype(np.int32)
         
         # ========== 特殊处理：QAdd/QMatMul的双输入scale ==========
         if isinstance(module, (QAdd, QMatMul, QMatMulIsqrtD)):
-            # x_scale, y_scale, o_scale
-            for scale_name in ['x_scale', 'y_scale', 'o_scale']:
+            # x_scale, y_scale, fused_scale, o_scale
+            # NOTE: fused_scale is semantically x_scale * y_scale / o_scale.
+            # For QMatMulIsqrtD, fused_scale is expected to have already fused 1/sqrt(d)
+            # inside the quant module calibration logic.
+            # For QAdd, fused_scale is Not used
+            for scale_name in ['x_scale', 'y_scale', 'fused_scale', 'o_scale']:
                 if hasattr(module, scale_name):
                     scale_data = getattr(module, scale_name).data.detach().numpy()
-                    sign, coe, rshift = float_to_fixed_point(scale_data, fixed_bits=SCALE_FIXED_BITS)
+                    sign, coe, rshift = float_to_fixed_point(scale_data, fixed_bits=quant_config.scale_fixed_bits)
                     
                     global_vars[var_prefix + f"_{scale_name}_sign"] = sign.astype(np.int8)
                     global_vars[var_prefix + f"_{scale_name}_coe"] = coe.astype(np.int32)
@@ -339,8 +342,19 @@ def _process_quantized_params(gm, global_vars):
                     # Compute inverse for o_scale
                     if scale_name == 'o_scale':
                         eps = 1e-10
+                        # If this is the ISqrtD variant, we must fuse the 1/sqrt(dim)
+                        # factor into the scaling (otherwise emitting plain qmatmul
+                        # would miss the normalization).
+                        # if isinstance(module, QMatMulIsqrtD) and hasattr(module, 'sqrt_dim'):
+                        #     sqrt_dim = module.sqrt_dim.detach().cpu().numpy()
+                        #     scale_inv_data = 1.0 / (scale_data * sqrt_dim + eps)
+                        # else:
+                        #     scale_inv_data = 1.0 / (scale_data + eps)
+                        
+                        # NOTE: Currently just directly records output_scale_inv
+                        # NOTE: But it's true that we can't distinguish them after here in MLIR, it's a real risk so you need to focus on this when you use other feature out of fused_scale
                         scale_inv_data = 1.0 / (scale_data + eps)
-                        sign_inv, coe_inv, rshift_inv = float_to_fixed_point(scale_inv_data, fixed_bits=SCALE_FIXED_BITS)
+                        sign_inv, coe_inv, rshift_inv = float_to_fixed_point(scale_inv_data, fixed_bits=quant_config.scale_fixed_bits)
                         
                         global_vars[var_prefix + "_o_scale_inv_sign"] = sign_inv.astype(np.int8)
                         global_vars[var_prefix + "_o_scale_inv_coe"] = coe_inv.astype(np.int32)
@@ -358,7 +372,7 @@ def _process_quantized_params(gm, global_vars):
         if isinstance(module, IntSoftmax):
             if hasattr(module, 'softmax_scale'):
                 scale_data = module.softmax_scale.data.detach().numpy()
-                sign, coe, rshift = float_to_fixed_point(scale_data, fixed_bits=SCALE_FIXED_BITS)
+                sign, coe, rshift = float_to_fixed_point(scale_data, fixed_bits=quant_config.scale_fixed_bits)
                 
                 global_vars[var_prefix + "_softmax_scale_sign"] = sign.astype(np.int8)
                 global_vars[var_prefix + "_softmax_scale_coe"] = coe.astype(np.int32)
@@ -370,7 +384,7 @@ def _process_quantized_params(gm, global_vars):
             # (input_scale, output_scale 和 fused_scale 已经在通用部分处理)
             if hasattr(module, 'gelu_scale'):
                 scale_data = module.gelu_scale.data.detach().numpy()
-                sign, coe, rshift = float_to_fixed_point(scale_data, fixed_bits=SCALE_FIXED_BITS)
+                sign, coe, rshift = float_to_fixed_point(scale_data, fixed_bits=quant_config.scale_fixed_bits)
                 
                 global_vars[var_prefix + "_gelu_scale_sign"] = sign.astype(np.int8)
                 global_vars[var_prefix + "_gelu_scale_coe"] = coe.astype(np.int32)
@@ -450,81 +464,79 @@ def from_pytorch(
     for pymod in (types,):
         global_vars.update({item[0]: item[1] for item in inspect.getmembers(pymod)})
     global_vars.update({"dsl": dsl})
-    # Pass SCALE_FIXED_BITS to builder for quantization
-    global_vars.update({"__allo_quant_fixed_bits__": SCALE_FIXED_BITS})
     
-    # 定义量化模块类型
-    quantized_module_types = (
-        QLinear, QConv2d, IntGELU, IntSoftmax, 
-        IntLayerNorm, QAdd, QMatMul, QMatMulIsqrtD,
-    )
+    # # 定义量化模块类型
+    # quantized_module_types = (
+    #     QLinear, QConv2d, IntGELU, IntSoftmax, 
+    #     IntLayerNorm, QAdd, QMatMul, QMatMulIsqrtD,
+    # )
     
-    # 收集量化模块信息，用于判断参数是否属于量化模块
-    quant_module_prefixes = set()
-    if enable_quant:
-        for module_name, module in gm.named_modules():
-            if isinstance(module, quantized_module_types):
-                quant_module_prefixes.add(module_name)
+    # # 收集量化模块信息，用于判断参数是否属于量化模块
+    # quant_module_prefixes = set()
+    # if enable_quant:
+    #     for module_name, module in gm.named_modules():
+    #         if isinstance(module, quantized_module_types):
+    #             quant_module_prefixes.add(module_name)
     
-    # 处理参数 (nn.Parameter)
-    # 对于量化模块的权重，需要将伪量化的浮点转换为整数
-    # 定义需要量化的 embedding 参数后缀
-    # Currently empty for we don't need to quantize embedding or cls token
-    quant_embedding_suffixes = tuple() # ("_embedding", "_cls_token")
+    # # 处理参数 (nn.Parameter)
+    # # 对于量化模块的权重，需要将伪量化的浮点转换为整数
+    # # 定义需要量化的 embedding 参数后缀
+    # # Currently empty for we don't need to quantize embedding or cls token
+    # quant_embedding_suffixes = tuple() # ("_embedding", "_cls_token")
     
-    for param_name, param in gm.named_parameters():
-        new_name = "g_" + param_name.replace(".", "_")
-        param_data = param.detach().numpy()
+    # for param_name, param in gm.named_parameters():
+    #     new_name = "g_" + param_name.replace(".", "_")
+    #     param_data = param.detach().numpy()
         
-        if enable_quant:
-            converted = False
-            # 检查是否是量化模块的权重
-            for prefix in quant_module_prefixes:
-                if param_name.startswith(prefix + "."):
-                    # 这是量化模块的参数
-                    # 检查是否是权重参数
-                    param_suffix = param_name[len(prefix)+1:]  # 获取 "weight" 或 "bias" 等
-                    if param_suffix == "weight":
-                        # 量化模块的权重，转换为 int8
-                        param_data = _convert_weight_to_int(param_data, bits=TorchBuilder.QUANT_WEIGHT_BITS)
-                        converted = True
-                    elif param_suffix == "bias":
-                        # 偏置转换为 int32
-                        param_data = _convert_weight_to_int(param_data, bits=TorchBuilder.QUANT_BIAS_BITS)
-                        converted = True
-                    break
+    #     if enable_quant:
+    #         converted = False
+    #         # 检查是否是量化模块的权重
+    #         for prefix in quant_module_prefixes:
+    #             if param_name.startswith(prefix + "."):
+    #                 # 这是量化模块的参数
+    #                 # 检查是否是权重参数
+    #                 param_suffix = param_name[len(prefix)+1:]  # 获取 "weight" 或 "bias" 等
+    #                 if param_suffix == "weight":
+    #                     # 量化模块的权重，转换为 int8
+    #                     param_data = _convert_weight_to_int(param_data, bits=TorchBuilder.QUANT_WEIGHT_BITS)
+    #                     converted = True
+    #                 elif param_suffix == "bias":
+    #                     # 偏置转换为 int32
+    #                     param_data = _convert_weight_to_int(param_data, bits=TorchBuilder.QUANT_BIAS_BITS)
+    #                     converted = True
+    #                 break
             
-            # 如果不是量化模块参数，检查是否是需要量化的 embedding 参数
-            if not converted:
-                for suffix in quant_embedding_suffixes:
-                    if param_name.endswith(suffix):
-                        # embedding 参数使用激活值位宽 (int8)
-                        param_data = _convert_weight_to_int(param_data, bits=TorchBuilder.QUANT_ACT_BITS)
-                        break
+    #         # 如果不是量化模块参数，检查是否是需要量化的 embedding 参数
+    #         if not converted:
+    #             for suffix in quant_embedding_suffixes:
+    #                 if param_name.endswith(suffix):
+    #                     # embedding 参数使用激活值位宽 (int8)
+    #                     param_data = _convert_weight_to_int(param_data, bits=TorchBuilder.QUANT_ACT_BITS)
+    #                     break
         
-        global_vars.update({new_name: param_data})
+    #     global_vars.update({new_name: param_data})
     
-    # 处理 buffers (register_buffer)
-    # 量化模块的 buffer（如 weight_int, bias_int）需要转换为整数类型
-    for buffer_name, buffer in gm.named_buffers():
-        new_name = "g_" + buffer_name.replace(".", "_")
-        buffer_data = buffer.detach().numpy()
+    # # 处理 buffers (register_buffer)
+    # # 量化模块的 buffer（如 weight_int, bias_int）需要转换为整数类型
+    # for buffer_name, buffer in gm.named_buffers():
+    #     new_name = "g_" + buffer_name.replace(".", "_")
+    #     buffer_data = buffer.detach().numpy()
         
-        if enable_quant:
-            # 检查是否是量化模块的 buffer
-            for prefix in quant_module_prefixes:
-                if buffer_name.startswith(prefix + "."):
-                    buffer_suffix = buffer_name[len(prefix)+1:]
-                    # weight_int 应该转换为 int8
-                    if buffer_suffix == "weight_int":
-                        buffer_data = _convert_weight_to_int(buffer_data, bits=TorchBuilder.QUANT_WEIGHT_BITS)
-                    # bias_int 应该转换为 int32
-                    elif buffer_suffix == "bias_int":
-                        buffer_data = _convert_weight_to_int(buffer_data, bits=TorchBuilder.QUANT_BIAS_BITS)
-                    # scale 和 zero 相关的 buffer 保持原样（会在后续定点转换中处理）
-                    break
+    #     if enable_quant:
+    #         # 检查是否是量化模块的 buffer
+    #         for prefix in quant_module_prefixes:
+    #             if buffer_name.startswith(prefix + "."):
+    #                 buffer_suffix = buffer_name[len(prefix)+1:]
+    #                 # weight_int 应该转换为 int8
+    #                 if buffer_suffix == "weight_int":
+    #                     buffer_data = _convert_weight_to_int(buffer_data, bits=TorchBuilder.QUANT_WEIGHT_BITS)
+    #                 # bias_int 应该转换为 int32
+    #                 elif buffer_suffix == "bias_int":
+    #                     buffer_data = _convert_weight_to_int(buffer_data, bits=TorchBuilder.QUANT_BIAS_BITS)
+    #                 # scale 和 zero 相关的 buffer 保持原样（会在后续定点转换中处理）
+    #                 break
         
-        global_vars.update({new_name: buffer_data})
+    #     global_vars.update({new_name: buffer_data})
 
     builder = TorchBuilder(gm, example_inputs, leaf_modules, enable_quant=enable_quant)
     code = builder.build()
@@ -550,7 +562,7 @@ class TorchBuilder:
     
     def __init__(self, gm, example_inputs, leaf_modules=None, 
                  quant_act_bits=None, quant_weight_bits=None, quant_bias_bits=None,
-                 enable_quant=True):
+                 enable_quant=False, quant_config=None):
         self.gm = gm
         self.code = []
         self.input_names = []
@@ -565,6 +577,9 @@ class TorchBuilder:
         
         # 量化开关：控制是否启用量化类型转换
         self.enable_quant = enable_quant
+        if enable_quant and quant_config is None:
+            raise ValueError("QuantConfig is required when enable_quant is True")
+        self.quant_config = quant_config
         
         # 实例级别的量化位宽配置（允许覆盖类级别的默认值）
         self.quant_act_bits = quant_act_bits if quant_act_bits is not None else self.QUANT_ACT_BITS
@@ -1136,10 +1151,23 @@ class TorchBuilder:
             
             # ========== 偏置相关 ==========
             if hasattr(module, 'bias_int'):
+                local_bias_dtype = "int32"
                 if hasattr(module.bias_int, 'shape'):
                     bias_shape = module.bias_int.shape
+                    if isinstance(module, QLinear):
+                        local_bias_dtype = bias_dtype
+                        if module.wgt_per_channel:
+                            raise NotImplementedError("Per-channel quantization is not supported for QLinear")
+                        elif module.act_per_token or not module.act_per_token:
+                            # NOTE: Here is also hard-coded for seq_len usage in bias shape for QLinear which is not classifier
+                            if 'classifier' not in module_name:
+                                bias_shape = (self.quant_config.seq_len, bias_shape[-1])
+                            else:
+                                bias_shape = (1, bias_shape[-1])
+                        else:
+                            raise NotImplementedError("Unsupported QLinear configuration")
                     bias_shape_str = ', '.join(str(s) for s in bias_shape)
-                    declarations.append(f"    {var_prefix}_bias_int: {bias_dtype}[{bias_shape_str}] = g_{var_prefix}_bias_int")
+                    declarations.append(f"    {var_prefix}_bias_int: {local_bias_dtype}[{bias_shape_str}] = g_{var_prefix}_bias_int")
                 
                 if hasattr(module, 'bias_scale'):
                     scale_shape = module.bias_scale.shape
@@ -1421,7 +1449,9 @@ class TorchBuilder:
                     elif module.__class__.__name__ == "QMatMul":
                         return getattr(self, f"build_{module.__class__.__name__}")(node)
                     elif module.__class__.__name__ == "QMatMulIsqrtD":
-                        return getattr(self, f"build_{module.__class__.__name__}")(node)
+                        # Do not expose qmatmul_isqrtd to downstream; the sqrt(dim)
+                        # effect is fused into scales inside the quant module.
+                        return self.build_QMatMul(node)
         if op is None:
             raise NotImplementedError("Unsupported module")
         if op == "linear":
@@ -1832,31 +1862,50 @@ class TorchBuilder:
         dim = node.kwargs["dim"] + (node.kwargs["dim"] < 0) * shape_len
         return f"{node.name} = dsl.concat({tensor_A}, {tensor_B}, axis={dim})"
     
-    def build_ViTGetFirstToken(self, node, shape):
-        shape = (self.example_inputs[0].shape[0], shape[1], shape[2])
-        # 根据输入节点的实际类型选择数据类型
-        # 检查输入参数的类型（从 _node_output_types 查询）
-        dtype_str = "float32"  # 默认值
-        if self.enable_quant and hasattr(self, '_node_output_types'):
-            # 查找输入节点的类型
-            for arg in node.args:
-                if isinstance(arg, fx.Node) and arg.name in self._node_output_types:
-                    output_type = self._node_output_types[arg.name]
-                    if output_type == 'int8':
-                        dtype_str = self._get_quant_dtype_str(self.quant_act_bits)
-                    break
-        # 根据数据类型选择对应的 lib 函数
-        lib_func = ViTGetFirstToken_int8_lib if dtype_str == f"int{self.quant_act_bits}" else ViTGetFirstToken_float32_lib
-        src = inspect.getsource(lib_func(*shape))
-        src = (
-            src.replace("s_0", str(shape[0]))
-            .replace("s_1", str(shape[1]))
-            .replace("s_2", str(shape[2]))
-        )
-        if src not in self.subfunctions:
-            self.subfunctions.append(src)
-        return f"{node.name} = ViTGetFirstToken({', '.join([get_var_name(arg) for arg in node.args])})"
+    # Deprecated
+    # def build_ViTGetFirstToken(self, node, shape):
+    #     shape = (self.example_inputs[0].shape[0], shape[1], shape[2])
+    #     # 根据输入节点的实际类型选择数据类型
+    #     # 检查输入参数的类型（从 _node_output_types 查询）
+    #     dtype_str = "float32"  # 默认值
+    #     if self.enable_quant and hasattr(self, '_node_output_types'):
+    #         # 查找输入节点的类型
+    #         for arg in node.args:
+    #             if isinstance(arg, fx.Node) and arg.name in self._node_output_types:
+    #                 output_type = self._node_output_types[arg.name]
+    #                 if output_type == 'int8':
+    #                     dtype_str = self._get_quant_dtype_str(self.quant_act_bits)
+    #                 break
+    #     # 根据数据类型选择对应的 lib 函数
+    #     lib_func = ViTGetFirstToken_int8_lib if dtype_str == f"int{self.quant_act_bits}" else ViTGetFirstToken_float32_lib
+    #     src = inspect.getsource(lib_func(*shape))
+    #     src = (
+    #         src.replace("s_0", str(shape[0]))
+    #         .replace("s_1", str(shape[1]))
+    #         .replace("s_2", str(shape[2]))
+    #     )
+    #     if src not in self.subfunctions:
+    #         self.subfunctions.append(src)
+    #     return f"{node.name} = ViTGetFirstToken({', '.join([get_var_name(arg) for arg in node.args])})"
     
+    def build_ViTGetFirstToken(self, node, shape):
+        """构建 ViTGetFirstToken 的 DSL 调用
+        
+        功能：从 [B, L, D] 提取第一个 token 得到 [B, 1, D]
+        
+        Args:
+            node: 节点信息
+            shape: 原始 token 形状 (不含 batch)
+        
+        Returns:
+            DSL 调用字符串
+        """
+        # 获取输入变量名
+        inp = get_var_name(node.args[0])
+        
+        # 直接调用 dsl.vit_get_first_token，不需要子函数
+        return f"{node.name} = dsl.vit_get_first_token({inp})"
+
     def build_ViTTokenExpand(self, node, shape):
         shape = (self.example_inputs[0].shape[0], shape[1], shape[2])
         # 根据输入节点的实际类型选择数据类型
@@ -2044,6 +2093,18 @@ class TorchBuilder:
         if hasattr(module, 'output_zero') and module.output_zero is not None:
             output_zero = get_var_name(target_name + "_output_zero")
             kwargs.append(f"ozr={output_zero}")
+
+        name = "unknown"
+        names = node.name.split('_')
+        if names[-1] in ('q', 'k', 'v'):
+            name = "qkvgemm.proj_" + names[-1]
+        elif names[-1] in ('out',):
+            name = "attngemm.proj"
+        elif names[-1] in ('fc1', 'fc2'):
+            name = "ffn." + names[-1]
+        elif names[-1] in ('dense',):
+            name = "classifier.dense"
+        kwargs.append(f"layer_type=\"{name}\"")
         
         # 组装参数字符串
         params_str = ', '.join(str(p) for p in params)
@@ -2285,6 +2346,10 @@ class TorchBuilder:
         y_scale_sign = get_var_name(target_name + "_y_scale_sign")
         y_scale_coe = get_var_name(target_name + "_y_scale_coe")
         y_scale_rshift = get_var_name(target_name + "_y_scale_rshift")
+
+        fused_scale_sign = get_var_name(target_name + "_fused_scale_sign")
+        fused_scale_coe = get_var_name(target_name + "_fused_scale_coe")
+        fused_scale_rshift = get_var_name(target_name + "_fused_scale_rshift")
         
         o_scale_sign = get_var_name(target_name + "_o_scale_sign")
         o_scale_coe = get_var_name(target_name + "_o_scale_coe")
@@ -2298,6 +2363,7 @@ class TorchBuilder:
             inp1, inp2,
             x_scale_sign, x_scale_coe, x_scale_rshift,
             y_scale_sign, y_scale_coe, y_scale_rshift,
+            fused_scale_sign, fused_scale_coe, fused_scale_rshift,
             o_scale_sign, o_scale_coe, o_scale_rshift,
             o_scale_inv_sign, o_scale_inv_coe, o_scale_inv_rshift
         ]
@@ -2334,6 +2400,10 @@ class TorchBuilder:
         y_scale_sign = get_var_name(target_name + "_y_scale_sign")
         y_scale_coe = get_var_name(target_name + "_y_scale_coe")
         y_scale_rshift = get_var_name(target_name + "_y_scale_rshift")
+
+        fused_scale_sign = get_var_name(target_name + "_fused_scale_sign")
+        fused_scale_coe = get_var_name(target_name + "_fused_scale_coe")
+        fused_scale_rshift = get_var_name(target_name + "_fused_scale_rshift")
         
         o_scale_sign = get_var_name(target_name + "_o_scale_sign")
         o_scale_coe = get_var_name(target_name + "_o_scale_coe")
@@ -2347,6 +2417,7 @@ class TorchBuilder:
             inp1, inp2,
             x_scale_sign, x_scale_coe, x_scale_rshift,
             y_scale_sign, y_scale_coe, y_scale_rshift,
+            fused_scale_sign, fused_scale_coe, fused_scale_rshift,
             o_scale_sign, o_scale_coe, o_scale_rshift,
             o_scale_inv_sign, o_scale_inv_coe, o_scale_inv_rshift
         ]

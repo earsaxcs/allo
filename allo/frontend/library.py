@@ -48,20 +48,20 @@ def CoreAttention_lib(s_0, s_1, s_2, s_3):
 
 def ViTGetFirstToken_float32_lib(s_0, s_1, s_2):
     """Generate ViTGetFirstToken function for float32 type."""
-    def ViTGetFirstToken(x: float32[s_0, s_1, s_2]) -> float32[s_0, s_2]:
-        first_token: float32[s_0, s_2]
-        for i, j in dsl.grid(s_0, s_2):
-            first_token[i, j] = x[i, 0, j]
+    def ViTGetFirstToken(x: float32[s_0, s_1, s_2]) -> float32[s_0, 1, s_2]:
+        first_token: float32[s_0, 1, s_2]
+        for i, j, k in dsl.grid(s_0, 1, s_2):
+            first_token[i, j, k] = x[i, 0, k]
         return first_token
     return ViTGetFirstToken
 
 
 def ViTGetFirstToken_int8_lib(s_0, s_1, s_2):
     """Generate ViTGetFirstToken function for int8 type."""
-    def ViTGetFirstToken(x: int8[s_0, s_1, s_2]) -> int8[s_0, s_2]:
-        first_token: int8[s_0, s_2]
-        for i, j in dsl.grid(s_0, s_2):
-            first_token[i, j] = x[i, 0, j]
+    def ViTGetFirstToken(x: int8[s_0, s_1, s_2]) -> int8[s_0, 1, s_2]:
+        first_token: int8[s_0, 1, s_2]
+        for i, j, k in dsl.grid(s_0, 1, s_2):
+            first_token[i, j, k] = x[i, 0, k]
         return first_token
     return ViTGetFirstToken
 

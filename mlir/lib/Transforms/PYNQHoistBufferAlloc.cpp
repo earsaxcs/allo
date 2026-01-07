@@ -37,6 +37,7 @@
  * ```
  */
 
+#include "PassDetail.h"
 #include "allo/Transforms/Passes.h"
 #include "allo/Dialect/PYNQDialect.h"
 #include "allo/Dialect/PYNQTypes.h"
@@ -44,7 +45,6 @@
 
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Pass/Pass.h"
-#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/IRMapping.h"
 
 #include "llvm/ADT/SmallVector.h"

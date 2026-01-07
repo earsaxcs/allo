@@ -135,6 +135,7 @@ def Vivado_QMatMulOp : Vivado_Op<"qmatmul", [AttrSizedOperandSegments]> {
     AnyShaped:$rhs,
     ScaleType:$x_scale,
     ScaleType:$y_scale,
+    ScaleType:$fused_scale,
     ScaleType:$o_scale,
     ScaleType:$o_scale_inv,
     Optional<ZeroType>:$x_zero,
@@ -153,22 +154,38 @@ def Vivado_QMatMulOp : Vivado_Op<"qmatmul", [AttrSizedOperandSegments]> {
     DefaultValuedAttr<StrAttr, "\"i32\"">:$accumulator_type,
     DefaultValuedAttr<StrAttr, "\"inline\"">:$requant_mode,
     DefaultValuedAttr<StrAttr, "\"8,24,8,16,16,0\"">:$scale_packing,
-    DefaultValuedAttr<StrAttr, "\"Tail\"">:$scale_coe_mode
+    DefaultValuedAttr<StrAttr, "\"Tail\"">:$scale_coe_mode,
+    
+    // Transpose mode attribute
+    // - transpose_mode = false: op uses standard (non-transpose) semantics; is_transposed is ignored.
+    // - transpose_mode = true: op interprets its inputs/logic in transpose-mode.
+    // is_transposed indicates whether the *output memref* is in transposed layout.
+    DefaultValuedAttr<BoolAttr, "false">:$transpose_mode,
+    DefaultValuedAttr<BoolAttr, "false">:$is_transposed,
+
+    // RHS (second input) layout tag.
+    // Supported: "bhld", "blhd", "bhdl". Default is "bhld".
+    DefaultValuedAttr<StrAttr, "\"bhld\"">:$rhs_layout,
+
+    // RHS reduce axis location (dimension index on RHS tensor/memref).
+    // This tracks where the logical token-length axis `l` resides under rhs_layout.
+    // Default 2 matches rhs_layout="bhld".
+    DefaultValuedAttr<I32Attr, "2">:$reduce_dim
   );
   
   let results = (outs);
   
   let assemblyFormat = [{
     `(` $output `,` $lhs `,` $rhs `,`
-        $x_scale `,` $y_scale `,` $o_scale `,` $o_scale_inv
+      $x_scale `,` $y_scale `,` $fused_scale `,` $o_scale `,` $o_scale_inv
         (`x_zero` `=` $x_zero^ `:` type($x_zero))?
         (`y_zero` `=` $y_zero^ `:` type($y_zero))?
         (`o_zero` `=` $o_zero^ `:` type($o_zero))? `)` attr-dict `:` 
         type($output) `,` type($lhs) `,` type($rhs) `,`
-        type($x_scale) `,` type($y_scale) `,` type($o_scale) `,` type($o_scale_inv)
+      type($x_scale) `,` type($y_scale) `,` type($fused_scale) `,` type($o_scale) `,` type($o_scale_inv)
   }];
-  
-  // let hasVerifier = 1;
+
+  let hasVerifier = 1;
 }
 
 //===----------------------------------------------------------------------===//
@@ -187,6 +204,17 @@ def Vivado_QLinearOp : Vivado_Op<"qlinear", [AttrSizedOperandSegments]> {
     **Attributes:** Same as vivado.qmatmul, with additional:
     - **bias_buffer_id** (optional): Explicit buffer for bias (default: buffer 7)
     - **fuse_bias** (optional): Whether to fuse bias into matmul instruction
+    
+    **Layer Type Attribute:**
+    The layer_type attribute identifies the role of this linear layer in the network:
+    - "qkvgemm.proj_q": Query projection in multi-head attention
+    - "qkvgemm.proj_k": Key projection in multi-head attention
+    - "qkvgemm.proj_v": Value projection in multi-head attention
+    - "attngemm.proj": Output projection after attention
+    - "ffn.fc1": First FC layer in feed-forward network
+    - "ffn.fc2": Second FC layer in feed-forward network
+    - "classifier.dense": Classification head
+    - "unknown": Default for unspecified layers
     
     **Lowering:** Can be lowered to vivado.qmatmul + bias handling, or directly
     to PYNQ instructions with bias support.
@@ -219,7 +247,17 @@ def Vivado_QLinearOp : Vivado_Op<"qlinear", [AttrSizedOperandSegments]> {
     DefaultValuedAttr<StrAttr, "\"i32\"">:$accumulator_type,
     DefaultValuedAttr<StrAttr, "\"inline\"">:$requant_mode,
     DefaultValuedAttr<StrAttr, "\"8,24,8,16,16,0\"">:$scale_packing,
-    DefaultValuedAttr<StrAttr, "\"Tail\"">:$scale_coe_mode
+    DefaultValuedAttr<StrAttr, "\"Tail\"">:$scale_coe_mode,
+    
+    // Transpose mode attribute
+    // - transpose_mode = false: op uses standard (non-transpose) semantics; is_transposed is ignored.
+    // - transpose_mode = true: op interprets its inputs/logic in transpose-mode.
+    // is_transposed indicates whether the *output memref* is in transposed layout.
+    DefaultValuedAttr<BoolAttr, "false">:$transpose_mode,
+    DefaultValuedAttr<BoolAttr, "false">:$is_transposed,
+    
+    // Layer type identification for optimization
+    DefaultValuedAttr<StrAttr, "\"unknown\"">:$layer_type
   );
   
   let results = (outs);
@@ -236,6 +274,7 @@ def Vivado_QLinearOp : Vivado_Op<"qlinear", [AttrSizedOperandSegments]> {
         (`,` type($bscl)^)?
   }];
   
+    let hasVerifier = 1;
   // let hasVerifier = 1;
 }
 
@@ -273,7 +312,14 @@ def Vivado_QAddOp : Vivado_Op<"qadd", [AttrSizedOperandSegments]> {
     DefaultValuedAttr<BoolAttr, "false">:$fuse_into_producer,
     DefaultValuedAttr<BoolAttr, "true">:$vectorize,
     DefaultValuedAttr<StrAttr, "\"8,24,8,16,16,0\"">:$scale_packing,
-    DefaultValuedAttr<StrAttr, "\"Tail\"">:$scale_coe_mode
+    DefaultValuedAttr<StrAttr, "\"Tail\"">:$scale_coe_mode,
+    
+    // Transpose mode attribute
+    // - transpose_mode = false: op uses standard (non-transpose) semantics; is_transposed is ignored.
+    // - transpose_mode = true: op interprets its inputs/logic in transpose-mode.
+    // is_transposed indicates whether the *output memref* is in transposed layout.
+    DefaultValuedAttr<BoolAttr, "false">:$transpose_mode,
+    DefaultValuedAttr<BoolAttr, "false">:$is_transposed
   );
   
   let results = (outs);
@@ -288,6 +334,8 @@ def Vivado_QAddOp : Vivado_Op<"qadd", [AttrSizedOperandSegments]> {
         type($output) `,` type($lhs) `,` type($rhs) `,`
         type($x_scale) `,` type($y_scale) `,` type($o_scale) `,` type($o_scale_inv)
   }];
+  
+  let hasVerifier = 1;
 }
 
 //===----------------------------------------------------------------------===//
@@ -324,7 +372,14 @@ def Vivado_IntGELUOp : Vivado_Op<"int_gelu", [AttrSizedOperandSegments]> {
     
     DefaultValuedAttr<StrAttr, "\"lut\"">:$implementation,  // "lut" or "polynomial"
     DefaultValuedAttr<StrAttr, "\"8,24,8,16,16,0\"">:$scale_packing,
-    DefaultValuedAttr<StrAttr, "\"Tail\"">:$scale_coe_mode
+    DefaultValuedAttr<StrAttr, "\"Tail\"">:$scale_coe_mode,
+    
+    // Transpose mode attribute
+    // - transpose_mode = false: op uses standard (non-transpose) semantics; is_transposed is ignored.
+    // - transpose_mode = true: op interprets its inputs/logic in transpose-mode.
+    // is_transposed indicates whether the *output memref* is in transposed layout.
+    DefaultValuedAttr<BoolAttr, "false">:$transpose_mode,
+    DefaultValuedAttr<BoolAttr, "false">:$is_transposed
   );
   
   let results = (outs);
@@ -360,7 +415,14 @@ def Vivado_IntSoftmaxOp : Vivado_Op<"int_softmax", [AttrSizedOperandSegments]> {
     
     DefaultValuedAttr<StrAttr, "\"lut\"">:$implementation,
     DefaultValuedAttr<StrAttr, "\"8,24,8,16,16,0\"">:$scale_packing,
-    DefaultValuedAttr<StrAttr, "\"Tail\"">:$scale_coe_mode
+    DefaultValuedAttr<StrAttr, "\"Tail\"">:$scale_coe_mode,
+    
+    // Transpose mode attribute
+    // - transpose_mode = false: op uses standard (non-transpose) semantics; is_transposed is ignored.
+    // - transpose_mode = true: op interprets its inputs/logic in transpose-mode.
+    // is_transposed indicates whether the *output memref* is in transposed layout.
+    DefaultValuedAttr<BoolAttr, "false">:$transpose_mode,
+    DefaultValuedAttr<BoolAttr, "false">:$is_transposed
   );
   
   let results = (outs);
@@ -401,7 +463,14 @@ def Vivado_IntLayerNormOp : Vivado_Op<"int_layernorm", [AttrSizedOperandSegments
     
     DefaultValuedAttr<StrAttr, "\"approx\"">:$rsqrt_method,  // "approx" or "lut"
     DefaultValuedAttr<StrAttr, "\"8,24,8,16,16,0\"">:$scale_packing,
-    DefaultValuedAttr<StrAttr, "\"Tail\"">:$scale_coe_mode
+    DefaultValuedAttr<StrAttr, "\"Tail\"">:$scale_coe_mode,
+    
+    // Transpose mode attribute
+    // - transpose_mode = false: op uses standard (non-transpose) semantics; is_transposed is ignored.
+    // - transpose_mode = true: op interprets its inputs/logic in transpose-mode.
+    // is_transposed indicates whether the *output memref* is in transposed layout.
+    DefaultValuedAttr<BoolAttr, "false">:$transpose_mode,
+    DefaultValuedAttr<BoolAttr, "false">:$is_transposed
   );
   
   let results = (outs);
@@ -459,7 +528,14 @@ def Vivado_QConv2dOp : Vivado_Op<"qconv2d", [AttrSizedOperandSegments]> {
     DefaultValuedAttr<StrAttr, "\"i32\"">:$accumulator_type,
     DefaultValuedAttr<StrAttr, "\"inline\"">:$requant_mode,
     DefaultValuedAttr<StrAttr, "\"8,24,8,16,16,0\"">:$scale_packing,
-    DefaultValuedAttr<StrAttr, "\"Tail\"">:$scale_coe_mode
+    DefaultValuedAttr<StrAttr, "\"Tail\"">:$scale_coe_mode,
+    
+    // Transpose mode attribute
+    // - transpose_mode = false: op uses standard (non-transpose) semantics; is_transposed is ignored.
+    // - transpose_mode = true: op interprets its inputs/logic in transpose-mode.
+    // is_transposed indicates whether the *output memref* is in transposed layout.
+    DefaultValuedAttr<BoolAttr, "false">:$transpose_mode,
+    DefaultValuedAttr<BoolAttr, "false">:$is_transposed
   );
   
   let results = (outs);
@@ -497,6 +573,7 @@ def Vivado_QMatMulIsqrtDOp : Vivado_Op<"qmatmul_isqrtd", [AttrSizedOperandSegmen
     AnyShaped:$rhs,
     ScaleType:$x_scale,
     ScaleType:$y_scale,
+    ScaleType:$fused_scale,
     ScaleType:$o_scale,
     ScaleType:$o_scale_inv,
     Optional<ZeroType>:$x_zero,
@@ -515,21 +592,39 @@ def Vivado_QMatMulIsqrtDOp : Vivado_Op<"qmatmul_isqrtd", [AttrSizedOperandSegmen
     DefaultValuedAttr<StrAttr, "\"i32\"">:$accumulator_type,
     DefaultValuedAttr<StrAttr, "\"inline\"">:$requant_mode,
     DefaultValuedAttr<StrAttr, "\"8,24,8,16,16,0\"">:$scale_packing,
-    DefaultValuedAttr<StrAttr, "\"Tail\"">:$scale_coe_mode
+    DefaultValuedAttr<StrAttr, "\"Tail\"">:$scale_coe_mode,
+    
+    // Transpose mode attribute
+    // - transpose_mode = false: op uses standard (non-transpose) semantics; is_transposed is ignored.
+    // - transpose_mode = true: op interprets its inputs/logic in transpose-mode.
+    // is_transposed indicates whether the *output memref* is in transposed layout.
+    DefaultValuedAttr<BoolAttr, "false">:$transpose_mode,
+    DefaultValuedAttr<BoolAttr, "false">:$is_transposed,
+
+    // RHS (second input) layout tag.
+    // Supported: "bhld", "bhdl", "blhd", "bhdl". Default is "bhld".
+    DefaultValuedAttr<StrAttr, "\"bhld\"">:$rhs_layout,
+
+    // RHS reduce axis location (dimension index on RHS tensor/memref).
+    // This tracks where the logical token-length axis `l` resides under rhs_layout.
+    // Default 2 matches rhs_layout="bhld".
+    DefaultValuedAttr<I32Attr, "2">:$reduce_dim
   );
   
   let results = (outs);
   
   let assemblyFormat = [{
     `(` $output `,` $lhs `,` $rhs `,`
-        $x_scale `,` $y_scale `,` $o_scale `,` $o_scale_inv
+      $x_scale `,` $y_scale `,` $fused_scale `,` $o_scale `,` $o_scale_inv
         (`x_zero` `=` $x_zero^ `:` type($x_zero))?
         (`y_zero` `=` $y_zero^ `:` type($y_zero))?
         (`o_zero` `=` $o_zero^ `:` type($o_zero))? `)`
         attr-dict `:` 
         type($output) `,` type($lhs) `,` type($rhs) `,`
-        type($x_scale) `,` type($y_scale) `,` type($o_scale) `,` type($o_scale_inv)
+      type($x_scale) `,` type($y_scale) `,` type($fused_scale) `,` type($o_scale) `,` type($o_scale_inv)
   }];
+
+  let hasVerifier = 1;
 }
 
 //===----------------------------------------------------------------------===//
@@ -583,7 +678,14 @@ def Vivado_QuantOp : Vivado_Op<"quant", []> {
     // Backend-specific attributes
     I8Attr:$quant_mode,               // Quantization mode (0-3)
     DefaultValuedAttr<StrAttr, "\"8,24,8,16,16,0\"">:$scale_packing,
-    DefaultValuedAttr<StrAttr, "\"Tail\"">:$scale_coe_mode
+    DefaultValuedAttr<StrAttr, "\"Tail\"">:$scale_coe_mode,
+    
+    // Transpose mode attribute
+    // - transpose_mode = false: op uses standard (non-transpose) semantics; is_transposed is ignored.
+    // - transpose_mode = true: op interprets its inputs/logic in transpose-mode.
+    // is_transposed indicates whether the *output memref* is in transposed layout.
+    DefaultValuedAttr<BoolAttr, "false">:$transpose_mode,
+    DefaultValuedAttr<BoolAttr, "false">:$is_transposed
   );
   
   let results = (outs);
@@ -631,7 +733,14 @@ def Vivado_DequantOp : Vivado_Op<"dequant", [/*AttrSizedOperandSegments*/]> {
     // Backend-specific attributes
     I8Attr:$quant_mode,               // Quantization mode (0-3)
     DefaultValuedAttr<StrAttr, "\"8,24,8,16,16,0\"">:$scale_packing,
-    DefaultValuedAttr<StrAttr, "\"Tail\"">:$scale_coe_mode
+    DefaultValuedAttr<StrAttr, "\"Tail\"">:$scale_coe_mode,
+    
+    // Transpose mode attribute
+    // - transpose_mode = false: op uses standard (non-transpose) semantics; is_transposed is ignored.
+    // - transpose_mode = true: op interprets its inputs/logic in transpose-mode.
+    // is_transposed indicates whether the *output memref* is in transposed layout.
+    DefaultValuedAttr<BoolAttr, "false">:$transpose_mode,
+    DefaultValuedAttr<BoolAttr, "false">:$is_transposed
   );
   
   let results = (outs);
@@ -642,4 +751,228 @@ def Vivado_DequantOp : Vivado_Op<"dequant", [/*AttrSizedOperandSegments*/]> {
         `quant_mode` `=` $quant_mode attr-dict `:` 
         type($output) `,` type($input) `,` type($scale)
   }];
+}
+
+//===----------------------------------------------------------------------===//
+// Vivado ViT-specific Operations
+//===----------------------------------------------------------------------===//
+
+def Vivado_ViTGetFirstTokenOp : Vivado_Op<"vit_get_first_token", []> {
+  let summary = "Extract first token from sequence for Vivado/PYNQ backend";
+  let description = [{
+    Backend-specific operation to extract the first token from a sequence.
+    Input: [B, L, D], Output: [B, 1, D].
+    
+    **Backend-Specific Attributes:**
+    - **is_transposed** (optional, default: false)
+      Layout hint for hardware implementation.
+      false: standard (B, L, D) layout
+      true: transposed (B, D, L) layout
+    
+    **Lowering Target:**
+    This op will be lowered to simple memory copy/slice operations.
+  }];
+  let arguments = (ins 
+    AnyShaped:$output,
+    AnyShaped:$input,
+    // Transpose mode attribute
+    // - transpose_mode = false: op uses standard (non-transpose) semantics; is_transposed is ignored.
+    // - transpose_mode = true: op interprets its inputs/logic in transpose-mode.
+    // is_transposed indicates whether the *output memref* is in transposed layout.
+    DefaultValuedAttr<BoolAttr, "false">:$transpose_mode,
+    DefaultValuedAttr<BoolAttr, "false">:$is_transposed
+  );
+  let results = (outs);
+  let assemblyFormat = [{
+    `(` $output `,` $input `)` attr-dict `:` type($output) `,` type($input)
+  }];
+}
+
+//===----------------------------------------------------------------------===//
+// Vivado Activation Layout Transpose Op
+//===----------------------------------------------------------------------===//
+
+def Vivado_ActivationLayoutTransposeOp : Vivado_Op<"activation_layout_transpose", []> {
+  let summary = "Transpose activation tensor between (B,L,D) and (B,D,L) layouts";
+  let description = [{
+    Explicitly transposes activation tensors between standard layout and
+    hardware-friendly transposed layout.
+    
+    **Purpose:**
+    This op is inserted at model boundaries (entry/exit of transformer blocks)
+    to convert between:
+    - Standard layout: (Batch, SeqLen, EmbedDim) - used by embedding layers
+    - Transposed layout: (Batch, EmbedDim, SeqLen) - used by hardware accelerators
+    
+    **Key Points:**
+    1. Only used at boundaries - NOT inside transformer blocks
+    2. Inside transformer blocks, all ops work in transposed layout (is_transposed=true)
+    3. Batch dimension is preserved, only L and D dimensions are swapped
+    
+    **Usage Pattern:**
+    ```
+    [Embedding Layer] -> (B, L, D)
+                            |
+                vivado.activation_layout_transpose (to_transposed=true)
+                            |
+                         (B, D, L)
+                            |
+    [Transformer Blocks with is_transposed=true]
+                            |
+                         (B, D, L)
+                            |
+                vivado.activation_layout_transpose (to_transposed=false)
+                            |
+                         (B, L, D)
+    [Output Layer]
+    ```
+    
+    **Hardware Motivation:**
+    Hardware matmul uses (K,M) x (K,N) = (M,N) format where reduce dimension K
+    is exposed in row direction. Transposed layout aligns activations for this.
+  }];
+  
+  let arguments = (ins 
+    AnyShaped:$output,    // Output tensor with transposed layout
+    AnyShaped:$input,     // Input tensor with original layout
+    
+    // Direction of transpose
+    // true: (B, L, D) -> (B, D, L) [entering transformer blocks]
+    // false: (B, D, L) -> (B, L, D) [exiting transformer blocks]
+    BoolAttr:$to_transposed
+  );
+  
+  let results = (outs);
+  
+  let assemblyFormat = [{
+    `(` $output `,` $input `)` `to_transposed` `=` $to_transposed attr-dict `:` 
+    type($output) `,` type($input)
+  }];
+  
+  // let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
+// Vivado Activation Dynamic Padding Op
+//===----------------------------------------------------------------------===//
+
+def Vivado_ActivationDynamicPadOp : Vivado_Op<"activation_dynamic_pad", []> {
+  let summary = "Pad/unpad activation last dimension with zeros";
+  let description = [{
+    Inserts a boundary-only dynamic padding (zero-padding) for activation tensors.
+
+    **Goal:**
+    Align the *last* (contiguous) dimension of an activation buffer to a multiple
+    of the hardware alignment unit (e.g. InstrConfig::kTileSize).
+
+    **Usage Pattern:**
+    This op is intended to be inserted ONLY at the beginning and end of a
+    quantized region, so that intermediate buffers keep a padded shape without
+    requiring per-op dynamic padding.
+
+    - to_padded = true: copy input into output and fill padded tail with 0
+    - to_padded = false: copy the non-padded prefix back to output
+
+    **Notes:**
+    - Rank can be 2/3/4; padding applies to the last dimension.
+    - This is a semantic boundary op; lowering may map it to nested loops or
+      memref copies depending on backend.
+  }];
+
+  let arguments = (ins
+    AnyShaped:$output,
+    AnyShaped:$input,
+
+    // Direction:
+    // true: unpadded -> padded (zero-fill tail)
+    // false: padded -> unpadded (drop tail)
+    BoolAttr:$to_padded
+  );
+
+  let results = (outs);
+
+  let assemblyFormat = [{
+    `(` $output `,` $input `)` `to_padded` `=` $to_padded attr-dict `:`
+    type($output) `,` type($input)
+  }];
+}
+
+//===----------------------------------------------------------------------===//
+// Vivado Scale Conversion Op
+//===----------------------------------------------------------------------===//
+
+def Vivado_ScaleConversionOp : Vivado_Op<"scale_conversion", [AttrSizedOperandSegments]> {
+  let summary = "Convert quantization scale between different modes";
+  let description = [{
+    Converts tensor quantization from one scale mode to another.
+    
+    **Purpose:**
+    This operation bridges quantization scale mismatches between operations.
+    For example, LayerNorm may output per-channel quantization, but the next
+    operation may expect per-token quantization. This op performs the requantization
+    to match scale modes.
+    
+    **Scale Modes:**
+    - 0 (kPerTensor): Single scale for entire tensor
+    - 1 (kPerChannel): Separate scale per channel (output dimension)
+    - 2 (kPerToken): Separate scale per token (sequence dimension)
+    
+    **Semantics:**
+    1. Dequantize input: x_float = (x_int - input_zero) * input_scale
+    2. Requantize output: y_int = round(x_float / output_scale) + output_zero
+    
+    **Example:**
+    LayerNorm output: per-channel scale (scale per D dimension)
+    Next op expectation: per-token scale (scale per L dimension)
+    This op performs: (B,L,D) with per-channel -> (B,L,D) with per-token
+    
+    **Usage Pattern:**
+    ```mlir
+    vivado.int_layernorm(...) -> %layernorm_out with per-channel scale
+                                      |
+    vivado.scale_conversion(%output, %layernorm_out, 
+                            %input_scale, %output_scale)
+      {input_scale_mode = 1 : i8,    // per-channel
+       output_scale_mode = 2 : i8}   // per-token
+                                      |
+    vivado.qmatmul(...) expects per-token scale
+    ```
+  }];
+  
+  let arguments = (ins 
+    AnyShaped:$output,              // Output: requantized tensor (pre-allocated)
+    AnyShaped:$input,               // Input: quantized tensor to convert
+    ScaleType:$input_scale,         // Input scale (packed format)
+    ScaleType:$output_scale,        // Output scale (packed format)
+    Optional<ZeroType>:$input_zero, // Input zero point (for asymmetric)
+    Optional<ZeroType>:$output_zero,// Output zero point (for asymmetric)
+    
+    // Scale mode attributes
+    I8Attr:$input_scale_mode,       // 0=per-tensor, 1=per-channel, 2=per-token
+    I8Attr:$output_scale_mode,      // 0=per-tensor, 1=per-channel, 2=per-token
+    
+    // Backend-specific attributes
+    DefaultValuedAttr<StrAttr, "\"8,24,8,16,16,0\"">:$scale_packing,
+    DefaultValuedAttr<StrAttr, "\"Tail\"">:$scale_coe_mode,
+    
+    // Transpose mode attribute
+    // - transpose_mode = false: op uses standard (non-transpose) semantics; is_transposed is ignored.
+    // - transpose_mode = true: op interprets its inputs/logic in transpose-mode.
+    // is_transposed indicates whether the *output memref* is in transposed layout.
+    DefaultValuedAttr<BoolAttr, "false">:$transpose_mode,
+    DefaultValuedAttr<BoolAttr, "false">:$is_transposed
+  );
+  
+  let results = (outs);
+  
+  let assemblyFormat = [{
+    `(` $output `,` $input `,` $input_scale `,` $output_scale
+        (`input_zero` `=` $input_zero^ `:` type($input_zero))?
+        (`output_zero` `=` $output_zero^ `:` type($output_zero))? `)`
+        `input_scale_mode` `=` $input_scale_mode `,`
+        `output_scale_mode` `=` $output_scale_mode attr-dict `:` 
+        type($output) `,` type($input) `,` type($input_scale) `,` type($output_scale)
+  }];
+  
+  // let hasVerifier = 1;
 }

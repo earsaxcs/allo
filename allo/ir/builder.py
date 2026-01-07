@@ -1689,6 +1689,12 @@ class ASTTransformer(ASTBuilder):
             module.operation.attributes["allo.quant.fixed_bits"] = IntegerAttr.get(
                 IntegerType.get_signless(32), fixed_bits
             )
+        # Attach batch size as a module attribute for downstream MLIR passes
+        if "__allo_batch__" in ctx.global_vars:
+            batch = int(ctx.global_vars["__allo_batch__"])
+            module.operation.attributes["allo.batch"] = IntegerAttr.get(
+                IntegerType.get_signless(32), batch
+            )
         ctx.set_ip(module.body)
         for stmt in node.body:
             build_stmt(ctx, stmt)
@@ -1975,6 +1981,7 @@ class ASTTransformer(ASTBuilder):
                 # quant/dequant
                 "quant",
                 "dequant",
+                "vit_get_first_token",
             }:
                 return ASTTransformer.build_library_op(
                     ctx, node=node, attr=fn_name, new_args=new_args
@@ -2038,6 +2045,29 @@ class ASTTransformer(ASTBuilder):
         return call_op
 
     @staticmethod
+    def build_vit_get_first_token_op(ctx, node, new_args, output_buffer):
+        """Build allo.vit_get_first_token operation.
+        
+        Args:
+            ctx: builder context
+            node: AST node
+            new_args: [input] - the input tensor [B, L, D]
+            output_buffer: pre-allocated output buffer [B, 1, D]
+        """
+        if len(new_args) != 1:
+            raise ValueError(f"vit_get_first_token expects 1 argument (input), got {len(new_args)}")
+        
+        input_val = new_args[0]
+        if isinstance(input_val, MockConstant):
+            input_val = input_val.result
+        elif hasattr(input_val, "result"):
+            input_val = input_val.result
+        
+        ip = ctx.get_ip()
+        allo_d.ViTGetFirstTokenOp(output_buffer, input_val, ip=ip)
+        return output_buffer
+
+    @staticmethod
     def build_library_op(ctx, node, attr, new_args, dtype=None, shape=None):
         assert attr is not None and attr != ""
         ip = ctx.get_ip()
@@ -2061,6 +2091,9 @@ class ASTTransformer(ASTBuilder):
                 "dequant",
             }:
                 return quant_ops_builder.build_quant_placeholder(ctx, node, attr, new_args, alloc_op.result, transformer_cls=ASTTransformer)
+            if attr in {"vit_get_first_token"}:
+                # TODO: 26.1.6
+                return ASTTransformer.build_vit_get_first_token_op(ctx, node, new_args, alloc_op.result)
             if attr == "concat":
                 axis = node.keywords[0].value.value
                 strides = [1] * len(shape)

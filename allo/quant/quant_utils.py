@@ -86,7 +86,7 @@ def max_min_quantize_params(
                 if DEBUG_QUANT:
                     print(f"Info: Inferring channel_dim={actual_channel_dim} for {ndim}D tensor based on is_weight={is_weight}.")
             elif ndim == 3:
-                # NOTICE: is_weight==False means its per-token currently
+                # NOTE: is_weight==False means its per-token currently
                 actual_channel_dim = 1
                 if DEBUG_QUANT:
                     print(f"Info: Inferring channel_dim={actual_channel_dim} for {ndim}D tensor.")
@@ -267,10 +267,12 @@ def mean_std_quantize_params(
                     print(f"Info: Inferring channel_dim={actual_channel_dim} for {ndim}D tensor based on is_weight={is_weight}.")
             elif ndim == 3:
                 # Typical for Transformer/RNN Activation [B, S, E] (dim 2)
-                actual_channel_dim = 2
+                # NOTE: is_weight==False means its per-token currently
+                actual_channel_dim = 1
                 if DEBUG_QUANT:
                     print(f"Info: Inferring channel_dim={actual_channel_dim} for {ndim}D tensor.")
                 if is_weight:
+                    actual_channel_dim = 2
                     if DEBUG_QUANT:
                         print("Info: Assuming 3D tensor is activation-like for per-channel inference. If it's a 3D weight, manually set channel_dim.")
             elif ndim == 4:
@@ -401,7 +403,10 @@ def linear_quantize(input, scale, zero_point, is_weight):
             scale = scale.view(-1)
             zero_point = zero_point.view(-1)
     else:
-        if len(input.shape) == 2:
+        if len(input.shape) == 1:
+            scale = scale.view(-1)
+            zero_point = zero_point.view(-1)
+        elif len(input.shape) == 2:
             scale = scale.view(1, -1)
             zero_point = zero_point.view(1, -1)
         # TODO: bmm?

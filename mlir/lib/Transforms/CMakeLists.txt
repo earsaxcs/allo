@@ -14,6 +14,12 @@ add_mlir_library(MLIRAlloPasses
     MergeSubviewAndCopy.cpp
     PYNQHoistBufferAlloc.cpp
     PYNQBufferAllocation.cpp
+    RepackVivadoScales.cpp
+    ToggleVivadoTranspose.cpp
+    VivadoQLinearKSplit.cpp
+    VivadoSeparateBias.cpp
+    InsertScaleConversionAfterLayerNorm.cpp
+    VivadoPadding.cpp
 
     ADDITIONAL_HEADER_DIRS
     ${PROJECT_SOURCE_DIR}/include/allo
@@ -24,6 +30,7 @@ add_mlir_library(MLIRAlloPasses
     MLIRAlloPassesIncGen
     MLIRPYNQOpsIncGen
     MLIRPYNQTypesIncGen
+    MLIRVivadoOpsIncGen
 
     LINK_COMPONENTS
     Core

@@ -24,7 +24,6 @@ std::unique_ptr<OperationPass<ModuleOp>> createLowerCompositeTypePass();
 std::unique_ptr<OperationPass<ModuleOp>> createLowerBitOpsPass();
 std::unique_ptr<OperationPass<ModuleOp>> createLowerPrintOpsPass();
 std::unique_ptr<OperationPass<ModuleOp>> createLowerAlloQuantToVivadoPass();
-std::unique_ptr<OperationPass<ModuleOp>> createRepackVivadoScalesPass();
 std::unique_ptr<OperationPass<ModuleOp>> createLowerVivadoToPYNQPass();
 
 bool applyAlloToLLVMLoweringPass(ModuleOp &module, MLIRContext &context);

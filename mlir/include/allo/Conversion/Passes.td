@@ -53,34 +53,6 @@ def LowerAlloQuantToVivado : Pass<"lower-allo-quant-to-vivado", "ModuleOp"> {
   let dependentDialects = ["mlir::allo::vivado::VivadoDialect"];
 }
 
-def RepackVivadoScales : Pass<"repack-vivado-scales", "ModuleOp"> {
-  let summary = "Repack Vivado quantized op scale parameters";
-  let description = [{
-    This pass transforms packed scale parameters from one format to another
-    according to global packing configuration strings. The primary use case is
-    converting scale formats after lowering to Vivado ops.
-    
-    Transformation details:
-    - Source format example: "8,24,8,16,16,0" (Tail mode)
-      Layout: sign[31:24] | rshift[23:16] | coe[15:0]
-    - Target format example: "0,22,6,16,16,0" (Full mode, sign-fused)
-      Layout: rshift[27:22] | coe[21:0] (two's complement)
-    
-    The pass performs:
-    1. Tail->Full mode conversion (adds explicit leading 1 to coefficient)
-    2. Sign fusion (converts signed coefficient to two's complement)
-    3. Bit width adjustments (e.g., 16->22 bits for coefficient)
-    4. rshift correction for bit width changes
-    
-    Supports all Vivado quantized operations:
-    - vivado.qmatmul, vivado.qlinear, vivado.qadd
-    - vivado.int_gelu, vivado.int_softmax, vivado.int_layernorm
-    - vivado.qconv2d, vivado.qmatmul_isqrtd
-  }];
-  let constructor = "mlir::allo::createRepackVivadoScalesPass()";
-  let dependentDialects = ["mlir::allo::vivado::VivadoDialect"];
-}
-
 def LowerVivadoToPYNQ : Pass<"lower-vivado-to-pynq", "ModuleOp"> {
   let summary = "Lower Vivado backend ops to PYNQ hardware instructions";
   let description = [{

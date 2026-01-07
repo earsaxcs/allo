@@ -45,19 +45,39 @@ except ImportError:
 # GLOBAL SETTINGS
 DEFAULT_ACT_BIT = 8
 DEFAULT_WEIGHT_BIT = 8
-DEFAULT_BIAS_BIT = 32
+DEFAULT_BIAS_BIT = 8
 
+# Global configuration for quantization
+# SCALE_FIXED_BITS: Number of bits used to represent scale coefficient in [0.5, 1.0)
+# Default: 17 bits (coe ∈ [65536, 131071] represents [0.5, 1.0))
+# This value should match kExpectedAlloFixedBits in LowerAlloQuantToVivado.cpp
+#
+# Configuration Flow:
+# 1. Set SCALE_FIXED_BITS here (default: 17)
+# 2. float_to_fixed_point() uses this to convert scales: coe = value * 2^SCALE_FIXED_BITS
+# 3. In LowerAlloQuantToVivado.cpp, kExpectedAlloFixedBits should match this value
+# 4. The lowering pass validates and packs coe according to scale_coe_mode (Tail/Full)
+#
+# Example:
+#   SCALE_FIXED_BITS = 17 means:
+#   - scale 0.5 → coe = 0.5 * 2^17 = 65536 = 0b10000000000000000
+#   - scale 0.625 → coe = 0.625 * 2^17 = 81920 = 0b10100000000000000
+#   - Tail mode: stores low 16 bits (variant part)
+#   - Full mode: stores high 16 bits (including leading 1)
+DEFAULT_SCALE_FIXED_BITS = 17
+
+DEFAULT_SEQ_LEN = 197  # Default sequence length for models like ViT
 @dataclass
 class LayerQuantConfig:
     """Configuration for a single layer's quantization parameters."""
     # Common parameters
-    act_bit: int = 8
+    act_bit: int = DEFAULT_ACT_BIT
     act_quant_mode: str = "sym"  # "sym" or "asym"
     act_per_token: bool = False  # per-token (True) or per-tensor (False)
     
     # Linear/Conv specific
-    weight_bit: int = 8
-    bias_bit: int = 32
+    weight_bit: int = DEFAULT_WEIGHT_BIT
+    bias_bit: int = DEFAULT_BIAS_BIT
     wgt_per_channel: bool = False
     
     # Softmax specific
@@ -68,6 +88,7 @@ class LayerQuantConfig:
     
     # LayerNorm specific
     act_per_channel: bool = False
+    int_cal_mode: str = "I-ViT"
     
     # MatMul specific (inherits act_* params)
     
@@ -85,6 +106,7 @@ class LayerQuantConfig:
             'out_act_bit': self.out_act_bit,
             'act_per_head': self.act_per_head,
             'act_per_channel': self.act_per_channel,
+            'int_cal_mode': self.int_cal_mode,
         }
     
     def copy(self) -> 'LayerQuantConfig':
@@ -102,6 +124,10 @@ class QuantConfig:
     - Per-layer-name configuration (supports regex patterns)
     - Priority: layer_name > layer_type > default
     """
+    # Global fixed point settings
+    scale_fixed_bits: int = DEFAULT_SCALE_FIXED_BITS
+    # Global Sequence length
+    seq_len: int = DEFAULT_SEQ_LEN
     
     # Mapping from original module types to quantized module classes
     QUANT_MODULE_MAP: Dict[Type[nn.Module], Type[nn.Module]] = {
@@ -298,8 +324,10 @@ def get_vit_optimized_config() -> QuantConfig:
     config = QuantConfig()
     
     # Linear layers: per-channel weights
-    config.set_layer_type_config(nn.Linear, wgt_per_channel=False)
-    # TODO: ... config.set_layer_name_config("attention.linear_q", act_quant_mode="sym")
+    config.set_layer_type_config(nn.Linear, wgt_per_channel=False, act_per_token=True)
+    config.set_layer_name_config("attention.linear_k", wgt_per_channel=False, act_per_token=True)
+    config.set_layer_name_config("attention.linear_v", wgt_per_channel=False, act_per_token=True)
+    config.set_layer_name_config("classifier.dense", wgt_per_channel=False, act_per_token=False)
     
     # Conv2d: per-channel weights
     config.set_layer_type_config(nn.Conv2d, wgt_per_channel=False)
@@ -325,6 +353,8 @@ def get_vit_optimized_config() -> QuantConfig:
     
     return config
 
+def set_extra_compile_param_for_config(quant_config: QuantConfig) -> None:
+    quant_config.set_layer_type_config(nn.LayerNorm, int_cal_mode="Vivado-PYNQ")
 
 # ============== Model Replacement Function ==============
 
@@ -389,6 +419,7 @@ def _create_quant_module(module: nn.Module, config: LayerQuantConfig, quant_cls:
             out_act_bit=cfg['act_bit'],
             act_quant_mode=cfg['act_quant_mode'],
             act_per_channel=cfg['act_per_channel'],
+            int_cal_mode=cfg['int_cal_mode'],
         )
     
     elif quant_cls == QAdd:

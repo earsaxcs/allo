@@ -122,6 +122,8 @@ class ViTClassifier(nn.Module):
     def forward(self, x):
         first_token_tensor = self.getFirstToken(x)
         cls_output = self.dense(first_token_tensor)
+        # cls_output = self.dense(x)
+        # cls_output = self.getFirstToken(cls_output)
         return cls_output
 
 class ViTGetFirstToken(nn.Module):
@@ -131,7 +133,7 @@ class ViTGetFirstToken(nn.Module):
         self.shape = (1, seq_len + 1, hidden_size)
 
     def forward(self, x):
-        return x[:, 0]
+        return x[:, :1]
 
 class FFN(nn.Module):
     def __init__(self, n_embd, hidden_dim, output_dim):

@@ -17,8 +17,8 @@
  * The pass should be run after PYNQHoistBufferAllocPass and before code generation.
  */
 
+#include "PassDetail.h"
 #include "allo/Transforms/Passes.h"
-#include "allo/Dialect/PYNQDialect.h"
 #include "allo/Dialect/PYNQTypes.h"
 #include "allo/Dialect/PYNQOps.h"
 #include "allo/Dialect/PYNQConfig.h"
@@ -26,7 +26,6 @@
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Dominance.h"
 #include "mlir/Pass/Pass.h"
-#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Transforms/DialectConversion.h"
 
 #include "llvm/ADT/DenseMap.h"
