@@ -30,9 +30,108 @@ void VivadoDialect::initialize() {
 //===----------------------------------------------------------------------===//
 
 LogicalResult QLinearOp::verify() {
+  auto inputType = getInput().getType().dyn_cast<ShapedType>();
+  if (!inputType)
+    return emitOpError("input must be a shaped type (memref or tensor)");
+
+  auto weightType = getWeight().getType().dyn_cast<ShapedType>();
+  if (!weightType)
+    return emitOpError("weight must be a shaped type (memref or tensor)");
+
   auto outputType = getOutput().getType().dyn_cast<ShapedType>();
   if (!outputType)
     return emitOpError("output must be a shaped type (memref or tensor)");
+
+  if (!inputType.hasRank() || !weightType.hasRank() || !outputType.hasRank())
+    return success();
+
+  if (inputType.getRank() < 2)
+    return emitOpError("input rank must be at least 2");
+  if (outputType.getRank() < 2)
+    return emitOpError("output rank must be at least 2");
+  if (weightType.getRank() != 2)
+    return emitOpError("weight rank must be 2");
+
+  // Output rank should match input rank (batch dims preserved).
+  if (outputType.getRank() != inputType.getRank())
+    return emitOpError("output rank must match input rank");
+
+  auto matchDim = [&](int64_t a, int64_t b) {
+    return a == ShapedType::kDynamic || b == ShapedType::kDynamic || a == b;
+  };
+
+  auto inShape = inputType.getShape();
+  auto wShape = weightType.getShape();
+  auto outShape = outputType.getShape();
+
+  // Batch prefix dims must match between input and output.
+  for (int64_t i = 0; i + 2 < inputType.getRank(); ++i) {
+    if (!matchDim(inShape[i], outShape[i]))
+      return emitOpError("batch dimensions mismatch between input and output");
+  }
+
+  bool transposeMode = getTransposeMode();
+  bool outIsTransposed = getIsTransposed();
+
+  // When transpose_mode is enabled but the output is kept in non-transposed layout,
+  // require output scales to be rank-1 i32 memrefs, and (when statically known)
+  // allow common quantization granularities:
+  //   - per-tensor  : memref<1xi32>
+  //   - per-token   : memref<Mxi32>
+  //   - per-channel : memref<Nxi32>
+  // where output layout is [..., M, N].
+  if (transposeMode && !outIsTransposed) {
+    auto requireSingletonScaleMemRef = [&](Value scale, StringRef which) -> LogicalResult {
+      auto memrefTy = scale.getType().dyn_cast<MemRefType>();
+      if (!memrefTy || memrefTy.getRank() != 1)
+        return emitOpError(which) << " must be a memref<1xi32> when transpose_mode=true and is_transposed=false";
+      auto shape = memrefTy.getShape();
+      if (shape.size() != 1 || shape[0] != 1)
+        return emitOpError(which) << " must be a memref<1xi32> when transpose_mode=true and is_transposed=false";
+      if (!memrefTy.getElementType().isInteger(32))
+        return emitOpError(which) << " must be a memref<1xi32> when transpose_mode=true and is_transposed=false";
+      return success();
+    };
+
+    if (failed(requireSingletonScaleMemRef(getOscl(), "oscl (output_scale)")))
+      return failure();
+    if (failed(requireSingletonScaleMemRef(getOsclInv(), "oscl_inv (output_scale_inv)")))
+      return failure();
+  }
+
+  // Shape conventions:
+  // - transpose_mode=false: input [..., M, K] x weight [K, N] -> output [..., M, N]
+  // - transpose_mode=true : input [..., K, M] x weight [K, N] ->
+  //     output [..., M, N] when is_transposed=false
+  //     output [..., N, M] when is_transposed=true
+  if (!transposeMode) {
+    int64_t M = inShape[inputType.getRank() - 2];
+    int64_t K = inShape[inputType.getRank() - 1];
+    if (!matchDim(wShape[1], K))
+      return emitOpError("weight[1] must match input K dimension when transpose_mode=false");
+    int64_t N = wShape[0];
+    if (!matchDim(outShape[outputType.getRank() - 2], M) ||
+        !matchDim(outShape[outputType.getRank() - 1], N))
+      return emitOpError("output tail dims must be [M, N] when transpose_mode=false");
+  } else {
+    int64_t K = inShape[inputType.getRank() - 2];
+    int64_t M = inShape[inputType.getRank() - 1];
+    if (!matchDim(wShape[0], K))
+      return emitOpError("weight[0] must match input K dimension when transpose_mode=true");
+    int64_t N = wShape[1];
+
+    if (!outIsTransposed) {
+      if (!matchDim(outShape[outputType.getRank() - 2], M) ||
+          !matchDim(outShape[outputType.getRank() - 1], N))
+        return emitOpError(
+            "output tail dims must be [M, N] when transpose_mode=true and is_transposed=false");
+    } else {
+      if (!matchDim(outShape[outputType.getRank() - 2], N) ||
+          !matchDim(outShape[outputType.getRank() - 1], M))
+        return emitOpError(
+            "output tail dims must be [N, M] when transpose_mode=true and is_transposed=true");
+    }
+  }
 
   Value bias = getBias();
   if (!bias)
@@ -50,6 +149,7 @@ LogicalResult QLinearOp::verify() {
     return emitOpError("output rank must be at least 2 to compare with bias");
 
   if (biasType.getRank() < 1 || biasType.getRank() > 2)
+   // So 3D bias can just appear after seperating bias pass and disable fused_bias
     return emitOpError("bias rank must be 1 or 2 to align with input tail dims");
 
   if (outputType.hasStaticShape() && biasType.hasStaticShape()) {
@@ -75,9 +175,7 @@ LogicalResult QLinearOp::verify() {
       }
     }
 
-    // TOOD: verify weight and input, but it's more complex due to transposes. so hang
-    // is_transposed == false: input [..., IC] x weight [OC, IC] -> output [..., OC]
-    // is_transposed == true:  input [..., IC, M] x weight [IC, OC] -> output [..., OC, M]
+    // NOTE: input/weight/output shape checks are performed above.
   }
 
   return success();
@@ -110,6 +208,17 @@ LogicalResult QMatMulOp::verify() {
         }
       }
     }
+  }
+
+  // Enforce RHS (y) scale to be a singleton memref for backend scale configuration.
+  // NOTE: Only applies to y_scale (RHS). No restriction on x_scale (LHS).
+  {
+    auto yScaleTy = getYScale().getType().dyn_cast<MemRefType>();
+    if (!yScaleTy || yScaleTy.getRank() != 1 || !yScaleTy.getElementType().isInteger(32))
+      return emitOpError("y_scale must be memref<1xi32>");
+    auto yShape = yScaleTy.getShape();
+    if (yShape.size() != 1 || yShape[0] != 1)
+      return emitOpError("y_scale must be memref<1xi32>");
   }
 
   // NOTE: Do not uncomment this.

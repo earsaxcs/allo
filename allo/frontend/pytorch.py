@@ -236,15 +236,14 @@ def _process_quantized_params(gm, global_vars, quant_config=None):
                 if isinstance(module, QLinear):
                     if module.wgt_per_channel:
                         raise NotImplementedError("wgt_per_channel not supported")
-                    elif module.act_per_token or not module.act_per_token:
+                    else:
                         # NOTE: Here is hardcoded for classifier, please note if you change the model's module name, you need to change this line
                         if 'classifier' not in module_name:
                             bias_int = bias_int[None, :].expand(quant_config.seq_len, -1).contiguous() # Also need to broadcast when build
                         else:
                             bias_int = bias_int[None, :].contiguous()
                         dtype_str = f"int{module.bias_bit}"
-                    else:
-                        raise NotImplementedError("Currently Per-Tensor quantization also applys 2d bias")
+                    # NOTE: previously this path was effectively unconditional due to `act_per_token or not act_per_token`.
                 bias_int_data = bias_int.detach().numpy()
                 bias_key = var_prefix + "_bias_int"
                 global_vars[bias_key] = bias_int_data.astype(dtype_str)
@@ -1158,14 +1157,13 @@ class TorchBuilder:
                         local_bias_dtype = bias_dtype
                         if module.wgt_per_channel:
                             raise NotImplementedError("Per-channel quantization is not supported for QLinear")
-                        elif module.act_per_token or not module.act_per_token:
-                            # NOTE: Here is also hard-coded for seq_len usage in bias shape for QLinear which is not classifier
+                        else:
+                            # NOTE: Here is also hard-coded for seq_len usage in bias shape for QLinear which is not classifier.
+                            # Previously this was effectively unconditional due to `act_per_token or not act_per_token`.
                             if 'classifier' not in module_name:
                                 bias_shape = (self.quant_config.seq_len, bias_shape[-1])
                             else:
                                 bias_shape = (1, bias_shape[-1])
-                        else:
-                            raise NotImplementedError("Unsupported QLinear configuration")
                     bias_shape_str = ', '.join(str(s) for s in bias_shape)
                     declarations.append(f"    {var_prefix}_bias_int: {local_bias_dtype}[{bias_shape_str}] = g_{var_prefix}_bias_int")
                 
@@ -2369,6 +2367,20 @@ class TorchBuilder:
         ]
         
         kwargs = []
+
+        # layer_type: 用于后续 Vivado 侧的 layout/优化决策
+        # 约定：QMatMul(softmax@V) -> "attn.SV"，QMatMulIsqrtD(Q@K^T/sqrt(d)) -> "attn.QK"
+        # 这里对 QMatMul 默认给 SV；若从 node 名称中能识别 matmul2，则更稳。
+        layer_type = "attn.SV"
+        node_name_l = (node.name or "").lower()
+        node_tgt_l = (getattr(node, "target", "") or "").lower()
+        if "matmul2" in node_name_l or "matmul2" in node_tgt_l:
+            layer_type = "attn.SV"
+        elif "matmul1" in node_name_l or "matmul1" in node_tgt_l:
+            # 兼容：如果上游误把 matmul1 也走到 qmatmul，这里避免标错
+            layer_type = "attn.QK"
+        kwargs.append(f"layer_type=\"{layer_type}\"")
+
         # zero points
         if hasattr(module, 'x_zero') and module.x_zero is not None:
             x_zero = get_var_name(target_name + "_x_zero")
@@ -2423,6 +2435,16 @@ class TorchBuilder:
         ]
         
         kwargs = []
+
+        # layer_type: Q@K^T/sqrt(d)
+        layer_type = "attn.QK"
+        node_name_l = (node.name or "").lower()
+        node_tgt_l = (getattr(node, "target", "") or "").lower()
+        if "matmul2" in node_name_l or "matmul2" in node_tgt_l:
+            # 兼容：若图里命名反了，尽量不标错
+            layer_type = "attn.SV"
+        kwargs.append(f"layer_type=\"{layer_type}\"")
+
         if hasattr(module, 'x_zero') and module.x_zero is not None:
             x_zero = get_var_name(target_name + "_x_zero")
             y_zero = get_var_name(target_name + "_y_zero")

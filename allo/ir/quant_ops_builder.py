@@ -91,13 +91,19 @@ def build_quant_placeholder(ctx, node, attr, new_args, output_buffer, transforme
         x_zero = get_kwarg("x_zero", 17, arg_results)
         y_zero = get_kwarg("y_zero", 18, arg_results)
         o_zero = get_kwarg("o_zero", 19, arg_results)
+
+        # Extract layer_type from keyword arguments or use default "unknown"
+        layer_type = get_kwarg("layer_type", 20, arg_results)
+        from .._mlir.ir import StringAttr
+        layer_type_attr = StringAttr.get(layer_type if layer_type else "unknown")
         
         allo_d.QMatMulOp(output_buffer, lhs, rhs, x_scl_sign, x_scl_coe, x_scl_rshift, 
                          y_scl_sign, y_scl_coe, y_scl_rshift,
                          fused_scl_sign, fused_scl_coe, fused_scl_rshift,
                          o_scl_sign, o_scl_coe, o_scl_rshift,
                          o_scl_inv_sign, o_scl_inv_coe, o_scl_inv_rshift,
-                         x_zero=x_zero, y_zero=y_zero, o_zero=o_zero, ip=ip)
+                         x_zero=x_zero, y_zero=y_zero, o_zero=o_zero,
+                         layer_type=layer_type_attr, ip=ip)
         return output_buffer
     
     elif attr == "qmatmul_isqrtd":
@@ -120,13 +126,19 @@ def build_quant_placeholder(ctx, node, attr, new_args, output_buffer, transforme
         x_zero = get_kwarg("x_zero", 17, arg_results)
         y_zero = get_kwarg("y_zero", 18, arg_results)
         o_zero = get_kwarg("o_zero", 19, arg_results)
+
+        # Extract layer_type from keyword arguments or use default "unknown"
+        layer_type = get_kwarg("layer_type", 20, arg_results)
+        from .._mlir.ir import StringAttr
+        layer_type_attr = StringAttr.get(layer_type if layer_type else "unknown")
         
         allo_d.QMatMulIsqrtDOp(output_buffer, lhs, rhs, x_scl_sign, x_scl_coe, x_scl_rshift, 
                                y_scl_sign, y_scl_coe, y_scl_rshift,
                                fused_scl_sign, fused_scl_coe, fused_scl_rshift,
                                o_scl_sign, o_scl_coe, o_scl_rshift,
                                o_scl_inv_sign, o_scl_inv_coe, o_scl_inv_rshift,
-                               x_zero=x_zero, y_zero=y_zero, o_zero=o_zero, ip=ip)
+                               x_zero=x_zero, y_zero=y_zero, o_zero=o_zero,
+                               layer_type=layer_type_attr, ip=ip)
         return output_buffer
     
     elif attr == "qconv2d":

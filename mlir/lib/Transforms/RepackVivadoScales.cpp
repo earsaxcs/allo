@@ -390,7 +390,8 @@ struct RepackQMatMulPattern : public RepackVivadoOpPattern<vivado_ops::QMatMulOp
         op.getTransposeModeAttr(),
       op.getIsTransposedAttr(),
       op.getRhsLayoutAttr(),
-      op.getReduceDimAttr()
+      op.getReduceDimAttr(),
+      op.getLayerTypeAttr()
     );
     
     return success();
@@ -634,7 +635,8 @@ struct RepackQMatMulIsqrtDPattern : public RepackVivadoOpPattern<vivado_ops::QMa
         op.getTransposeModeAttr(),
       op.getIsTransposedAttr(),
       op.getRhsLayoutAttr(),
-      op.getReduceDimAttr()
+      op.getReduceDimAttr(),
+      op.getLayerTypeAttr()
     );
     
     return success();

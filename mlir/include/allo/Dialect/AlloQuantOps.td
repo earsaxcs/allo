@@ -98,7 +98,10 @@ def Allo_QMatMulOp : Allo_Op<"qmatmul", [AttrSizedOperandSegments]> {
     RshiftType:$o_scale_inv_rshift,
     Optional<ZeroType>:$x_zero,
     Optional<ZeroType>:$y_zero,
-    Optional<ZeroType>:$o_zero
+    Optional<ZeroType>:$o_zero,
+
+    // Layer type identification for optimization / backend layout decisions
+    DefaultValuedAttr<StrAttr, "\"unknown\"">:$layer_type
   );
   let results = (outs);
   let assemblyFormat = [{
@@ -150,7 +153,10 @@ def Allo_QMatMulIsqrtDOp : Allo_Op<"qmatmul_isqrtd", [AttrSizedOperandSegments]>
     RshiftType:$o_scale_inv_rshift,
     Optional<ZeroType>:$x_zero,
     Optional<ZeroType>:$y_zero,
-    Optional<ZeroType>:$o_zero
+    Optional<ZeroType>:$o_zero,
+
+    // Layer type identification for optimization / backend layout decisions
+    DefaultValuedAttr<StrAttr, "\"unknown\"">:$layer_type
   );
   let results = (outs);
   let assemblyFormat = [{

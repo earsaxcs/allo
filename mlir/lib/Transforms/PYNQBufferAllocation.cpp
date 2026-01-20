@@ -14,7 +14,9 @@
  * Input: pynq.buffer_alloc ops with virtual buffers (!pynq.buffer<i8, ?, 4096>)
  * Output: pynq.buffer_alloc ops with physical buffers (!pynq.buffer<i8, 0, 4096>)
  * 
- * The pass should be run after PYNQHoistBufferAllocPass and before code generation.
+ * The pass should be run before code generation. If paired with
+ * PYNQHoistBufferAllocPass, run this pass first to assign IDs and insert
+ * spills, then hoist/dedupe allocations.
  */
 
 #include "PassDetail.h"
@@ -24,15 +26,14 @@
 #include "allo/Dialect/PYNQConfig.h"
 
 #include "mlir/IR/BuiltinOps.h"
-#include "mlir/IR/Dominance.h"
 #include "mlir/Pass/Pass.h"
-#include "mlir/Transforms/DialectConversion.h"
+
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
 
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallBitVector.h"
-#include "llvm/ADT/SetVector.h"
 
-#include <queue>
+#include <optional>
 
 using namespace mlir;
 using namespace mlir::allo;
@@ -74,62 +75,34 @@ struct PYNQHardwareConfig {
 // Liveness Analysis Data Structures
 //===----------------------------------------------------------------------===//
 
-/// Represents a live range for a virtual buffer allocation.
-/// The range is defined by instruction indices in a linearized program order.
-struct LiveRange {
-  /// The buffer_alloc operation (with virtual buffer)
-  BufferAllocOp allocOp;
-  
-  /// Start index (where the buffer is allocated)
-  unsigned startIndex;
-  
-  /// End index (last use of the buffer value)
-  unsigned endIndex;
-  
-  /// Required buffer size in bytes
-  int64_t requiredSizeBytes;
-  
-  /// Element type of the buffer
-  Type elementType;
-  
-  /// Buffer role hint (input/weight/output/bias), if available
-  std::optional<StringRef> role;
-  
-  /// Assigned buffer ID (set by allocation algorithm)
-  std::optional<unsigned> assignedBufferId;
-  
-  /// Whether this allocation requires spilling
-  bool needsSpill = false;
-  
-  /// Check if this range overlaps with another
-  bool overlaps(const LiveRange &other) const {
-    return !(endIndex < other.startIndex || other.endIndex < startIndex);
-  }
-  
-  /// Check if this range is active at a given index
-  bool isActiveAt(unsigned index) const {
-    return startIndex <= index && index <= endIndex;
-  }
-};
+/// A live interval segment for a single virtual buffer value.
+///
+/// We allow splitting a virtual buffer's lifetime into multiple segments when
+/// spilling is required. Each segment will be rewritten to use its own physical
+/// `pynq.buffer_alloc` SSA value (possibly with different buffer IDs).
+struct LiveSegment {
+  BufferAllocOp virtualAlloc;
+  Value virtualBuffer;
 
-/// Represents a buffer assignment decision
-struct BufferAssignment {
-  unsigned bufferId;
+  unsigned startIndex;
+  unsigned endIndex;
+
+  int64_t requiredSizeBytes;
   Type elementType;
-  int64_t capacityBytes;
-  
-  /// The live ranges currently assigned to this buffer
-  /// (non-overlapping by construction)
-  SmallVector<LiveRange *, 4> assignedRanges;
-  
-  /// Check if a range can be assigned to this buffer
-  bool canAssign(const LiveRange &range) const {
-    for (auto *existing : assignedRanges) {
-      if (existing->overlaps(range)) {
-        return false;
-      }
-    }
-    return range.requiredSizeBytes <= capacityBytes;
+  std::optional<StringRef> role;
+
+  std::optional<unsigned> assignedBufferId;
+
+  // Spill bookkeeping.
+  bool needsStoreToSlot = false;
+  unsigned storeBeforeIndex = 0;
+  bool needsReloadFromSlot = false;
+
+  // Filled during IR rewrite.
+  BufferAllocOp physicalAlloc;
+
+  bool overlaps(const LiveSegment &other) const {
+    return !(endIndex < other.startIndex || other.endIndex < startIndex);
   }
 };
 
@@ -148,26 +121,48 @@ public:
   LogicalResult analyze();
   
   /// Get the allocation results
-  const SmallVector<LiveRange> &getLiveRanges() const { return liveRanges; }
+  const SmallVector<LiveSegment> &getSegments() const { return segments; }
+
+  Block *getSingleBlock() const { return singleBlock; }
+
+  Operation *getOpAt(unsigned index) const {
+    if (index >= indexToOp.size())
+      return nullptr;
+    return indexToOp[index];
+  }
+
+  std::optional<unsigned> getIndexOf(Operation *op) const {
+    auto it = opToIndex.find(op);
+    if (it == opToIndex.end())
+      return std::nullopt;
+    return it->second;
+  }
   
 private:
   func::FuncOp funcOp;
   const PYNQHardwareConfig &config;
   
-  /// All live ranges discovered during analysis
-  SmallVector<LiveRange> liveRanges;
+  /// All live segments discovered during analysis
+  SmallVector<LiveSegment> segments;
   
   /// Mapping from Operation* to linear instruction index
   DenseMap<Operation *, unsigned> opToIndex;
+
+  /// Reverse map for stable insertion points
+  SmallVector<Operation *> indexToOp;
+
+  /// We only support a single basic block in the first version.
+  Block *singleBlock = nullptr;
   
   /// Linearize the operations in program order
   void buildLinearOrder();
   
-  /// Collect all buffer requests and compute their live ranges
-  LogicalResult collectLiveRanges();
-  
-  /// Find the last use of a value
-  unsigned findLastUse(Value value);
+  /// Collect all virtual buffers and compute their [firstUse,lastUse]
+  LogicalResult collectSegments();
+
+  /// Find first/last use of a value inside `singleBlock`.
+  std::optional<std::pair<unsigned, unsigned>>
+  findFirstLastUseInBlock(Value value);
 };
 
 //===----------------------------------------------------------------------===//
@@ -190,42 +185,30 @@ public:
   
   /// Run allocation on the given live ranges
   /// Returns success if all ranges were allocated, failure otherwise
-  LogicalResult allocate(SmallVector<LiveRange> &ranges);
-  
-  /// Get the buffer assignments
-  const SmallVector<BufferAssignment> &getAssignments() const { 
-    return assignments; 
-  }
+  LogicalResult allocate(SmallVector<LiveSegment> &segments,
+                         const BufferAllocationAnalysis &analysis);
   
 private:
   const PYNQHardwareConfig &config;
   
   /// Bit vector tracking which buffer IDs are free
   llvm::SmallBitVector freeBuffers;
-  
-  /// Currently active live ranges (sorted by end index for expiration)
-  std::priority_queue<
-      std::pair<unsigned, LiveRange *>,
-      std::vector<std::pair<unsigned, LiveRange *>>,
-      std::greater<std::pair<unsigned, LiveRange *>>> activeRanges;
-  
-  /// Buffer assignments
-  SmallVector<BufferAssignment> assignments;
-  
-  /// Expire ranges that have ended before the given index
-  void expireOldRanges(unsigned currentIndex);
-  
-  /// Try to allocate a buffer for the given range
-  std::optional<unsigned> tryAllocate(LiveRange &range);
-  
-  /// Select a range to spill when no buffers are available
-  LiveRange *selectSpillCandidate(const LiveRange &newRange);
+
+  /// Currently active segments.
+  SmallVector<LiveSegment *, 16> active;
+
+  void expireOld(unsigned currentIndex);
+
+  std::optional<unsigned> tryAllocate(LiveSegment &segment);
+
+  LiveSegment *selectSpillVictim(Operation *currentOp,
+                                ArrayRef<Value> currentOpBuffers) const;
   
   /// Free a buffer ID
   void freeBuffer(unsigned bufferId);
   
   /// Allocate a specific buffer ID
-  void allocateBuffer(unsigned bufferId, LiveRange &range);
+  void allocateBuffer(unsigned bufferId, LiveSegment &segment);
 };
 
 //===----------------------------------------------------------------------===//
@@ -235,6 +218,10 @@ private:
 class PYNQBufferAllocationPass 
     : public PassWrapper<PYNQBufferAllocationPass, OperationPass<ModuleOp>> {
 public:
+  PYNQBufferAllocationPass() = default;
+  PYNQBufferAllocationPass(const PYNQBufferAllocationPass &pass)
+      : PassWrapper(pass) {}
+
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(PYNQBufferAllocationPass)
   
   StringRef getArgument() const override { return "pynq-buffer-allocation"; }
@@ -245,7 +232,23 @@ public:
   void getDependentDialects(DialectRegistry &registry) const override {
     registry.insert<pynq::PYNQDialect>();
     registry.insert<func::FuncDialect>();
+    registry.insert<memref::MemRefDialect>();
   }
+
+    Option<unsigned> numBuffers{
+      *this, "num-buffers",
+      llvm::cl::desc("Number of on-chip buffers available"),
+      llvm::cl::init(BufferConfig::kNumBuffers)};
+
+    Option<int64_t> bufferCapacity{
+      *this, "buffer-capacity",
+      llvm::cl::desc("Default buffer capacity in bytes"),
+      llvm::cl::init(BufferConfig::kDefaultCapacityBytes)};
+
+    Option<bool> enableSpilling{
+      *this, "enable-spilling",
+      llvm::cl::desc("Enable buffer spilling when buffers are exhausted"),
+      llvm::cl::init(false)};
   
   void runOnOperation() override;
   
@@ -258,7 +261,8 @@ private:
   
   /// Transform buffer_request ops to buffer_alloc ops based on analysis
   LogicalResult applyAllocations(func::FuncOp funcOp,
-                                  SmallVector<LiveRange> &ranges);
+                                BufferAllocationAnalysis &analysis,
+                                SmallVector<LiveSegment> &segments);
 };
 
 } // anonymous namespace
@@ -281,13 +285,52 @@ void BufferAllocationAnalysis::buildLinearOrder() {
    * TODO: 支持嵌套区域（loops, conditionals）
    */
   
+  // First version: require a single block.
+  if (funcOp.getBody().getBlocks().size() != 1) {
+    singleBlock = nullptr;
+    return;
+  }
+
+  singleBlock = &funcOp.getBody().front();
+  opToIndex.clear();
+  indexToOp.clear();
+
   unsigned index = 0;
-  funcOp.walk([&](Operation *op) {
-    opToIndex[op] = index++;
-  });
+  for (Operation &op : singleBlock->getOperations()) {
+    opToIndex[&op] = index++;
+    indexToOp.push_back(&op);
+  }
 }
 
-LogicalResult BufferAllocationAnalysis::collectLiveRanges() {
+std::optional<std::pair<unsigned, unsigned>>
+BufferAllocationAnalysis::findFirstLastUseInBlock(Value value) {
+  if (!value || !singleBlock)
+    return std::nullopt;
+
+  unsigned first = std::numeric_limits<unsigned>::max();
+  unsigned last = 0;
+  bool any = false;
+
+  for (OpOperand &use : value.getUses()) {
+    Operation *user = use.getOwner();
+    if (!user)
+      continue;
+    if (user->getBlock() != singleBlock)
+      return std::nullopt;
+    auto it = opToIndex.find(user);
+    if (it == opToIndex.end())
+      continue;
+    any = true;
+    first = std::min(first, it->second);
+    last = std::max(last, it->second);
+  }
+
+  if (!any)
+    return std::nullopt;
+  return std::make_pair(first, last);
+}
+
+LogicalResult BufferAllocationAnalysis::collectSegments() {
   /*
    * 设计思路:
    * 1. 遍历所有 pynq.buffer_alloc 操作
@@ -302,81 +345,62 @@ LogicalResult BufferAllocationAnalysis::collectLiveRanges() {
    * 注意：如果 buffer value 没有被使用（dead code），endIndex = startIndex
    */
   
+  segments.clear();
+
+  if (!singleBlock)
+    return failure();
+
   funcOp.walk([&](BufferAllocOp allocOp) {
-    // Only process virtual buffers
-    if (!allocOp.isVirtual()) {
+    if (!allocOp.isVirtual())
+      return;
+
+    Value buf = allocOp.getBuffer();
+    auto firstLast = findFirstLastUseInBlock(buf);
+    if (!firstLast.has_value()) {
+      // Unused or used outside block: handled by caller.
       return;
     }
-    
-    LiveRange range;
-    range.allocOp = allocOp;
-    range.startIndex = opToIndex[allocOp.getOperation()];
-    range.endIndex = findLastUse(allocOp.getBuffer());
-    range.requiredSizeBytes = allocOp.getCapacityBytes();
-    range.elementType = allocOp.getElementType();
-    
-    if (allocOp.hasRole()) {
-      range.role = allocOp.getRole();
-    }
-    
-    liveRanges.push_back(range);
+
+    LiveSegment seg;
+    seg.virtualAlloc = allocOp;
+    seg.virtualBuffer = buf;
+    seg.startIndex = firstLast->first;
+    seg.endIndex = firstLast->second;
+    seg.requiredSizeBytes = allocOp.getCapacityBytes();
+    seg.elementType = allocOp.getElementType();
+    if (allocOp.hasRole())
+      seg.role = allocOp.getRole();
+    segments.push_back(seg);
   });
   
   return success();
 }
 
-unsigned BufferAllocationAnalysis::findLastUse(Value value) {
-  /*
-   * 设计思路:
-   * 遍历 value 的所有 uses，找到最大的指令索引。
-   * 
-   * 特殊情况：
-   * - 如果 value 没有 use，返回定义点的索引
-   * - 如果 value 在循环中使用，需要考虑循环的结束点
-   *   （当前简化：不特殊处理循环）
-   */
-  
-  unsigned lastUse = opToIndex[value.getDefiningOp()];
-  
-  for (Operation *user : value.getUsers()) {
-    if (auto it = opToIndex.find(user); it != opToIndex.end()) {
-      lastUse = std::max(lastUse, it->second);
-    }
-  }
-  
-  return lastUse;
-}
-
 LogicalResult BufferAllocationAnalysis::analyze() {
   buildLinearOrder();
-  return collectLiveRanges();
+  if (!singleBlock)
+    return failure();
+  return collectSegments();
 }
 
 //===----------------------------------------------------------------------===//
 // LinearScanAllocator Implementation
 //===----------------------------------------------------------------------===//
 
-void LinearScanAllocator::expireOldRanges(unsigned currentIndex) {
-  /*
-   * 设计思路:
-   * 从 activeRanges 优先队列中移除所有 endIndex < currentIndex 的 range，
-   * 并释放它们占用的 buffer ID。
-   * 
-   * activeRanges 按 endIndex 升序排列，所以可以快速移除过期的 ranges。
-   */
-  
-  while (!activeRanges.empty() && 
-         activeRanges.top().first < currentIndex) {
-    auto [endIdx, range] = activeRanges.top();
-    activeRanges.pop();
-    
-    if (range->assignedBufferId) {
-      freeBuffer(*range->assignedBufferId);
+void LinearScanAllocator::expireOld(unsigned currentIndex) {
+  for (auto it = active.begin(); it != active.end();) {
+    LiveSegment *seg = *it;
+    if (seg && seg->endIndex < currentIndex) {
+      if (seg->assignedBufferId)
+        freeBuffer(*seg->assignedBufferId);
+      it = active.erase(it);
+      continue;
     }
+    ++it;
   }
 }
 
-std::optional<unsigned> LinearScanAllocator::tryAllocate(LiveRange &range) {
+std::optional<unsigned> LinearScanAllocator::tryAllocate(LiveSegment &segment) {
   /*
    * 设计思路:
    * 1. 找到第一个空闲的 buffer ID
@@ -393,8 +417,8 @@ std::optional<unsigned> LinearScanAllocator::tryAllocate(LiveRange &range) {
   for (unsigned i = 0; i < config.numBuffers; ++i) {
     if (freeBuffers[i]) {
       // 检查容量
-      if (range.requiredSizeBytes <= config.defaultBufferCapacity) {
-        allocateBuffer(i, range);
+      if (segment.requiredSizeBytes <= config.defaultBufferCapacity) {
+        allocateBuffer(i, segment);
         return i;
       }
     }
@@ -403,40 +427,89 @@ std::optional<unsigned> LinearScanAllocator::tryAllocate(LiveRange &range) {
   return std::nullopt;
 }
 
-LiveRange *LinearScanAllocator::selectSpillCandidate(const LiveRange &newRange) {
-  /*
-   * 设计思路（当启用 spilling 时）:
-   * 选择一个当前活跃的 range 进行 spill（换出到主存）。
-   * 
-   * 选择策略：
-   * 1. 优先选择 endIndex 最远的（减少后续冲突）
-   * 2. 或选择 size 最大的（释放更多空间）
-   * 3. 或根据 role 选择（output 比 input 更容易 spill）
-   * 
-   * 当前简化：选择 endIndex 最远的
-   * 
-   * Spilling 实现：
-   * - 在 spill 点插入 pynq.data_transfer (direction=1) 将数据写回
-   * - 在重新需要时插入 pynq.data_transfer (direction=0) 重新加载
-   * - 标记该 range 的 needsSpill = true
-   */
-  
-  // TODO: 实现 spill 候选选择
-  // 当前返回 nullptr 表示不支持 spilling
-  return nullptr;
+LiveSegment *LinearScanAllocator::selectSpillVictim(
+    Operation *currentOp, ArrayRef<Value> currentOpBuffers) const {
+  // Do not spill a segment if the current op uses that buffer.
+  auto isUsedByCurrent = [&](LiveSegment *seg) {
+    if (!seg)
+      return false;
+    for (Value b : currentOpBuffers)
+      if (b == seg->virtualBuffer)
+        return true;
+    return false;
+  };
+
+  LiveSegment *victim = nullptr;
+  unsigned farthestEnd = 0;
+
+  for (LiveSegment *seg : active) {
+    if (!seg || !seg->assignedBufferId)
+      continue;
+    if (isUsedByCurrent(seg))
+      continue;
+    // Heuristic: spill the one with farthest end.
+    if (!victim || seg->endIndex > farthestEnd) {
+      victim = seg;
+      farthestEnd = seg->endIndex;
+    }
+  }
+
+  (void)currentOp;
+  return victim;
 }
 
 void LinearScanAllocator::freeBuffer(unsigned bufferId) {
   freeBuffers.set(bufferId);
 }
 
-void LinearScanAllocator::allocateBuffer(unsigned bufferId, LiveRange &range) {
+void LinearScanAllocator::allocateBuffer(unsigned bufferId,
+                                        LiveSegment &segment) {
   freeBuffers.reset(bufferId);
-  range.assignedBufferId = bufferId;
-  activeRanges.push({range.endIndex, &range});
+  segment.assignedBufferId = bufferId;
+  active.push_back(&segment);
 }
 
-LogicalResult LinearScanAllocator::allocate(SmallVector<LiveRange> &ranges) {
+static SmallVector<Value, 8> collectPynqBufferOperands(Operation *op) {
+  SmallVector<Value, 8> bufs;
+  if (!op)
+    return bufs;
+  llvm::SmallPtrSet<Value, 8> seen;
+  for (Value operand : op->getOperands()) {
+    if (!operand)
+      continue;
+    if (!llvm::isa<pynq::BufferType>(operand.getType()))
+      continue;
+    if (seen.insert(operand).second)
+      bufs.push_back(operand);
+  }
+  return bufs;
+}
+
+static std::optional<unsigned>
+findNextUseIndex(Value v, unsigned fromIndex,
+                 const BufferAllocationAnalysis &analysis) {
+  unsigned best = std::numeric_limits<unsigned>::max();
+  bool any = false;
+  for (OpOperand &use : v.getUses()) {
+    Operation *user = use.getOwner();
+    if (!user)
+      continue;
+    auto idx = analysis.getIndexOf(user);
+    if (!idx.has_value())
+      continue;
+    if (*idx < fromIndex)
+      continue;
+    any = true;
+    best = std::min(best, *idx);
+  }
+  if (!any)
+    return std::nullopt;
+  return best;
+}
+
+LogicalResult LinearScanAllocator::allocate(
+    SmallVector<LiveSegment> &segments,
+    const BufferAllocationAnalysis &analysis) {
   /*
    * 设计思路（线性扫描算法）:
    * 
@@ -451,38 +524,81 @@ LogicalResult LinearScanAllocator::allocate(SmallVector<LiveRange> &ranges) {
    */
   
   // Step 1: Sort by start index
-  llvm::sort(ranges, [](const LiveRange &a, const LiveRange &b) {
+  llvm::sort(segments, [](const LiveSegment &a, const LiveSegment &b) {
     return a.startIndex < b.startIndex;
   });
   
-  // Step 2: Process each range in order
-  for (LiveRange &range : ranges) {
-    // Expire old ranges
-    expireOldRanges(range.startIndex);
-    
-    // Try to allocate
-    auto bufferId = tryAllocate(range);
-    
+  // We may append new segments during spilling; use index-based loop.
+  for (size_t i = 0; i < segments.size(); ++i) {
+    LiveSegment &seg = segments[i];
+    expireOld(seg.startIndex);
+
+    auto bufferId = tryAllocate(seg);
+    if (bufferId)
+      continue;
+
+    if (!config.enableSpilling) {
+      seg.virtualAlloc.emitError()
+          << "failed to allocate buffer: all " << config.numBuffers
+          << " buffers are occupied and spilling is disabled";
+      return failure();
+    }
+
+    Operation *currentOp = analysis.getOpAt(seg.startIndex);
+    auto currentOpBuffers = collectPynqBufferOperands(currentOp);
+    LiveSegment *victim = selectSpillVictim(currentOp, currentOpBuffers);
+    if (!victim || !victim->assignedBufferId) {
+      seg.virtualAlloc.emitError() << "failed to spill any active buffer";
+      return failure();
+    }
+
+    // Spill victim at seg.startIndex.
+    auto nextUse = findNextUseIndex(victim->virtualBuffer, seg.startIndex,
+                                   analysis);
+    if (!nextUse.has_value()) {
+      // Victim has no future uses; it can be simply truncated.
+      victim->endIndex = seg.startIndex - 1;
+    } else {
+      victim->needsStoreToSlot = true;
+      victim->storeBeforeIndex = seg.startIndex;
+
+      LiveSegment reloadSeg;
+      reloadSeg.virtualAlloc = victim->virtualAlloc;
+      reloadSeg.virtualBuffer = victim->virtualBuffer;
+      reloadSeg.startIndex = *nextUse;
+      reloadSeg.endIndex = victim->endIndex;
+      reloadSeg.requiredSizeBytes = victim->requiredSizeBytes;
+      reloadSeg.elementType = victim->elementType;
+      reloadSeg.role = victim->role;
+      reloadSeg.needsReloadFromSlot = true;
+
+      victim->endIndex = seg.startIndex - 1;
+
+      segments.push_back(reloadSeg);
+    }
+
+    unsigned freedId = *victim->assignedBufferId;
+    // Remove victim from active and free its buffer.
+    for (auto it = active.begin(); it != active.end(); ++it) {
+      if (*it == victim) {
+        active.erase(it);
+        break;
+      }
+    }
+    freeBuffer(freedId);
+
+    bufferId = tryAllocate(seg);
     if (!bufferId) {
-      // No free buffer available
-      if (config.enableSpilling) {
-        // TODO: Implement spilling
-        LiveRange *victim = selectSpillCandidate(range);
-        if (victim) {
-          victim->needsSpill = true;
-          freeBuffer(*victim->assignedBufferId);
-          bufferId = tryAllocate(range);
-        }
-      }
-      
-      if (!bufferId) {
-        // Allocation failed
-        range.allocOp.emitError() 
-            << "failed to allocate buffer: all " << config.numBuffers 
-            << " buffers are occupied and spilling is "
-            << (config.enableSpilling ? "not possible" : "disabled");
-        return failure();
-      }
+      seg.virtualAlloc.emitError() << "allocation still failed after spill";
+      return failure();
+    }
+
+    // Re-sort the tail if we appended a reload segment.
+    if (i + 1 < segments.size()) {
+      llvm::sort(segments.begin() + (i + 1), segments.end(),
+                 [](const LiveSegment &a, const LiveSegment &b) {
+                   return a.startIndex < b.startIndex;
+                 });
     }
   }
   
@@ -502,6 +618,11 @@ void PYNQBufferAllocationPass::runOnOperation() {
    */
   
   ModuleOp moduleOp = getOperation();
+
+  // Wire options.
+  hwConfig.numBuffers = numBuffers;
+  hwConfig.defaultBufferCapacity = bufferCapacity;
+  hwConfig.enableSpilling = enableSpilling;
   
   // Validate hardware configuration
   if (!hwConfig.isValid()) {
@@ -527,6 +648,12 @@ LogicalResult PYNQBufferAllocationPass::processFunction(func::FuncOp funcOp) {
    * 5. 更新 buffer_alloc 操作的类型（virtual → physical）
    */
   
+  // First version is block-local: require a single block.
+  if (funcOp.getBody().getBlocks().size() != 1) {
+    return funcOp.emitError()
+           << "pynq-buffer-allocation currently requires single-block functions";
+  }
+
   // Quick check: does this function have any virtual buffers?
   bool hasVirtualBuffers = false;
   funcOp.walk([&](BufferAllocOp allocOp) {
@@ -539,32 +666,34 @@ LogicalResult PYNQBufferAllocationPass::processFunction(func::FuncOp funcOp) {
     return success();
   }
   
-  // Run liveness analysis
   BufferAllocationAnalysis analysis(funcOp, hwConfig);
-  if (failed(analysis.analyze())) {
-    return funcOp.emitError() << "liveness analysis failed";
-  }
-  
-  // Get live ranges (need a mutable copy for allocation)
-  SmallVector<LiveRange> ranges = analysis.getLiveRanges();
-  
-  if (ranges.empty()) {
+  if (failed(analysis.analyze()))
+    return funcOp.emitError() << "block-local liveness analysis failed";
+
+  SmallVector<LiveSegment> segments = analysis.getSegments();
+  if (segments.empty()) {
+    // Erase unused virtual allocs to reduce noise.
+    llvm::SmallVector<BufferAllocOp, 16> dead;
+    funcOp.walk([&](BufferAllocOp allocOp) {
+      if (allocOp.isVirtual() && allocOp.getBuffer().use_empty())
+        dead.push_back(allocOp);
+    });
+    for (auto a : dead)
+      a.erase();
     return success();
   }
-  
-  // Run buffer allocation
+
   LinearScanAllocator allocator(hwConfig);
-  if (failed(allocator.allocate(ranges))) {
-    return failure(); // Error already emitted
-  }
-  
-  // Apply allocations to IR
-  return applyAllocations(funcOp, ranges);
+  if (failed(allocator.allocate(segments, analysis)))
+    return failure();
+
+  return applyAllocations(funcOp, analysis, segments);
 }
 
 LogicalResult PYNQBufferAllocationPass::applyAllocations(
     func::FuncOp funcOp,
-    SmallVector<LiveRange> &ranges) {
+    BufferAllocationAnalysis &analysis,
+    SmallVector<LiveSegment> &segments) {
   /*
    * 设计思路:
    * 对于每个已分配的 live range：
@@ -589,53 +718,141 @@ LogicalResult PYNQBufferAllocationPass::applyAllocations(
    * We only change the type from virtual to physical.
    */
   
+  Block *block = analysis.getSingleBlock();
+  if (!block)
+    return funcOp.emitError() << "expected single block";
+
   OpBuilder builder(funcOp.getContext());
-  
-  for (LiveRange &range : ranges) {
-    if (!range.assignedBufferId) {
-      return range.allocOp.emitError() << "buffer was not allocated";
-    }
-    
-    BufferAllocOp allocOp = range.allocOp;
-    unsigned bufferId = *range.assignedBufferId;
-    
-    // Create new physical buffer type
-    auto physicalBufferType = BufferType::getAllocated(
-        allocOp.getContext(),
-        range.elementType,
-        bufferId,
-        range.requiredSizeBytes);
-    
-    // Create new buffer_alloc with physical buffer type
-    builder.setInsertionPoint(allocOp);
-    auto newAllocOp = builder.create<BufferAllocOp>(
-        allocOp.getLoc(),
-        range.elementType,
-        bufferId,
-        range.requiredSizeBytes);
-    
-    // Copy role attribute if present
-    if (allocOp.hasRole()) {
-      newAllocOp.setRoleAttr(allocOp.getRoleAttr());
-    }
-    
-    // Replace all uses of the old virtual buffer with the new physical buffer
-    allocOp.getBuffer().replaceAllUsesWith(newAllocOp.getBuffer());
-    
-    // Handle spilling if needed
-    if (range.needsSpill) {
-      // TODO: Insert spill operations
-      // This requires:
-      // 1. Finding the point where the buffer is evicted
-      // 2. Inserting data_transfer to save to host memory
-      // 3. Finding the point where it's reloaded
-      // 4. Inserting data_transfer to load from host memory
-      allocOp.emitWarning() << "spilling not yet implemented";
-    }
-    
-    // Erase the original virtual buffer_alloc
-    allocOp.erase();
+
+  static constexpr StringLiteral kSpillSlotAttrName =
+      "allo.pynq.spill_slot";
+
+  // Determine which virtual buffers actually need spill slots.
+  llvm::DenseMap<Value, bool> needsSlot;
+  for (LiveSegment &seg : segments) {
+    if (seg.needsStoreToSlot || seg.needsReloadFromSlot)
+      needsSlot[seg.virtualBuffer] = true;
   }
+
+  // Create spill slots near their first required insertion point.
+  llvm::DenseMap<Value, Value> spillSlot;
+  llvm::DenseMap<Value, unsigned> spillSlotFirstIndex;
+  for (LiveSegment &seg : segments) {
+    if (!(seg.needsStoreToSlot || seg.needsReloadFromSlot))
+      continue;
+    unsigned idx = seg.needsStoreToSlot ? seg.storeBeforeIndex : seg.startIndex;
+    auto it = spillSlotFirstIndex.find(seg.virtualBuffer);
+    if (it == spillSlotFirstIndex.end()) {
+      spillSlotFirstIndex[seg.virtualBuffer] = idx;
+    } else {
+      it->second = std::min(it->second, idx);
+    }
+  }
+
+  for (auto &it : needsSlot) {
+    if (!it.second)
+      continue;
+    Value vbuf = it.first;
+    auto bufTy = llvm::dyn_cast<pynq::BufferType>(vbuf.getType());
+    if (!bufTy)
+      continue;
+    Type elemTy = bufTy.getElementType();
+    int64_t capBytes = bufTy.getCapacityBytes();
+    int64_t elemBits = elemTy.getIntOrFloatBitWidth();
+    if (elemBits == 0 || (elemBits % 8) != 0)
+      return funcOp.emitError() << "unsupported element type for spill slot";
+    int64_t elemBytes = elemBits / 8;
+    if (capBytes % elemBytes != 0)
+      return funcOp.emitError() << "buffer capacity is not element-aligned";
+    int64_t numElems = capBytes / elemBytes;
+
+    auto slotType = MemRefType::get({numElems}, elemTy);
+
+    unsigned insertIndex = 0;
+    auto idxIt = spillSlotFirstIndex.find(vbuf);
+    if (idxIt != spillSlotFirstIndex.end())
+      insertIndex = idxIt->second;
+    Operation *before = analysis.getOpAt(insertIndex);
+    if (before)
+      builder.setInsertionPoint(before);
+    else
+      builder.setInsertionPointToStart(block);
+
+    auto alloc = builder.create<memref::AllocOp>(funcOp.getLoc(), slotType);
+    alloc->setAttr(kSpillSlotAttrName, builder.getUnitAttr());
+    spillSlot[vbuf] = alloc;
+  }
+
+  // Create physical buffer_alloc ops for each segment near the segment start.
+  for (LiveSegment &seg : segments) {
+    if (!seg.assignedBufferId)
+      return seg.virtualAlloc.emitError() << "segment was not allocated";
+
+    Operation *before = analysis.getOpAt(seg.startIndex);
+    if (before)
+      builder.setInsertionPoint(before);
+    else
+      builder.setInsertionPointToStart(block);
+
+    auto newAlloc = builder.create<BufferAllocOp>(
+        seg.virtualAlloc.getLoc(), seg.elementType, *seg.assignedBufferId,
+        seg.requiredSizeBytes);
+    if (seg.virtualAlloc.hasRole())
+      newAlloc.setRoleAttr(seg.virtualAlloc.getRoleAttr());
+    seg.physicalAlloc = newAlloc;
+  }
+
+  // Rewrite uses: for each segment, redirect uses in [start,end] to the
+  // segment's physical buffer value.
+  for (LiveSegment &seg : segments) {
+    Value oldBuf = seg.virtualBuffer;
+    Value newBuf = seg.physicalAlloc.getBuffer();
+    for (OpOperand &use : llvm::make_early_inc_range(oldBuf.getUses())) {
+      Operation *user = use.getOwner();
+      auto idx = analysis.getIndexOf(user);
+      if (!idx.has_value())
+        continue;
+      if (*idx < seg.startIndex || *idx > seg.endIndex)
+        continue;
+      use.set(newBuf);
+    }
+  }
+
+  // Insert spill stores / reloads.
+  for (LiveSegment &seg : segments) {
+    Value slot = spillSlot.lookup(seg.virtualBuffer);
+
+    if (seg.needsStoreToSlot) {
+      Operation *before = analysis.getOpAt(seg.storeBeforeIndex);
+      if (!before)
+        return seg.virtualAlloc.emitError() << "invalid spill store point";
+      if (!slot)
+        return seg.virtualAlloc.emitError() << "missing spill slot";
+      builder.setInsertionPoint(before);
+      builder.create<pynq::CopyOp>(before->getLoc(),
+                                  seg.physicalAlloc.getBuffer(), slot);
+    }
+
+    if (seg.needsReloadFromSlot) {
+      Operation *before = analysis.getOpAt(seg.startIndex);
+      if (!before)
+        return seg.virtualAlloc.emitError() << "invalid reload point";
+      if (!slot)
+        return seg.virtualAlloc.emitError() << "missing spill slot";
+      builder.setInsertionPoint(before);
+      builder.create<pynq::CopyOp>(before->getLoc(), slot,
+                                  seg.physicalAlloc.getBuffer());
+    }
+  }
+
+  // Erase original virtual buffer_alloc ops (some may be unused).
+  llvm::SmallVector<BufferAllocOp, 64> toErase;
+  funcOp.walk([&](BufferAllocOp allocOp) {
+    if (allocOp.isVirtual())
+      toErase.push_back(allocOp);
+  });
+  for (auto a : toErase)
+    a.erase();
   
   return success();
 }

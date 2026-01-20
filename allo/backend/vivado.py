@@ -267,19 +267,38 @@ class VivadoModule:
             #     # DO NOT LOWER AFFINE DIALECT
             #     ")"
             # )
+            enable_pynq_simplify = os.getenv("ALLO_PYNQ_SIMPLIFY_HOST_TRANSFERS", "0").lower() in (
+                "1",
+                "true",
+                "yes",
+                "on",
+            )
+            simplify_pass = (
+                "pynq-simplify-host-transfers{dry-run=false emit-remarks=true}"
+                if enable_pynq_simplify
+                else "pynq-simplify-host-transfers"
+            )
+            post_simplify_cleanup = ",memref-dce,canonicalize" if enable_pynq_simplify else ""
             pm = PassManager.parse(
-                "builtin.module("
-                    "empty-tensor-to-alloc-tensor,"
-                    "lower-allo-quant-to-vivado,"
-                    "repack-vivado-scales,"
-                    "toggle-vivado-transpose,"
-                    "vivado-padding,"
-                    "vivado-separate-bias,"
-                    "vivado-qlinear-k-split,"
-                    "insert-scale-conversion-after-layernorm,"
-                    "symbol-dce,"
-                    "canonicalize"
-                ")"
+                f"builtin.module("
+                f"empty-tensor-to-alloc-tensor,"
+                f"lower-allo-quant-to-vivado,"
+                f"repack-vivado-scales,"
+                f"toggle-vivado-transpose,"
+                f"vivado-padding,"
+                f"vivado-separate-bias," # NOTE: this pass must be after the toggle-vivado-transpose because it assumes the bias layout is 2D, instead of 3D, but this pass will make bias 3D by add batch dim.
+                f"vivado-qlinear-k-split,"
+                f"insert-scale-conversion-after-layernorm,"
+                f"symbol-dce,"
+                f"canonicalize,"
+                f"lower-vivado-to-pynq,"
+                f"{simplify_pass}{post_simplify_cleanup},"
+                f"pynq-elide-redundant-copies{{dry-run=false}},"
+                f"pynq-schedule-ops{{dry-run=false}},"
+                f"pynq-buffer-allocation,"
+                f"pynq-hoist-buffer-alloc,"
+                f"pynq-mid-lower"
+                f")"
             )
 
             if self.debug_mode:

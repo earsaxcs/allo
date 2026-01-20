@@ -140,8 +140,11 @@ public:
   /// Emit pynq.matmul_instr operation
   void emitMatMulInstr(pynq::MatMulInstrOp op);
   
-  /// Emit pynq.data_transfer operation
-  void emitDataTransfer(pynq::DataTransferOp op);
+  /// Emit pynq.data_transfer_instr operation
+  void emitDataTransferInstr(pynq::DataTransferInstrOp op);
+
+  /// Emit pynq.copy operation (abstract data movement)
+  void emitCopy(pynq::CopyOp op);
   
   /// Emit pynq.buffer_alloc operation
   void emitBufferAlloc(pynq::BufferAllocOp op);
@@ -229,6 +232,10 @@ private:
   
   /// Emit intrinsic function declarations
   void emitIntrinsicDeclarations();
+
+  /// Emit a numeric buffer ID from a pynq.buffer typed value.
+  /// Falls back to emitting the value if it isn't a pynq.buffer.
+  void emitBufferId(Value bufferLike);
 };
 } // namespace
 
@@ -249,8 +256,12 @@ public:
       emitter.emitMatMulInstr(matmulOp);
       return true;
     }
-    if (auto transferOp = dyn_cast<pynq::DataTransferOp>(op)) {
-      emitter.emitDataTransfer(transferOp);
+    if (auto transferOp = dyn_cast<pynq::DataTransferInstrOp>(op)) {
+      emitter.emitDataTransferInstr(transferOp);
+      return true;
+    }
+    if (auto copyOp = dyn_cast<pynq::CopyOp>(op)) {
+      emitter.emitCopy(copyOp);
       return true;
     }
     if (auto allocOp = dyn_cast<pynq::BufferAllocOp>(op)) {
@@ -377,7 +388,7 @@ void PYNQCEmitter::emitMatMulInstr(pynq::MatMulInstrOp op) {
   os << ", ";
   emitValue(op.getReduceK());
   os << ", ";
-  emitValue(op.getHeadCount());
+  emitValue(op.getHeadIdx());
   os << ", ";
   emitValue(op.getHeadTileAxis());
   os << ", ";
@@ -388,8 +399,9 @@ void PYNQCEmitter::emitMatMulInstr(pynq::MatMulInstrOp op) {
   emitInfoAndNewLine(op);
 }
 
-void PYNQCEmitter::emitDataTransfer(pynq::DataTransferOp op) {
-  // Generate call to exec_data_load (direction=0) or exec_data_store (direction=1)
+void PYNQCEmitter::emitDataTransferInstr(pynq::DataTransferInstrOp op) {
+  // Generate call to exec_data_load (direction=0) / exec_data_store (direction=1)
+  // or exec_data_to_fifo (direction=2/3).
   // Runtime functions handle both instruction generation and register write
   
   // Try to get constant direction value
@@ -403,17 +415,48 @@ void PYNQCEmitter::emitDataTransfer(pynq::DataTransferOp op) {
       
       indent();
       if (direction == 0) {
-        os << "exec_data_load(";
-      } else {
-        os << "exec_data_store(";
+        os << "exec_data_load((void*)";
+        emitValue(op.getData());
+        os << ", ";
+        emitValue(op.getBufferId());
+        os << ", ";
+        emitValue(op.getTileCount());
+        os << ", ";
+        emitValue(op.getTotalPkgNum());
+        os << ");";
+        emitInfoAndNewLine(op);
+        return;
       }
-      
-      // Emit data pointer (cast to appropriate type)
-      os << "(void*)";
+      if (direction == 1) {
+        os << "exec_data_store((void*)";
+        emitValue(op.getData());
+        os << ", ";
+        emitValue(op.getBufferId());
+        os << ", ";
+        emitValue(op.getTileCount());
+        os << ", ";
+        emitValue(op.getTotalPkgNum());
+        os << ");";
+        emitInfoAndNewLine(op);
+        return;
+      }
+      if (direction == 2 || direction == 3) {
+        // direction=2: host->matrix_fifo (target=0)
+        // direction=3: host->vector_fifo (target=1)
+        int64_t target = (direction == 2) ? 0 : 1;
+        os << "exec_data_to_fifo((void*)";
+        emitValue(op.getData());
+        os << ", ";
+        emitValue(op.getTotalPkgNum());
+        os << ", " << target << ");";
+        emitInfoAndNewLine(op);
+        return;
+      }
+
+      // Unknown constant direction: fall back to store to keep C compilable.
+      os << "exec_data_store((void*)";
       emitValue(op.getData());
       os << ", ";
-      
-      // Emit buffer_id, tile_count, total_pkg_num
       emitValue(op.getBufferId());
       os << ", ";
       emitValue(op.getTileCount());
@@ -425,7 +468,7 @@ void PYNQCEmitter::emitDataTransfer(pynq::DataTransferOp op) {
     }
   }
   
-  // If direction is not constant, emit runtime conditional
+  // If direction is not constant, emit runtime conditional chain.
   indent();
   os << "if (";
   emitValue(directionValue);
@@ -443,7 +486,9 @@ void PYNQCEmitter::emitDataTransfer(pynq::DataTransferOp op) {
   os << ");\n";
   reduceIndent();
   indent();
-  os << "} else {\n";
+  os << "} else if (";
+  emitValue(directionValue);
+  os << " == 1) {\n";
   addIndent();
   indent();
   os << "exec_data_store((void*)";
@@ -457,7 +502,75 @@ void PYNQCEmitter::emitDataTransfer(pynq::DataTransferOp op) {
   os << ");\n";
   reduceIndent();
   indent();
+  os << "} else if (";
+  emitValue(directionValue);
+  os << " == 2) {\n";
+  addIndent();
+  indent();
+  os << "exec_data_to_fifo((void*)";
+  emitValue(op.getData());
+  os << ", ";
+  emitValue(op.getTotalPkgNum());
+  os << ", 0);\n";
+  reduceIndent();
+  indent();
+  os << "} else if (";
+  emitValue(directionValue);
+  os << " == 3) {\n";
+  addIndent();
+  indent();
+  os << "exec_data_to_fifo((void*)";
+  emitValue(op.getData());
+  os << ", ";
+  emitValue(op.getTotalPkgNum());
+  os << ", 1);\n";
+  reduceIndent();
+  indent();
+  os << "} else {\n";
+  addIndent();
+  indent();
+  os << "// Unknown direction; defaulting to store\n";
+  indent();
+  os << "exec_data_store((void*)";
+  emitValue(op.getData());
+  os << ", ";
+  emitValue(op.getBufferId());
+  os << ", ";
+  emitValue(op.getTileCount());
+  os << ", ";
+  emitValue(op.getTotalPkgNum());
+  os << ");\n";
+  reduceIndent();
+  indent();
   os << "}";
+  emitInfoAndNewLine(op);
+}
+
+void PYNQCEmitter::emitBufferId(Value bufferLike) {
+  if (auto bufferType = llvm::dyn_cast<pynq::BufferType>(bufferLike.getType())) {
+    // Prefer emitting the concrete ID (after allocation).
+    if (bufferType.isAllocated()) {
+      os << bufferType.getBufferId();
+      return;
+    }
+    // Virtual buffers don't have a concrete ID yet; emit something stable.
+    // Later lowering/codegen passes should have eliminated this before final C.
+    os << 0;
+    return;
+  }
+  // Fallback: treat as a normal SSA value (e.g., for instr ops using i32 IDs).
+  emitValue(bufferLike);
+}
+
+void PYNQCEmitter::emitCopy(pynq::CopyOp op) {
+  // pynq.copy is an abstract data movement op. In the current pipeline it is
+  // expected to be lowered/expanded into pynq.data_transfer_instr and/or scalar
+  // loops before final codegen.
+  indent();
+  os << "// pynq.copy: ";
+  emitValue(op.getSrc());
+  os << " -> ";
+  emitValue(op.getDst());
   emitInfoAndNewLine(op);
 }
 
@@ -490,7 +603,7 @@ void PYNQCEmitter::emitGELU(pynq::GELUOp op) {
   os << "exec_gelu(";
   
   // GELU operation parameters
-  emitValue(op.getBufferId());
+  emitBufferId(op.getBuffer());
   os << ", ";
   emitValue(op.getTileCount());
   os << ", ";
@@ -504,13 +617,13 @@ void PYNQCEmitter::emitQAdd(pynq::QAddOp op) {
   os << "exec_qadd(";
   
   // QAdd operation parameters
-  emitValue(op.getBufferId());
+  emitBufferId(op.getBuffer());
   os << ", ";
   emitValue(op.getTileCount());
   os << ", ";
   emitValue(op.getReduceK());
   os << ", ";
-  emitValue(op.getExtraBufferId());
+  emitBufferId(op.getExtraBuffer());
   os << ");";
   emitInfoAndNewLine(op);
 }
@@ -520,7 +633,7 @@ void PYNQCEmitter::emitSoftmax(pynq::SoftmaxOp op) {
   os << "exec_softmax(";
   
   // Softmax operation parameters
-  emitValue(op.getBufferId());
+  emitBufferId(op.getBuffer());
   os << ", ";
   emitValue(op.getTileCount());
   os << ", ";
@@ -534,7 +647,7 @@ void PYNQCEmitter::emitLayerNorm(pynq::LayerNormOp op) {
   os << "exec_layernorm(";
   
   // LayerNorm operation parameters
-  emitValue(op.getBufferId());
+  emitBufferId(op.getBuffer());
   os << ", ";
   emitValue(op.getTileCount());
   os << ", ";
@@ -548,7 +661,7 @@ void PYNQCEmitter::emitVectorOp(pynq::VectorOp op) {
   os << "exec_vector(";
   
   // Generic vector operation parameters
-  emitValue(op.getBufferId());
+  emitBufferId(op.getBuffer());
   os << ", ";
   emitValue(op.getTileCount());
   os << ", ";
@@ -556,7 +669,7 @@ void PYNQCEmitter::emitVectorOp(pynq::VectorOp op) {
   os << ", ";
   emitValue(op.getOp());
   os << ", ";
-  emitValue(op.getExtraBufferId());
+  emitBufferId(op.getExtraBuffer());
   os << ");";
   emitInfoAndNewLine(op);
 }
@@ -1166,6 +1279,7 @@ void PYNQCEmitter::emitHeader() {
 #include <stdbool.h>
 #include <stddef.h>
 #include "instr.h"  // Hardware instruction generation functions
+#include "pynq_runtime.h"  // PYNQ runtime API (exec_* helpers)
 #include <pynq_api.h>  // PYNQ shared memory API
 
 )XXX";

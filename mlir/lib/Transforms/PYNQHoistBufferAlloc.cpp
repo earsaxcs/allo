@@ -4,13 +4,19 @@
  * 
  * PYNQ Hoist Buffer Allocation Pass
  * 
- * This pass hoists all pynq.buffer_alloc operations to the entry block of
- * their containing function. This transformation:
- * 1. Makes buffer lifetime analysis easier in subsequent passes
- * 2. Ensures all buffers are declared before use
- * 3. Simplifies buffer ID assignment by having a clear declaration region
- * 
- * The pass should run after vivado->pynq lowering but before buffer allocation.
+ * This pass hoists allocation-like ops to the entry block of their containing
+ * function.
+ *
+ * It performs two related cleanups:
+ * 1) Hoist: move `pynq.buffer_alloc` ops (and tagged spill-slot `memref.alloc`)
+ *    to function entry, simplifying later lowering.
+ * 2) Dedupe: after physical IDs are assigned, merge multiple `pynq.buffer_alloc`
+ *    ops that allocate the same physical buffer ID into a single SSA value.
+ *
+ * Pipeline note:
+ * - If run before ID assignment, it will only hoist.
+ * - If run after `pynq-buffer-allocation`, it will hoist and dedupe same-ID
+ *   allocations.
  * 
  * Example transformation:
  * 
@@ -47,7 +53,11 @@
 #include "mlir/Pass/Pass.h"
 #include "mlir/IR/IRMapping.h"
 
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
+
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/STLExtras.h"
 
 using namespace mlir;
 using namespace mlir::allo;
@@ -75,6 +85,7 @@ public:
   void getDependentDialects(DialectRegistry &registry) const override {
     registry.insert<pynq::PYNQDialect>();
     registry.insert<func::FuncDialect>();
+    registry.insert<memref::MemRefDialect>();
   }
 
   void runOnOperation() override;
@@ -82,6 +93,8 @@ public:
 private:
   /// Process a single function and hoist its buffer allocations
   LogicalResult hoistBuffersInFunction(func::FuncOp funcOp);
+
+  LogicalResult dedupePhysicalBuffersInEntry(func::FuncOp funcOp);
 };
 
 } // end anonymous namespace
@@ -112,43 +125,92 @@ void PYNQHoistBufferAllocPass::runOnOperation() {
 
 LogicalResult PYNQHoistBufferAllocPass::hoistBuffersInFunction(
     func::FuncOp funcOp) {
-  
-  // Collect all buffer_alloc operations in the function
-  SmallVector<BufferAllocOp, 8> allocOps;
-  funcOp.walk([&](BufferAllocOp allocOp) {
-    allocOps.push_back(allocOp);
-  });
-  
-  // If no buffer allocations, nothing to do
-  if (allocOps.empty()) {
-    return success();
+
+  static constexpr StringLiteral kSpillSlotAttrName =
+      "allo.pynq.spill_slot";
+
+  // Collect hoistable ops in a deterministic function order.
+  struct OrderedOp {
+    Operation *op;
+    uint64_t order;
+  };
+  SmallVector<OrderedOp, 64> hoistOps;
+  uint64_t order = 0;
+  for (Block &b : funcOp.getBody().getBlocks()) {
+    for (Operation &op : b.getOperations()) {
+      bool isBufferAlloc = llvm::isa<pynq::BufferAllocOp>(op);
+      bool isSpillSlotAlloc =
+          llvm::isa<memref::AllocOp>(op) && op.hasAttr(kSpillSlotAttrName);
+      if (isBufferAlloc || isSpillSlotAlloc)
+        hoistOps.push_back(OrderedOp{&op, order});
+      ++order;
+    }
   }
-  
-  // Get the entry block of the function
+
+  if (hoistOps.empty())
+    return success();
+
+  llvm::stable_sort(hoistOps, [](const OrderedOp &a, const OrderedOp &b) {
+    return a.order < b.order;
+  });
+
   Block &entryBlock = funcOp.front();
-  
-  // Find the insertion point (after function arguments, before first op)
   auto insertPoint = entryBlock.begin();
-  
-  // Move all buffer_alloc operations to the entry block
-  for (BufferAllocOp allocOp : allocOps) {
-    // Skip if already in entry block at correct position
-    if (allocOp->getBlock() == &entryBlock) {
-      // Update insertion point to be after this alloc
-      auto opIter = allocOp->getIterator();
-      if (++opIter != entryBlock.end()) {
-        insertPoint = opIter;
-      }
+
+  for (const OrderedOp &it : hoistOps) {
+    Operation *op = it.op;
+    if (!op)
+      continue;
+    op->moveBefore(&entryBlock, insertPoint);
+    insertPoint = ++op->getIterator();
+  }
+
+  return dedupePhysicalBuffersInEntry(funcOp);
+}
+
+LogicalResult PYNQHoistBufferAllocPass::dedupePhysicalBuffersInEntry(
+    func::FuncOp funcOp) {
+  Block &entryBlock = funcOp.front();
+
+  // Group physical buffer allocs by assigned buffer ID.
+  llvm::DenseMap<unsigned, pynq::BufferAllocOp> canonicalById;
+  SmallVector<pynq::BufferAllocOp, 32> toErase;
+
+  for (Operation &op : entryBlock.getOperations()) {
+    auto allocOp = llvm::dyn_cast<pynq::BufferAllocOp>(op);
+    if (!allocOp)
+      continue;
+    if (allocOp.isVirtual())
+      continue;
+
+    unsigned id = allocOp.getBufferId();
+
+    auto it = canonicalById.find(id);
+    if (it == canonicalById.end()) {
+      canonicalById[id] = allocOp;
       continue;
     }
-    
-    // Move the operation to the entry block
-    allocOp->moveBefore(&entryBlock, insertPoint);
-    
-    // Update insertion point for next alloc
-    insertPoint = ++allocOp->getIterator();
+
+    pynq::BufferAllocOp canonical = it->second;
+    if (allocOp.getBuffer().getType() != canonical.getBuffer().getType()) {
+      allocOp.emitError()
+          << "cannot deduplicate pynq.buffer_alloc with same buffer_id=" << id
+          << ": mismatched buffer types (capacity/element type differ)";
+      canonical.emitRemark() << "canonical buffer_alloc for buffer_id=" << id;
+      return failure();
+    }
+
+    // Prefer keeping role information if the canonical doesn't have it.
+    if (!canonical.hasRole() && allocOp.hasRole())
+      canonical.setRoleAttr(allocOp.getRoleAttr());
+
+    allocOp.getBuffer().replaceAllUsesWith(canonical.getBuffer());
+    toErase.push_back(allocOp);
   }
-  
+
+  for (auto a : toErase)
+    a.erase();
+
   return success();
 }
 

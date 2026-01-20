@@ -73,7 +73,13 @@ class LayerQuantConfig:
     # Common parameters
     act_bit: int = DEFAULT_ACT_BIT
     act_quant_mode: str = "sym"  # "sym" or "asym"
-    act_per_token: bool = False  # per-token (True) or per-tensor (False)
+    # Legacy: per-token (True) or per-tensor (False). Used as fallback.
+    act_per_token: bool = False
+
+    # New: split per-token behavior for input/output activations.
+    # If None, falls back to act_per_token.
+    input_act_per_token: Optional[bool] = None
+    output_act_per_token: Optional[bool] = None
     
     # Linear/Conv specific
     weight_bit: int = DEFAULT_WEIGHT_BIT
@@ -87,7 +93,12 @@ class LayerQuantConfig:
     act_per_head: bool = False
     
     # LayerNorm specific
+    # Legacy: per hidden-dim (True) or per-tensor (False). Used as fallback.
     act_per_channel: bool = False
+    # New: split LayerNorm input/output behavior.
+    # - input_act_per_token: reuse the common field above
+    # - output_act_per_channel: if None, falls back to act_per_channel
+    output_act_per_channel: Optional[bool] = None
     int_cal_mode: str = "I-ViT"
     
     # MatMul specific (inherits act_* params)
@@ -98,6 +109,8 @@ class LayerQuantConfig:
             'act_bit': self.act_bit,
             'act_quant_mode': self.act_quant_mode,
             'act_per_token': self.act_per_token,
+            'input_act_per_token': self.input_act_per_token,
+            'output_act_per_token': self.output_act_per_token,
             'weight_bit': self.weight_bit,
             'bias_bit': self.bias_bit,
             'wgt_per_channel': self.wgt_per_channel,
@@ -106,6 +119,7 @@ class LayerQuantConfig:
             'out_act_bit': self.out_act_bit,
             'act_per_head': self.act_per_head,
             'act_per_channel': self.act_per_channel,
+            'output_act_per_channel': self.output_act_per_channel,
             'int_cal_mode': self.int_cal_mode,
         }
     
@@ -325,9 +339,11 @@ def get_vit_optimized_config() -> QuantConfig:
     
     # Linear layers: per-channel weights
     config.set_layer_type_config(nn.Linear, wgt_per_channel=False, act_per_token=True)
-    config.set_layer_name_config("attention.linear_k", wgt_per_channel=False, act_per_token=True)
-    config.set_layer_name_config("attention.linear_v", wgt_per_channel=False, act_per_token=True)
-    config.set_layer_name_config("classifier.dense", wgt_per_channel=False, act_per_token=False)
+    config.set_layer_name_config("attention.linear_q", wgt_per_channel=False, input_act_per_token=False, output_act_per_token=True)
+    config.set_layer_name_config("ffn.fc1", wgt_per_channel=False, input_act_per_token=False, output_act_per_token=True)
+    config.set_layer_name_config("attention.linear_k", wgt_per_channel=False, input_act_per_token=False, output_act_per_token=False)
+    config.set_layer_name_config("attention.linear_v", wgt_per_channel=False, input_act_per_token=False, output_act_per_token=False)
+    config.set_layer_name_config("classifier.dense", wgt_per_channel=False, input_act_per_token=False, output_act_per_token=False)
     
     # Conv2d: per-channel weights
     config.set_layer_type_config(nn.Conv2d, wgt_per_channel=False)
@@ -339,7 +355,7 @@ def get_vit_optimized_config() -> QuantConfig:
     config.set_layer_type_config(nn.GELU, act_per_token=True)
     
     # LayerNorm: per-channel (per hidden dim)
-    config.set_layer_type_config(nn.LayerNorm, act_per_channel=True)
+    config.set_layer_type_config(nn.LayerNorm, input_act_per_token=False, output_act_per_channel=False)
     
     # MatMul: per-token
     if MatMul is not None:
@@ -380,6 +396,8 @@ def _create_quant_module(module: nn.Module, config: LayerQuantConfig, quant_cls:
             act_bit=cfg['act_bit'],
             act_quant_mode=cfg['act_quant_mode'],
             act_per_token=cfg['act_per_token'],
+            input_act_per_token=cfg.get('input_act_per_token', None),
+            output_act_per_token=cfg.get('output_act_per_token', None),
             wgt_per_channel=cfg['wgt_per_channel'],
         )
     
@@ -419,6 +437,8 @@ def _create_quant_module(module: nn.Module, config: LayerQuantConfig, quant_cls:
             out_act_bit=cfg['act_bit'],
             act_quant_mode=cfg['act_quant_mode'],
             act_per_channel=cfg['act_per_channel'],
+            input_act_per_token=bool(cfg.get('input_act_per_token', False)) if cfg.get('input_act_per_token', None) is not None else False,
+            output_act_per_channel=cfg.get('output_act_per_channel', None),
             int_cal_mode=cfg['int_cal_mode'],
         )
     

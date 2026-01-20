@@ -261,7 +261,7 @@ def qmatmul(lhs, rhs,
         fused_scale_sign, fused_scale_coe, fused_scale_rshift,
             o_scale_sign, o_scale_coe, o_scale_rshift,
             o_scale_inv_sign, o_scale_inv_coe, o_scale_inv_rshift,
-            x_zero=None, y_zero=None, o_zero=None, name=None):
+            x_zero=None, y_zero=None, o_zero=None, layer_type="unknown", name=None):
     """QMatMul 的 DSL 包装器 - 接受定点化的 scale 参数"""
     pass
 
@@ -271,7 +271,7 @@ def qmatmul_isqrtd(lhs, rhs,
         fused_scale_sign, fused_scale_coe, fused_scale_rshift,
             o_scale_sign, o_scale_coe, o_scale_rshift,
             o_scale_inv_sign, o_scale_inv_coe, o_scale_inv_rshift,
-            x_zero=None, y_zero=None, o_zero=None, name=None):
+            x_zero=None, y_zero=None, o_zero=None, layer_type="unknown", name=None):
     """QMatMul 的 DSL 包装器 - 接受定点化的 scale 参数"""
     pass
 def qadd(lhs, rhs, 

@@ -463,6 +463,24 @@ struct QMatMulLoweringPattern : public OpRewritePattern<allo_ops::QMatMulOp> {
     Value yZero = op.getYZero();
     Value oZero = op.getOZero();
 
+    // Preserve layer_type for downstream Vivado transforms/optimizations
+    auto layerType = op.getLayerTypeAttr();
+
+    // Initialize rhs_layout/reduce_dim based on layer_type.
+    // reduce_dim is the reduction (K) axis on RHS.
+    // - attn.QK: rhs is K    -> "bhdl" layout; reduce_dim = 2 (d axis in B,H,D,L)
+    // - attn.SV: rhs is V    -> "blhd" layout; reduce_dim = 1 (l axis in B,L,H,D)
+    // For other/unknown layer types, keep historical defaults.
+    auto rhsLayoutAttr = rewriter.getStringAttr("bhld");
+    auto reduceDimAttr = rewriter.getI32IntegerAttr(2);
+    if (layerType && layerType.getValue() == "attn.QK") {
+      rhsLayoutAttr = rewriter.getStringAttr("bhdl");
+      reduceDimAttr = rewriter.getI32IntegerAttr(2);
+    } else if (layerType && layerType.getValue() == "attn.SV") {
+      rhsLayoutAttr = rewriter.getStringAttr("bhld");
+      reduceDimAttr = rewriter.getI32IntegerAttr(2);
+    }
+
     // Create vivado.qmatmul op with packed scales
     rewriter.replaceOpWithNewOp<vivado_ops::QMatMulOp>(
         op, output, lhs, rhs,
@@ -483,8 +501,9 @@ struct QMatMulLoweringPattern : public OpRewritePattern<allo_ops::QMatMulOp> {
         rewriter.getStringAttr(kScaleCoeModeAttr),  // scale_coe_mode
         rewriter.getBoolAttr(false),                // transpose_mode
         rewriter.getBoolAttr(false),                // is_transposed
-        rewriter.getStringAttr("bhld"),            // rhs_layout
-        rewriter.getI32IntegerAttr(2)               // reduce_dim (L dim for bhld)
+        rhsLayoutAttr,                              // rhs_layout
+        reduceDimAttr,                              // reduce_dim
+        layerType                                   // layer_type
     );
 
     return success();
@@ -750,7 +769,8 @@ struct IntSoftmaxLoweringPattern : public OpRewritePattern<allo_ops::IntSoftmaxO
     Value outputZero = op.getOutputZero();
     
     // TODO：add axis parameter
-    int64_t axis = 1; // op.getAxis();
+    // For 4-D tensor, default to axis=3 (last dimension)
+    int64_t axis = 3; // op.getAxis();
 
     // Create vivado.int_softmax with LUT implementation
     rewriter.replaceOpWithNewOp<vivado_ops::IntSoftmaxOp>(
@@ -989,6 +1009,21 @@ struct QMatMulIsqrtDLoweringPattern : public OpRewritePattern<allo_ops::QMatMulI
     Value yZero = op.getYZero();
     Value oZero = op.getOZero();
 
+    // Preserve layer_type for downstream Vivado transforms/optimizations
+    auto layerType = op.getLayerTypeAttr();
+
+    // Initialize rhs_layout/reduce_dim based on layer_type.
+    // reduce_dim is the reduction (K) axis on RHS.
+    auto rhsLayoutAttr = rewriter.getStringAttr("bhdl");
+    auto reduceDimAttr = rewriter.getI32IntegerAttr(2);
+    if (layerType && layerType.getValue() == "attn.SV") {
+      rhsLayoutAttr = rewriter.getStringAttr("bhld");
+      reduceDimAttr = rewriter.getI32IntegerAttr(2);
+    } else if (layerType && layerType.getValue() == "attn.QK") {
+      rhsLayoutAttr = rewriter.getStringAttr("bhdl");
+      reduceDimAttr = rewriter.getI32IntegerAttr(2);
+    }
+
     rewriter.replaceOpWithNewOp<vivado_ops::QMatMulIsqrtDOp>(
         op, output, lhs, rhs,
       xScale, yScale, fusedScale, oScale, oScaleInv,
@@ -1008,8 +1043,9 @@ struct QMatMulIsqrtDLoweringPattern : public OpRewritePattern<allo_ops::QMatMulI
         rewriter.getStringAttr(kScaleCoeModeAttr),
         rewriter.getBoolAttr(false),                // transpose_mode
         rewriter.getBoolAttr(false),                // is_transposed
-        rewriter.getStringAttr("bhdl"),            // rhs_layout
-        rewriter.getI32IntegerAttr(3)               // reduce_dim (L dim for bhdl)
+        rhsLayoutAttr,                              // rhs_layout
+        reduceDimAttr,                              // reduce_dim
+        layerType                                   // layer_type
     );
 
     return success();

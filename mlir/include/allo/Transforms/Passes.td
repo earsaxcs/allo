@@ -52,12 +52,16 @@ def MergeSubviewAndCopy : Pass<"merge-subview-and-copy", "ModuleOp"> {
 // PYNQ Backend Passes
 //===----------------------------------------------------------------------===//
 
-def PYNQHoistBufferAlloc : Pass<"pynq-hoist-buffer-alloc", "func::FuncOp"> {
-  let summary = "Hoist pynq.buffer_alloc ops to function entry block";
+def PYNQHoistBufferAlloc : Pass<"pynq-hoist-buffer-alloc", "ModuleOp"> {
+  let summary = "Hoist allocation ops to function entry and dedupe same-ID buffers";
   let description = [{
-    This pass moves all pynq.buffer_alloc operations to the entry block of
-    each function. This simplifies subsequent buffer allocation analysis by
-    placing all buffer declarations in a single location.
+    This pass moves allocation-like ops to the entry block of each function.
+    It primarily hoists `pynq.buffer_alloc` and also hoists allocator-inserted
+    spill slots (`memref.alloc` tagged as spill slots).
+
+    When run after `pynq-buffer-allocation`, it additionally deduplicates
+    multiple `pynq.buffer_alloc` ops that allocate the same physical buffer ID,
+    rewriting all uses to a single SSA value.
     
     Compilation Flow:
     ```
@@ -80,13 +84,14 @@ def PYNQHoistBufferAlloc : Pass<"pynq-hoist-buffer-alloc", "func::FuncOp"> {
     }
     ```
     
-    This pass should run before PYNQBufferAllocation.
+    This pass is typically run after PYNQBufferAllocation.
   }];
   let constructor = "mlir::allo::createPYNQHoistBufferAllocPass()";
   
   let dependentDialects = [
     "mlir::allo::pynq::PYNQDialect",
-    "mlir::func::FuncDialect"
+    "mlir::func::FuncDialect",
+    "mlir::memref::MemRefDialect"
   ];
 }
 
@@ -143,6 +148,86 @@ def PYNQBufferAllocation : Pass<"pynq-buffer-allocation", "ModuleOp"> {
   
   let dependentDialects = [
     "mlir::allo::pynq::PYNQDialect"
+  ];
+}
+
+def PYNQSimplifyHostTransfers : Pass<"pynq-simplify-host-transfers", "ModuleOp"> {
+  let summary = "(WIP) Simplify redundant host memref transfers between PYNQ buffers";
+  let description = [{
+    This pass is planned to reduce unnecessary buffer->memref->buffer round-trips
+    after `lower-vivado-to-pynq`, keeping data in `!pynq.buffer` whenever possible.
+
+    Current status: scaffolding / dry-run (no IR rewrite by default).
+  }];
+  let constructor = "mlir::allo::createPYNQSimplifyHostTransfersPass()";
+  let dependentDialects = [
+    "mlir::allo::pynq::PYNQDialect",
+    "mlir::func::FuncDialect",
+    "mlir::memref::MemRefDialect"
+  ];
+}
+
+def PYNQElideRedundantCopies : Pass<"pynq-elide-redundant-copies", "ModuleOp"> {
+  let summary = "Elide redundant pynq.copy ops by forwarding buffer reads";
+  let description = [{
+    This pass performs copy forwarding/copy propagation for `!pynq.buffer`.
+    It is intended to run after host-transfer simplifications, and can reduce
+    intermediate buffer usage by rewriting users of a buffer to directly use
+    the buffer that most recently defined its contents.
+
+    Current status: conservative, block-local forwarding (CFG dataflow TBD).
+  }];
+  let constructor = "mlir::allo::createPYNQElideRedundantCopiesPass()";
+  let dependentDialects = [
+    "mlir::allo::pynq::PYNQDialect",
+    "mlir::func::FuncDialect"
+  ];
+}
+
+def PYNQScheduleOps : Pass<"pynq-schedule-ops", "ModuleOp"> {
+  let summary = "Conservatively schedule pynq ops to reduce peak live buffers";
+  let description = [{
+    This pass performs conservative block-local scheduling of a subset of
+    PYNQ operations to reduce the estimated peak number of simultaneously-live
+    `!pynq.buffer` values.
+
+    Correctness-first design:
+    - Only reorders within a single basic block.
+    - Only schedules within contiguous windows of known PYNQ ops.
+    - Treats unknown ops, `pynq.sync`, and terminators as barriers.
+    - Preserves SSA def-use dependencies and per-buffer write ordering.
+
+    Default mode is dry-run (analysis only).
+  }];
+  let constructor = "mlir::allo::createPYNQScheduleOpsPass()";
+  let dependentDialects = [
+    "mlir::allo::pynq::PYNQDialect",
+    "mlir::func::FuncDialect"
+  ];
+}
+
+def PYNQMidLower : Pass<"pynq-mid-lower", "ModuleOp"> {
+  let summary = "Mid-lower PYNQ ops: pack scale/bias to FIFO transfers and lower to instr ops";
+  let description = [{
+    This pass separates scale/bias transfers from compute operations.
+
+    It:
+    - Walks PYNQ compute ops in IR order and collects their bound scale (+bias for layernorm)
+      from memref.global constants.
+    - Preprocesses scales (chunking + half-interleave, plus block-wise stacking for multi-scale vector ops).
+    - Packs scales into per-transfer memref.global blobs and inserts pynq.data_transfer_instr to stream
+      them to the hardware FIFOs (direction=2 for matrix FIFO, direction=3 for vector FIFO).
+    - Lowers pynq.matmul and vector ops to their corresponding *_instr ops, removing scale bindings.
+    - Lowers pynq.copy to pynq.data_transfer_instr for host<->device transfers.
+
+    This pass must run after pynq-buffer-allocation; any virtual !pynq.buffer triggers an error.
+  }];
+  let constructor = "mlir::allo::createPYNQMidLowerPass()";
+  let dependentDialects = [
+    "mlir::allo::pynq::PYNQDialect",
+    "mlir::func::FuncDialect",
+    "mlir::memref::MemRefDialect",
+    "mlir::arith::ArithDialect"
   ];
 }
 

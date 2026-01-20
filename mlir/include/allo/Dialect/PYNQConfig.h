@@ -74,6 +74,24 @@ struct DMAConfig {
   static constexpr int32_t kDirectionStore = 1;
 };
 
+/// FIFO transfer configuration for scale/bias streaming
+struct FIFOConfig {
+  /// Chunk granularity (in elements) for matrix-op scales
+  static constexpr int32_t kMatrixScaleChunk = 32;
+
+  /// Chunk granularity (in elements) for vector-op scales
+  static constexpr int32_t kVectorScaleChunk = 32;
+
+  /// Chunk granularity (in elements) for vector-op bias (used by LayerNorm)
+  static constexpr int32_t kBiasChunk = 64;
+
+  /// Direction code for transferring matrix scales to matrix FIFO
+  static constexpr int32_t kDirectionMatrixScaleFIFO = 2;
+
+  /// Direction code for transferring vector scales/bias to vector FIFO
+  static constexpr int32_t kDirectionVectorScaleFIFO = 3;
+};
+
 /// Instruction encoding configuration
 struct InstrConfig {
   /// Buffer ID field width (3 bits, range 0-7)
@@ -83,6 +101,9 @@ struct InstrConfig {
   static constexpr unsigned kTileCountWidth = 3;
 
   /// Tile Size (32 Bytes)
+  // NOTE: This is different from TileConfig kDefaultTileM which is in elements
+  // TileConfig::kDefaultTileM is a Matrix which is supported by the hardware standardly
+  // InstrConfig::kTileSize is the basic unit size in the instruction encoding the columns (not rows)
   static constexpr int32_t kTileSize = 32;
 
   /// Package count field width (12 bits, 0-4095)

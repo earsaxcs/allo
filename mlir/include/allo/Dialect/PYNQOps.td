@@ -185,7 +185,7 @@ def PYNQ_MatMulInstrOp : PYNQ_Op<"matmul_instr", []> {
       bits[9:11]  - input_tile_count (3 bits, value 1-8)
       bits[12:14] - weight_tile_count (3 bits, value 1-8)
       bits[15:22] - reduce_k (8 bits, reduction dimension size, 1-256)
-      bits[23:24] - head_count (2 bits, number of attention heads, 1-4)
+      bits[23:24] - head_idx (2 bits, index of attention heads, 0-3 because it's idx not count, base is 0)
       bits[25]    - head_tile_axis (1 bit, tiling axis for multi-head attention)
       bits[26:29] - reserved (4 bits)
       bit[30]     - enable_bias (1 bit, add bias vector: 0=no, 1=yes)
@@ -201,13 +201,13 @@ def PYNQ_MatMulInstrOp : PYNQ_Op<"matmul_instr", []> {
     - Buffer IDs must be in range [0, 7]
     - Tile counts must be in range [1, 8]
     - reduce_k must be in range [1, 256]
-    - head_count must be in range [1, 4]
+    - head_idx must be in range [0, 3]
     
     Example:
       pynq.matmul_instr 
         input_buf = %c0, weight_buf = %c1, output_buf = %c2,
         input_tiles = %c4, weight_tiles = %c4, reduce_k = %c32,
-        head_count = %c0, head_tile_axis = %c0,
+        head_idx = %c1, head_tile_axis = %c0,
         enable_bias = %c0, enable_transpose = %c0
   }];
   
@@ -218,7 +218,7 @@ def PYNQ_MatMulInstrOp : PYNQ_Op<"matmul_instr", []> {
     I32:$input_tile_count,     // Input tile count (1-8)
     I32:$weight_tile_count,    // Weight tile count (1-8)
     I32:$reduce_k,             // Reduction dimension size (1-256)
-    I32:$head_count,           // Number of attention heads (1-4)
+    I32:$head_idx,             // Index of attention heads (0-3)
     I32:$head_tile_axis,       // Tiling axis for multi-head attention (0 or 1)
     I32:$enable_bias,          // Add bias vector (0=no, 1=yes)
     I32:$enable_transpose      // Transpose weight matrix (0=no, 1=yes)
@@ -233,7 +233,7 @@ def PYNQ_MatMulInstrOp : PYNQ_Op<"matmul_instr", []> {
     `input_tiles` `=` $input_tile_count `,`
     `weight_tiles` `=` $weight_tile_count `,`
     `reduce_k` `=` $reduce_k `,`
-    `head_count` `=` $head_count `,`
+    `head_idx` `=` $head_idx `,`
     `head_tile_axis` `=` $head_tile_axis `,`
     `enable_bias` `=` $enable_bias `,`
     `enable_transpose` `=` $enable_transpose
@@ -244,10 +244,61 @@ def PYNQ_MatMulInstrOp : PYNQ_Op<"matmul_instr", []> {
 }
 
 //===----------------------------------------------------------------------===//
-// PYNQ Data Transfer Op
+// PYNQ MatMul Op (Higher-level, with scale binding and pynq.buffer operands)
 //===----------------------------------------------------------------------===//
 
-def PYNQ_DataTransferOp : PYNQ_Op<"data_transfer", []> {
+def PYNQ_MatMulOp : PYNQ_Op<"matmul", []> {
+  let summary = "Higher-level matmul op with fused_scale binding";
+  let description = [{
+    Higher-level matrix multiplication operation.
+
+    This op is intended to be used in mid-level PYNQ compilation passes.
+    It carries a host-side fused_scale binding and uses abstract PYNQ buffers
+    (pynq.buffer) instead of raw numeric buffer IDs.
+
+    The parameter list matches pynq.matmul_instr 1:1, except that the three
+    buffer operands are `pynq.buffer` values.
+  }];
+
+  let arguments = (ins
+    AnyMemRef:$fused_scale,      // Host-side fused_scale binding (not encoded)
+    AnyPYNQBuffer:$input_buffer, // Abstract input buffer
+    AnyPYNQBuffer:$weight_buffer,// Abstract weight buffer
+    AnyPYNQBuffer:$output_buffer,// Abstract output buffer
+    I32:$input_tile_count,       // Input tile count (1-8)
+    I32:$weight_tile_count,      // Weight tile count (1-8)
+    I32:$reduce_k,               // Reduction dimension size (1-256)
+    I32:$head_idx,             // Index of attention heads (0-3)
+    I32:$head_tile_axis,         // Tiling axis for multi-head attention (0 or 1)
+    I32:$enable_bias,            // Add bias vector (0=no, 1=yes)
+    I32:$enable_transpose        // Transpose weight matrix (0=no, 1=yes)
+  );
+
+  let results = (outs);
+
+  let assemblyFormat = [{
+    `fused_scale` `=` $fused_scale `:` type($fused_scale) `,`
+    `input_buf` `=` $input_buffer `:` type($input_buffer) `,`
+    `weight_buf` `=` $weight_buffer `:` type($weight_buffer) `,`
+    `output_buf` `=` $output_buffer `:` type($output_buffer) `,`
+    `input_tiles` `=` $input_tile_count `,`
+    `weight_tiles` `=` $weight_tile_count `,`
+    `reduce_k` `=` $reduce_k `,`
+    `head_idx` `=` $head_idx `,`
+    `head_tile_axis` `=` $head_tile_axis `,`
+    `enable_bias` `=` $enable_bias `,`
+    `enable_transpose` `=` $enable_transpose
+    attr-dict
+  }];
+
+  let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
+// PYNQ Data Transfer Instruction Op
+//===----------------------------------------------------------------------===//
+
+def PYNQ_DataTransferInstrOp : PYNQ_Op<"data_transfer_instr", []> {
   let summary = "DMA data transfer between host and device";
   let description = [{
     Transfers matrix data between host memory and on-chip buffer via DMA.
@@ -281,11 +332,11 @@ def PYNQ_DataTransferOp : PYNQ_Op<"data_transfer", []> {
     
     Example:
       // Load input matrix to buffer 0
-      pynq.data_transfer %input_memref, buffer_id = %c0, tiles = %c4, 
+      pynq.data_transfer_instr %input_memref, buffer_id = %c0, tiles = %c4, 
                         total_pkg_num = %c128, direction = 0
       
       // Store result from buffer 2 back to host
-      pynq.data_transfer %output_memref, buffer_id = %c2, tiles = %c4,
+      pynq.data_transfer_instr %output_memref, buffer_id = %c2, tiles = %c4,
                         total_pkg_num = %c128, direction = 1
   }];
   
@@ -294,7 +345,7 @@ def PYNQ_DataTransferOp : PYNQ_Op<"data_transfer", []> {
     I32:$buffer_id,           // On-chip buffer ID (0-7)
     I32:$tile_count,          // Number of tiles (1-8)
     I32:$total_pkg_num,       // Total number of packages to transfer
-    I32:$direction            // 0 = host->device, 1 = device->host
+    I32:$direction            // 0 = host->device, 1 = device->host, 2 = host->matrix_fifo, 3 = host->vector_fifo
   );
   
   let results = (outs);
@@ -309,6 +360,36 @@ def PYNQ_DataTransferOp : PYNQ_Op<"data_transfer", []> {
   }];
   
   let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
+// PYNQ Copy Op (Abstract data movement)
+//===----------------------------------------------------------------------===//
+
+// A copy endpoint can be either a host-side memref or a PYNQ on-chip buffer.
+def PYNQ_CopyEndpointType : AnyTypeOf<[AnyMemRef, AnyPYNQBuffer]>;
+
+def PYNQ_CopyOp : PYNQ_Op<"copy", []> {
+  let summary = "Abstract copy between memrefs and/or PYNQ buffers";
+  let description = [{
+    Models a data movement operation between two endpoints. Each endpoint can be
+    either a host-side memref or a PYNQ on-chip buffer.
+
+    This op is intended as a simple, high-level placeholder that can be
+    expanded/lowered into concrete DMA transfers (pynq.data_transfer_instr) and/or
+    scalar loops in later passes.
+  }];
+
+  let arguments = (ins
+    PYNQ_CopyEndpointType:$src,
+    PYNQ_CopyEndpointType:$dst
+  );
+
+  let results = (outs);
+
+  let assemblyFormat = [{
+    $src `,` $dst attr-dict `:` type($src) `,` type($dst)
+  }];
 }
 
 // TODO: Add support for DDR to FIFO of Matrix/Vector
@@ -336,6 +417,47 @@ def PYNQ_DataTransferOp : PYNQ_Op<"data_transfer", []> {
 // a cleaner interface and hide the op encoding detail.
 //===----------------------------------------------------------------------===//
 
+//===----------------------------------------------------------------------===//
+// PYNQ Vector Instruction Op (low-level reference)
+//===----------------------------------------------------------------------===//
+
+def PYNQ_VectorInstrOp : PYNQ_Op<"vector_instr", []> {
+  let summary = "Generic hardware vector instruction (raw IDs)";
+  let description = [{
+    Encodes a single PYNQ vector instruction that executes on the accelerator.
+    This is a low-level reference op mirroring gen_vector_instr() in instr.h.
+
+    Instruction format (32 bits) - gen_vector_instr():
+      bits[0:2]   - buffer_id (3 bits, primary buffer ID)
+      bits[3:5]   - tile_count (3 bits, value 1-8)
+      bits[6:13]  - reduce_k (8 bits, 1-256)
+      bits[14:15] - op (2 bits, operation type)
+      bits[16:18] - extra_buffer_id (3 bits, secondary buffer ID)
+      bits[19:31] - reserved (13 bits)
+  }];
+
+  let arguments = (ins
+    I32:$buffer_id,           // Primary buffer ID (0-7)
+    I32:$tile_count,          // Tile count (1-8)
+    I32:$reduce_k,            // Reduce dimension size (1-256)
+    I32:$op,                  // Operation type (0-3)
+    I32:$extra_buffer_id      // Secondary buffer ID (0-7)
+  );
+
+  let results = (outs);
+
+  let assemblyFormat = [{
+    `buffer_id` `=` $buffer_id `,`
+    `tiles` `=` $tile_count `,`
+    `reduce_k` `=` $reduce_k `,`
+    `op` `=` $op `,`
+    `extra_buffer_id` `=` $extra_buffer_id
+    attr-dict
+  }];
+
+  let hasVerifier = 1;
+}
+
 // Base class for all vector operations (with extra_buffer_id)
 class PYNQ_VectorOpBase<string mnemonic, string opSummary, int opCode> 
     : PYNQ_Op<mnemonic, []> {
@@ -353,21 +475,21 @@ class PYNQ_VectorOpBase<string mnemonic, string opSummary, int opCode>
       bits[19:31] - reserved (13 bits)
   }];
   
-  // Common arguments for vector ops (all u32 to match instr.h)
+  // Common arguments for vector ops.
   let arguments = (ins
-    I32:$buffer_id,           // Primary buffer ID (0-7)
+    AnyPYNQBuffer:$buffer, // Primary buffer (pynq.buffer)
     I32:$tile_count,          // Tile count (1-8)
     I32:$reduce_k,            // Reduce dimension size (1-256)
-    I32:$extra_buffer_id      // Secondary buffer ID (0-7, for ops that need it)
+    AnyPYNQBuffer:$extra_buffer // Secondary buffer (pynq.buffer), for ops that need it
   );
   
   let results = (outs);
   
   let assemblyFormat = [{
-    `buffer_id` `=` $buffer_id `,`
+    `buffer` `=` $buffer `:` type($buffer) `,`
     `tiles` `=` $tile_count `,`
     `reduce_k` `=` $reduce_k `,`
-    `extra_buffer_id` `=` $extra_buffer_id
+    `extra_buffer` `=` $extra_buffer `:` type($extra_buffer)
     attr-dict
   }];
   
@@ -401,14 +523,14 @@ class PYNQ_SimpleVectorOpBase<string mnemonic, string opSummary, int opCode>
   
   // Override: Arguments without extra_buffer_id
   let arguments = (ins
-    I32:$buffer_id,           // Primary buffer ID (0-7)
+    AnyPYNQBuffer:$buffer, // Primary buffer (pynq.buffer)
     I32:$tile_count,          // Tile count (1-8)
     I32:$reduce_k             // Reduce dimension size (1-256)
   );
   
   // Override: Simplified assembly format
   let assemblyFormat = [{
-    `buffer_id` `=` $buffer_id `,`
+    `buffer` `=` $buffer `:` type($buffer) `,`
     `tiles` `=` $tile_count `,`
     `reduce_k` `=` $reduce_k
     attr-dict
@@ -445,7 +567,24 @@ def PYNQ_GELUOp : PYNQ_SimpleVectorOpBase<"gelu",
     where Φ is the cumulative distribution function of standard normal.
     
     Example:
-      pynq.gelu buffer_id = %c0, tiles = %c4, reduce_k = %c128
+      pynq.gelu buffer = %buf0 : !pynq.buffer<i8, ?, 4096>, tiles = %c4, reduce_k = %c128
+  }];
+
+  let arguments = (ins
+    AnyMemRef:$in_scale,        // Host-side input scale binding
+    AnyMemRef:$out_scale_inv,   // Host-side output inverse scale binding
+    AnyPYNQBuffer:$buffer,      // Primary buffer (pynq.buffer)
+    I32:$tile_count,            // Tile count (1-8)
+    I32:$reduce_k               // Reduce dimension size (1-256)
+  );
+
+  let assemblyFormat = [{
+    `in_scale` `=` $in_scale `:` type($in_scale) `,`
+    `out_scale_inv` `=` $out_scale_inv `:` type($out_scale_inv) `,`
+    `buffer` `=` $buffer `:` type($buffer) `,`
+    `tiles` `=` $tile_count `,`
+    `reduce_k` `=` $reduce_k
+    attr-dict
   }];
 }
 
@@ -472,8 +611,29 @@ def PYNQ_QAddOp : PYNQ_VectorOpBase<"qadd",
     
     Example:
       // Add buffer 1 to buffer 0: buf0 = buf0 + buf1
-      pynq.qadd buffer_id = %c0, tiles = %c4, reduce_k = %c128,
-                extra_buffer_id = %c1
+      pynq.qadd buffer = %buf0 : !pynq.buffer<i8, ?, 4096>, tiles = %c4, reduce_k = %c128,
+                extra_buffer = %buf1 : !pynq.buffer<i8, ?, 4096>
+  }];
+
+  let arguments = (ins
+    AnyMemRef:$x_scale,         // Host-side scale for primary input (buffer_id)
+    AnyMemRef:$y_scale,         // Host-side scale for secondary input (extra_buffer_id)
+    AnyMemRef:$o_scale_inv,     // Host-side inverse scale for output
+    AnyPYNQBuffer:$buffer,      // Primary buffer (pynq.buffer)
+    I32:$tile_count,            // Tile count (1-8)
+    I32:$reduce_k,              // Reduce dimension size (1-256)
+    AnyPYNQBuffer:$extra_buffer // Secondary buffer (pynq.buffer)
+  );
+
+  let assemblyFormat = [{
+    `x_scale` `=` $x_scale `:` type($x_scale) `,`
+    `y_scale` `=` $y_scale `:` type($y_scale) `,`
+    `o_scale_inv` `=` $o_scale_inv `:` type($o_scale_inv) `,`
+    `buffer` `=` $buffer `:` type($buffer) `,`
+    `tiles` `=` $tile_count `,`
+    `reduce_k` `=` $reduce_k `,`
+    `extra_buffer` `=` $extra_buffer `:` type($extra_buffer)
+    attr-dict
   }];
 }
 
@@ -499,7 +659,24 @@ def PYNQ_SoftmaxOp : PYNQ_SimpleVectorOpBase<"softmax",
     reduce_k specifies the dimension size for softmax normalization.
     
     Example:
-      pynq.softmax buffer_id = %c0, tiles = %c4, reduce_k = %c32
+      pynq.softmax buffer = %buf0 : !pynq.buffer<i8, ?, 4096>, tiles = %c4, reduce_k = %c32
+  }];
+
+  let arguments = (ins
+    AnyMemRef:$in_scale,        // Host-side input scale binding
+    AnyMemRef:$out_scale_inv,   // Host-side output inverse scale binding
+    AnyPYNQBuffer:$buffer,      // Primary buffer (pynq.buffer)
+    I32:$tile_count,            // Tile count (1-8)
+    I32:$reduce_k               // Reduce dimension size (1-256)
+  );
+
+  let assemblyFormat = [{
+    `in_scale` `=` $in_scale `:` type($in_scale) `,`
+    `out_scale_inv` `=` $out_scale_inv `:` type($out_scale_inv) `,`
+    `buffer` `=` $buffer `:` type($buffer) `,`
+    `tiles` `=` $tile_count `,`
+    `reduce_k` `=` $reduce_k
+    attr-dict
   }];
 }
 
@@ -524,7 +701,24 @@ def PYNQ_LayerNormOp : PYNQ_SimpleVectorOpBase<"layernorm",
     The operation normalizes the data in-place on the specified buffer.
     
     Example:
-      pynq.layernorm buffer_id = %c0, tiles = %c4, reduce_k = %c64
+      pynq.layernorm fused_scale = %fs : memref<256xi32>, bias_int = %bias : memref<256xi16>, buffer = %buf0 : !pynq.buffer<i8, ?, 4096>, tiles = %c4, reduce_k = %c64
+  }];
+
+  let arguments = (ins
+    AnyMemRef:$fused_scale,     // Host-side fused_scale binding
+    AnyMemRef:$bias_int,        // Host-side bias_int binding
+    AnyPYNQBuffer:$buffer,      // Primary buffer (pynq.buffer)
+    I32:$tile_count,            // Tile count (1-8)
+    I32:$reduce_k               // Reduce dimension size (1-256)
+  );
+
+  let assemblyFormat = [{
+    `fused_scale` `=` $fused_scale `:` type($fused_scale) `,`
+    `bias_int` `=` $bias_int `:` type($bias_int) `,`
+    `buffer` `=` $buffer `:` type($buffer) `,`
+    `tiles` `=` $tile_count `,`
+    `reduce_k` `=` $reduce_k
+    attr-dict
   }];
 }
 
@@ -558,26 +752,26 @@ def PYNQ_VectorOp : PYNQ_Op<"vector_op", []> {
     - pynq.layernorm (op = 3)
     
     Example:
-      pynq.vector_op buffer_id = %c0, tiles = %c4, reduce_k = %c32,
-                     op = %c1, extra_buffer_id = %c1
+      pynq.vector_op buffer = %buf0 : !pynq.buffer<i8, ?, 4096>, tiles = %c4, reduce_k = %c32,
+                     op = %c1, extra_buffer = %buf1 : !pynq.buffer<i8, ?, 4096>
   }];
   
   let arguments = (ins
-    I32:$buffer_id,           // Primary buffer ID (0-7)
+    AnyPYNQBuffer:$buffer, // Primary buffer (pynq.buffer)
     I32:$tile_count,          // Tile count (1-8)
     I32:$reduce_k,            // Operation parameter (1-256)
     I32:$op,                  // Operation type (0-3)
-    I32:$extra_buffer_id      // Secondary buffer ID (0-7)
+    AnyPYNQBuffer:$extra_buffer // Secondary buffer (pynq.buffer)
   );
   
   let results = (outs);
   
   let assemblyFormat = [{
-    `buffer_id` `=` $buffer_id `,`
+    `buffer` `=` $buffer `:` type($buffer) `,`
     `tiles` `=` $tile_count `,`
     `reduce_k` `=` $reduce_k `,`
     `op` `=` $op `,`
-    `extra_buffer_id` `=` $extra_buffer_id
+    `extra_buffer` `=` $extra_buffer `:` type($extra_buffer)
     attr-dict
   }];
   
@@ -650,19 +844,18 @@ def PYNQ_QuantOp : PYNQ_Op<"quant", []> {
   let arguments = (ins
     AnyMemRef:$output,           // Output integer memref (pre-allocated)
     AnyMemRef:$input,            // Input float memref
-    I32:$scale,                  // Packed scale (sign, coe, rshift in 32-bit)
-    Optional<I32>:$zero,         // Zero point (for asymmetric mode)
+    AnyMemRef:$scale,                  // Packed scale (sign, coe, rshift in 32-bit)
+    Optional<AnyMemRef>:$zero,         // Zero point (for asymmetric mode)
     I8Attr:$quant_mode           // Quantization mode (0-3)
   );
   
   let results = (outs);
   
   let assemblyFormat = [{
-    `output` `=` $output `,` `input` `=` $input `,`
-    `scale` `=` $scale
-    (`zero` `=` $zero^)?
-    `quant_mode` `=` $quant_mode attr-dict `:` 
-    type($output) `,` type($input)
+    `output` `=` $output `:` type($output) `,` `input` `=` $input `:` type($input) `,`
+    `scale` `=` $scale `:` type($scale)
+    (`zero` `=` $zero^ `:` type($zero))?
+    `quant_mode` `=` $quant_mode attr-dict
   }];
 }
 
@@ -702,18 +895,75 @@ def PYNQ_DequantOp : PYNQ_Op<"dequant", []> {
   let arguments = (ins
     AnyMemRef:$output,           // Output float memref (pre-allocated)
     AnyMemRef:$input,            // Input integer memref
-    I32:$scale,                  // Packed scale (sign, coe, rshift in 32-bit)
-    Optional<I32>:$zero,         // Zero point (for asymmetric mode)
+    AnyMemRef:$scale,                  // Packed scale (sign, coe, rshift in 32-bit)
+    Optional<AnyMemRef>:$zero,         // Zero point (for asymmetric mode)
     I8Attr:$quant_mode           // Quantization mode (0-3)
   );
   
   let results = (outs);
   
   let assemblyFormat = [{
-    `output` `=` $output `,` `input` `=` $input `,`
-    `scale` `=` $scale
-    (`zero` `=` $zero^)?
-    `quant_mode` `=` $quant_mode attr-dict `:` 
+    `output` `=` $output `:` type($output) `,` `input` `=` $input `:` type($input) `,`
+    `scale` `=` $scale `:` type($scale)
+    (`zero` `=` $zero^ `:` type($zero))?
+    `quant_mode` `=` $quant_mode attr-dict
+  }];
+}
+
+//===----------------------------------------------------------------------===//
+// PYNQ Activation Layout Transpose Op (Boundary Layout Transform)
+//===----------------------------------------------------------------------===//
+
+def PYNQ_ActivationLayoutTransposeOp : PYNQ_Op<"activation_layout_transpose", []> {
+  let summary = "Transpose activation tensor between (B,L,D) and (B,D,L) layouts";
+  let description = [{
+    PYNQ-level boundary op that mirrors vivado.activation_layout_transpose.
+
+    This op is a semantic marker for a layout transform between standard
+    activation layout (B, L, D) and hardware-friendly transposed layout
+    (B, D, L). It is intentionally simple: memref-in/memref-out plus a
+    direction flag.
+  }];
+
+  let arguments = (ins
+    AnyMemRef:$output,
+    AnyMemRef:$input,
+    BoolAttr:$to_transposed
+  );
+
+  let results = (outs);
+
+  let assemblyFormat = [{
+    `(` $output `,` $input `)` `to_transposed` `=` $to_transposed attr-dict `:`
+    type($output) `,` type($input)
+  }];
+
+  let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
+// PYNQ Activation Dynamic Padding Op (Boundary Pad/Unpad)
+//===----------------------------------------------------------------------===//
+
+def PYNQ_ActivationDynamicPadOp : PYNQ_Op<"activation_dynamic_pad", []> {
+  let summary = "Pad/unpad activation last dimension with zeros";
+  let description = [{
+    PYNQ-level boundary op that mirrors vivado.activation_dynamic_pad.
+
+    This op represents a boundary-only pad/unpad transform on the last
+    (contiguous) dimension of an activation buffer.
+  }];
+
+  let arguments = (ins
+    AnyMemRef:$output,
+    AnyMemRef:$input,
+    BoolAttr:$to_padded
+  );
+
+  let results = (outs);
+
+  let assemblyFormat = [{
+    `(` $output `,` $input `)` `to_padded` `=` $to_padded attr-dict `:`
     type($output) `,` type($input)
   }];
 }

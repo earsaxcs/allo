@@ -167,10 +167,13 @@ def Vivado_QMatMulOp : Vivado_Op<"qmatmul", [AttrSizedOperandSegments]> {
     // Supported: "bhld", "blhd", "bhdl". Default is "bhld".
     DefaultValuedAttr<StrAttr, "\"bhld\"">:$rhs_layout,
 
-    // RHS reduce axis location (dimension index on RHS tensor/memref).
-    // This tracks where the logical token-length axis `l` resides under rhs_layout.
-    // Default 2 matches rhs_layout="bhld".
-    DefaultValuedAttr<I32Attr, "2">:$reduce_dim
+    // RHS reduction (K) axis location (dimension index on RHS tensor/memref).
+    // This indicates which RHS dimension is reduced over during matmul.
+    // Default 2 matches historical defaults for rhs_layout="bhld".
+    DefaultValuedAttr<I32Attr, "2">:$reduce_dim,
+
+    // Layer type identification for optimization / backend layout decisions
+    DefaultValuedAttr<StrAttr, "\"unknown\"">:$layer_type
   );
   
   let results = (outs);
@@ -605,10 +608,13 @@ def Vivado_QMatMulIsqrtDOp : Vivado_Op<"qmatmul_isqrtd", [AttrSizedOperandSegmen
     // Supported: "bhld", "bhdl", "blhd", "bhdl". Default is "bhld".
     DefaultValuedAttr<StrAttr, "\"bhld\"">:$rhs_layout,
 
-    // RHS reduce axis location (dimension index on RHS tensor/memref).
-    // This tracks where the logical token-length axis `l` resides under rhs_layout.
-    // Default 2 matches rhs_layout="bhld".
-    DefaultValuedAttr<I32Attr, "2">:$reduce_dim
+    // RHS reduction (K) axis location (dimension index on RHS tensor/memref).
+    // This indicates which RHS dimension is reduced over during matmul.
+    // Default 2 matches historical defaults for rhs_layout="bhld".
+    DefaultValuedAttr<I32Attr, "2">:$reduce_dim,
+
+    // Layer type identification for optimization / backend layout decisions
+    DefaultValuedAttr<StrAttr, "\"unknown\"">:$layer_type
   );
   
   let results = (outs);

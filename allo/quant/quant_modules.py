@@ -55,6 +55,8 @@ class QLinear(QuantizableModule):
                  act_bit: int = 8,
                  act_quant_mode: str = "sym",
                  act_per_token: bool = False,
+                 input_act_per_token=None,
+                 output_act_per_token=None,
                  wgt_per_channel: bool = False):
         super(QLinear, self).__init__()
         self.in_features = in_features
@@ -69,11 +71,21 @@ class QLinear(QuantizableModule):
         self.bias_bit = bias_bit
         self.act_bit = act_bit
         self.act_quant_mode = act_quant_mode
-        self.act_per_token = act_per_token
+
+        # Backward-compatible behavior:
+        # - If input/output flags are not provided, fall back to legacy act_per_token.
+        # - If they are provided, allow all 4 combinations.
+        if input_act_per_token is None:
+            input_act_per_token = act_per_token
+        if output_act_per_token is None:
+            output_act_per_token = act_per_token
+
+        self.input_act_per_token = bool(input_act_per_token)
+        self.output_act_per_token = bool(output_act_per_token)
         self.wgt_per_channel = wgt_per_channel
 
         # can't be used at the same time
-        assert not(wgt_per_channel and act_per_token) and "pt and pc can't be used at the same time"
+        assert not(wgt_per_channel and (self.input_act_per_token or self.output_act_per_token)) and "pt and pc can't be used at the same time"
 
         ## PARAM QUANT DEFINITION ##
         if self.wgt_per_channel:
@@ -94,14 +106,11 @@ class QLinear(QuantizableModule):
             self.register_buffer("bias_scale", None)
 
         # input and output can be set sym/asym and pertoken/pertensor
-        if self.act_per_token:
-            input_quant_param_shape = (1,)
-            output_quant_param_shape = (1,)
-        else: # per tensor
         # NOTICE: we can't assume that output_scale == bias_scale == input_scale * weight_scale, because this will make the output be a int32 number
-            input_quant_param_shape = (1,)
-            output_quant_param_shape = (1,)
-        fused_scale_quant_param_shape = (1 * input_quant_param_shape[0] * self.bias_scale.numel(),)
+        input_quant_param_shape = (1,)
+        output_quant_param_shape = (1,)
+        # fused_scale may become per-token during calibrate(); use placeholder here.
+        fused_scale_quant_param_shape = (1,)
 
         ## ACT QUANT DEFINITION ##
         self.register_buffer("input_scale", torch.zeros(input_quant_param_shape))
@@ -133,7 +142,7 @@ class QLinear(QuantizableModule):
             input_tensor=x_float,
             bitwidth=self.act_bit,
             quant_mode=self.act_quant_mode,
-            per_channel=self.act_per_token,
+            per_channel=self.input_act_per_token,
             is_weight=False,
         )
 
@@ -141,7 +150,7 @@ class QLinear(QuantizableModule):
             input_tensor=y,
             bitwidth=self.act_bit,
             quant_mode=self.act_quant_mode,
-            per_channel=self.act_per_token,
+            per_channel=self.output_act_per_token,
             is_weight=False,
         )
 
@@ -158,13 +167,13 @@ class QLinear(QuantizableModule):
             is_weight=False,
         )
 
-        # insert quant params
-        self.input_scale.data = x_scale
-        self.output_scale.data = y_scale
-        self.weight_scale.data = w_scale
-        self.bias_scale.data = b_scale
-        self.fused_scale.data = x_scale * w_scale / y_scale
-        self.weight_int.data = symmetric_linear_quantize(
+        # insert quant params (use buffer replacement to allow dynamic shapes)
+        self.input_scale = x_scale
+        self.output_scale = y_scale
+        self.fused_scale = x_scale * w_scale / y_scale
+        self.weight_scale = w_scale
+        self.bias_scale = b_scale
+        self.weight_int = symmetric_linear_quantize(
             bits=self.weight_bit, 
             input=self.weight.data, 
             scale=w_scale, 
@@ -174,7 +183,7 @@ class QLinear(QuantizableModule):
             # NOTICE: No need to add bias if no bias
             # but bias_scale can exist even there is no bias
             # TODO: !!!!!!!!!!!!!!bias_bit must 32???
-            self.bias_int.data = symmetric_linear_quantize(
+            self.bias_int = symmetric_linear_quantize(
                 bits=self.bias_bit, 
                 input=self.bias.data, 
                 scale=b_scale, 
@@ -184,34 +193,58 @@ class QLinear(QuantizableModule):
         if self.act_quant_mode == "sym":
             pass
         elif self.act_quant_mode == "asym":
-            self.input_zero.data = x_zero
-            self.output_zero.data = y_zero
+            self.input_zero = x_zero
+            self.output_zero = y_zero
         
         return y
 
     def forward_int(self, x_int):
-        if self.act_quant_mode == "asym":
-            # asymmetric
-            x_int = x_int - self.input_zero
+        def _view_1d_param(param: torch.Tensor, ref: torch.Tensor):
+            if param is None:
+                return None
+            if param.numel() == 1:
+                return param
+            # per-token on dim=1
+            if ref.ndim == 3 and param.numel() == ref.shape[1]:
+                return param.view(1, -1, 1)
+            # per-feature on last dim
+            if ref.ndim == 3 and param.numel() == ref.shape[-1]:
+                return param.view(1, 1, -1)
+            if ref.ndim == 2 and param.numel() == ref.shape[0]:
+                return param.view(-1, 1)
+            if ref.ndim == 2 and param.numel() == ref.shape[1]:
+                return param.view(1, -1)
+            return param
+
+        if self.act_quant_mode == "asym" and self.input_zero is not None:
+            x_int = x_int - _view_1d_param(self.input_zero, x_int)
 
         xw_scale = self.input_scale * self.weight_scale
-        if self.wgt_per_channel:
-            fused_scale = self.fused_scale[None, :]
-            xw_scale = xw_scale[None, :]
-        elif self.act_per_token:
-            fused_scale = self.fused_scale[:, None]
-            xw_scale = xw_scale[:, None]
-        else:
-            fused_scale = self.fused_scale
+        bias_num = None
+        if self.bias_int is not None and self.bias_scale is not None:
+            bias_num = (self.bias_int * self.bias_scale).to(torch.float32)
 
-        # o_int = F.linear(x_int, self.weight_int, self.bias_int)
-        broadcast_bias = torch.unsqueeze(self.bias_int[None, :] * self.bias_scale / xw_scale, 0).expand(x_int.shape[0], -1, -1).reshape(-1, self.bias_int.shape[-1])
-        o_int = F.linear(x_int, self.weight_int, broadcast_bias)
-        # automatically broadcast Batchsize and Channel/Token
-        o_int = torch.round(o_int * fused_scale)
-        
-        if self.act_quant_mode == "asym":
-            o_int = o_int + self.output_zero
+        # Linear without bias first (works for 2D/3D inputs)
+        o_int = F.linear(x_int, self.weight_int, None)
+
+        # Add bias_term with correct broadcasting
+        if bias_num is not None:
+            if xw_scale.numel() == 1:
+                o_int = o_int + (bias_num / xw_scale).view(1, *([1] * (o_int.ndim - 2)), -1)
+            elif x_int.ndim == 3 and xw_scale.numel() == x_int.shape[1]:
+                # per-token input scale
+                o_int = o_int + (bias_num.view(1, 1, -1) / xw_scale.view(1, -1, 1))
+            elif xw_scale.numel() == self.out_features:
+                # per-output-feature scale
+                o_int = o_int + (bias_num.view(1, *([1] * (o_int.ndim - 2)), -1) / xw_scale.view(1, *([1] * (o_int.ndim - 2)), -1))
+            else:
+                o_int = o_int + (bias_num / xw_scale)
+
+        fused_scale_view = _view_1d_param(self.fused_scale, o_int)
+        o_int = torch.round(o_int * fused_scale_view)
+
+        if self.act_quant_mode == "asym" and self.output_zero is not None:
+            o_int = o_int + _view_1d_param(self.output_zero, o_int)
 
         return o_int
     
@@ -229,8 +262,28 @@ class QLinear(QuantizableModule):
             return self.calibrate(x_float)
         # now fake quant
         elif self.fakequant_mode:
-            # TODO: think of asymmetric
-            return self.forward_int(x_int=torch.clamp(torch.round(x_float / self.input_scale[:, None]), -2**(self.act_bit-1), 2**(self.act_bit-1)-1)) * self.output_scale[:, None]
+            def _view_1d_param(param: torch.Tensor, ref: torch.Tensor):
+                if param is None:
+                    return None
+                if param.numel() == 1:
+                    return param
+                if ref.ndim == 3 and param.numel() == ref.shape[1]:
+                    return param.view(1, -1, 1)
+                if ref.ndim == 2 and param.numel() == ref.shape[0]:
+                    return param.view(-1, 1)
+                if ref.ndim == 2 and param.numel() == ref.shape[1]:
+                    return param.view(1, -1)
+                return param
+
+            in_scale = _view_1d_param(self.input_scale, x_float)
+            x_int = torch.clamp(
+                torch.round(x_float / in_scale),
+                -2 ** (self.act_bit - 1),
+                2 ** (self.act_bit - 1) - 1,
+            )
+            y_int = self.forward_int(x_int=x_int)
+            out_scale = _view_1d_param(self.output_scale, y_int)
+            return y_int * out_scale
         else:
             return self.forward_float(x_float)
 
@@ -256,6 +309,8 @@ class QLinear(QuantizableModule):
                  act_bit=8,
                  act_quant_mode="sym",
                  act_per_token=False,
+                 input_act_per_token=None,
+                 output_act_per_token=None,
                  wgt_per_channel=False):
         return cls(linear.in_features, 
                    linear.out_features,
@@ -264,6 +319,8 @@ class QLinear(QuantizableModule):
                    act_bit=act_bit,
                    act_quant_mode=act_quant_mode,
                    act_per_token=act_per_token,
+                   input_act_per_token=input_act_per_token,
+                   output_act_per_token=output_act_per_token,
                    wgt_per_channel=wgt_per_channel,
                    ).copy_from(linear)
 
@@ -944,6 +1001,8 @@ class IntLayerNorm(QuantizableModule):
             out_act_bit: int = 8,
             act_quant_mode: str = "sym",
             act_per_channel: bool = False,
+            input_act_per_token: bool = False,
+            output_act_per_channel=None,
             int_cal_mode: str = "I-ViT",
         ):
         super(IntLayerNorm, self).__init__()
@@ -964,18 +1023,24 @@ class IntLayerNorm(QuantizableModule):
         self.in_act_bit = in_act_bit
         self.out_act_bit = out_act_bit
         self.act_quant_mode = act_quant_mode
-        self.act_per_channel = act_per_channel
+        # Backward-compatible behavior:
+        # - act_per_channel (legacy) maps to output_act_per_channel if the new flag isn't provided.
+        if output_act_per_channel is None:
+            output_act_per_channel = act_per_channel
+
+        self.input_act_per_token = bool(input_act_per_token)
+        self.output_act_per_channel = bool(output_act_per_channel)
         assert len(normalized_shape) == 1
         self.hidden_dim = normalized_shape[-1] if len(normalized_shape) == 1 else None # if you use it in Transformer this will be set
         self.dim_sqrt = torch.sqrt(torch.Tensor([self.hidden_dim]))
 
-        # here just control the input quant param shape
-        if act_per_channel:
-            self.act_per_channel = act_per_channel
-            input_quant_param_shape = tuple(normalized_shape)
+        # Input quant params can be per-token (dynamic length). Use placeholder and resize in calibrate().
+        input_quant_param_shape = (1,)
+
+        # Output quant params can be per-channel on hidden dim (static).
+        if self.output_act_per_channel:
             output_quant_param_shape = tuple(normalized_shape)
         else:
-            input_quant_param_shape = (1,)
             output_quant_param_shape = (1,)
         
         layernorm_quant_param_shape = normalized_shape
@@ -1010,7 +1075,7 @@ class IntLayerNorm(QuantizableModule):
             raise NotImplementedError("unsupported act quant mode: {}".format(act_quant_mode))
         
         if len(normalized_shape) == 1:
-            self.register_buffer("fused_scale", torch.zeros(input_quant_param_shape))
+            self.register_buffer("fused_scale", torch.zeros(layernorm_quant_param_shape))
             # self.qact = QAct(
             #     in_act_bit=32,
             #     out_act_bit=out_act_bit,
@@ -1030,7 +1095,7 @@ class IntLayerNorm(QuantizableModule):
             bitwidth=self.out_act_bit,
             quant_mode=self.act_quant_mode,
             per_channel=False, 
-            channel_dim=2 if self.act_per_channel else None, # 注意这里要能够真的per-channel而非per-token，故3d的输入应该是actual_dim=2，需要使用manual channel_dim
+            channel_dim=1 if self.input_act_per_token else None, 
             is_weight=False,
         )
 
@@ -1038,31 +1103,31 @@ class IntLayerNorm(QuantizableModule):
             input_tensor=y,
             bitwidth=self.out_act_bit,
             quant_mode=self.act_quant_mode,
-            per_channel=False,
-            channel_dim=2 if self.act_per_channel else None,
+            per_channel=self.output_act_per_channel,
+            channel_dim=2 if self.output_act_per_channel else None, # NOTE：注意这里要能够真的per-channel而非per-token，故3d的输入应该是actual_dim=2，需要使用manual channel_dim
             is_weight=False,
         )
 
-        self.input_scale.data = x_scale
-        self.output_scale.data = y_scale
+        self.input_scale = x_scale
+        self.output_scale = y_scale
         # TODO: update bias_scale algorithm to adapt to backend not this forward_int
         if self.bias is not None:
             if self.int_cal_mode == "I-ViT":
-                self.bias_scale.data = self.dim_sqrt / 2 ** 30
-                self.layernorm_scale.data = self.bias_scale * self.weight
+                self.bias_scale = self.dim_sqrt / 2 ** 30
+                self.layernorm_scale = self.bias_scale * self.weight
 
-                self.bias_int.data = symmetric_linear_quantize(
+                self.bias_int = symmetric_linear_quantize(
                     bits=32, # NOTE: hardcoded for now
                     input=self.bias / self.weight,
                     scale=self.bias_scale,
                     is_weight=True,
                 )
             elif self.int_cal_mode == "Vivado-PYNQ":
-                self.bias_scale.data = torch.Tensor([1 / (2 ** 16)]) # NOTE: hardcoded for now, please refer to pynq config
-                self.layernorm_scale.data = self.bias_scale * self.weight
+                self.bias_scale = torch.Tensor([1 / (2 ** 16)]) # NOTE: hardcoded for now, please refer to pynq config
+                self.layernorm_scale = self.bias_scale * self.weight
 
-                self.bias_int.data = symmetric_linear_quantize(
-                    bits=32, # NOTE: hardcoded for now
+                self.bias_int = symmetric_linear_quantize(
+                    bits=24, # NOTE: hardcoded for now, 24bit for PYNQ backend request
                     input=self.bias / self.weight,
                     scale=self.bias_scale,
                     is_weight=True,
@@ -1072,17 +1137,17 @@ class IntLayerNorm(QuantizableModule):
 
         # self.qact.fused_scale.data = self.layernorm_scale / self.output_scale
         if self.int_cal_mode == "I-ViT":
-            self.fused_scale.data = self.layernorm_scale / self.output_scale
+            self.fused_scale = self.layernorm_scale / self.output_scale
         elif self.int_cal_mode == "Vivado-PYNQ":
-            self.fused_scale.data = self.weight / self.output_scale
+            self.fused_scale = self.weight / self.output_scale
         else:
             raise NotImplementedError("unsupported int_cal_mode: {}".format(self.int_cal_mode))
 
         if self.act_quant_mode == "sym":
             pass
         elif self.act_quant_mode == "asym":
-            self.input_zero.data = x_zero
-            self.output_zero.data = y_zero
+            self.input_zero = x_zero
+            self.output_zero = y_zero
             # NOTICE: self.qact.output_zero is not used
             # self.qact.output_zero.data = y_zero
 
@@ -1160,6 +1225,8 @@ class IntLayerNorm(QuantizableModule):
             out_act_bit: int = 8,
             act_quant_mode: str = "sym",
             act_per_channel: bool = False,
+            input_act_per_token: bool = False,
+            output_act_per_channel=None,
             int_cal_mode: str = "I-ViT"):
         return cls(normalized_shape=layernorm.normalized_shape, 
             elementwise_affine=layernorm.elementwise_affine,
@@ -1167,7 +1234,9 @@ class IntLayerNorm(QuantizableModule):
             in_act_bit=in_act_bit,
             out_act_bit=out_act_bit,
             act_quant_mode=act_quant_mode,
-            act_per_channel=act_per_channel, 
+            act_per_channel=act_per_channel,
+            input_act_per_token=input_act_per_token,
+            output_act_per_channel=output_act_per_channel,
             int_cal_mode=int_cal_mode,).copy_from(layernorm)
 
 # ----- QAdd -----

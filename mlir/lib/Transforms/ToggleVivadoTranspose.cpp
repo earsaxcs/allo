@@ -12,7 +12,7 @@
 // Key transformations:
 // 1. Transpose weight globals: (OC, IC) -> (IC, OC) for QLinear
 // 2. Transpose bias globals: (L, OC) -> (OC, L) for QLinear (if 2D)
-// 3. Toggle is_transposed attribute on all vivado quant ops
+// 3. Toggle transpose_mode attribute on all vivado quant ops
 // 4. Update activation shapes, reshape ops, and linalg.transpose
 // 5. Insert boundary transposes: vivado.activation_layout_transpose at entry/exit
 //
@@ -145,12 +145,12 @@ static DenseElementsAttr transposeMatrix(DenseElementsAttr attr,
   return attr;
 }
 
-/// Check if all vivado quant ops have is_transposed = false
+/// Check if all vivado quant ops have transpose_mode = false
 static bool verifyAllNotTransposed(ModuleOp module) {
   bool allFalse = true;
   
   module.walk([&](Operation *op) {
-    if (auto attr = op->getAttrOfType<BoolAttr>("is_transposed")) {
+    if (auto attr = op->getAttrOfType<BoolAttr>("transpose_mode")) {
       if (attr.getValue()) {
         allFalse = false;
       }
@@ -160,17 +160,17 @@ static bool verifyAllNotTransposed(ModuleOp module) {
   return allFalse;
 }
 
-/// Get all vivado quant ops that have is_transposed attribute
+/// Get all vivado quant ops that have transpose_mode attribute
 /// For QLinear ops, filter by layer_type:
 ///   - proj_q, proj_k, out_proj, fc1, fc2: include
 ///   - proj_v: exclude (no transpose needed)
 static void collectVivadoQuantOps(ModuleOp module, 
                                    SmallVector<Operation*> &ops) {
   module.walk([&](Operation *op) {
-    // Check if op is a vivado dialect op with is_transposed attribute
+    // Check if op is a vivado dialect op with transpose_mode attribute
     if (op->getDialect() && 
         op->getDialect()->getNamespace() == "vivado" &&
-        op->hasAttr("is_transposed") && !op->getAttr("is_transposed").cast<BoolAttr>().getValue()) {
+        op->hasAttr("transpose_mode") && !op->getAttr("transpose_mode").cast<BoolAttr>().getValue()) {
       
       // Special handling for QLinear ops based on layer_type
       if (isa<vivado_ops::QLinearOp>(op)) {
@@ -211,7 +211,7 @@ static bool isConnectedToQuantOp(Value value, int maxDepth = 10) {
 
     auto isDirectVivadoQuant = [&](Operation *op) -> bool {
       return op && op->getDialect() && op->getDialect()->getNamespace() == "vivado" &&
-             op->hasAttr("is_transposed");
+             op->hasAttr("transpose_mode");
     };
 
     // --- Use chain (destination-passing aware) ---
@@ -321,7 +321,7 @@ static std::string getSourceQuantOpTypeImpl(Value value,
     if (!op)
       return "non_quant";
     if (op->getDialect() && op->getDialect()->getNamespace() == "vivado" &&
-        op->hasAttr("is_transposed")) {
+        op->hasAttr("transpose_mode")) {
       return classifyVivadoQuantOpType(op);
     }
     return "non_quant";
@@ -339,7 +339,7 @@ static std::string getSourceQuantOpTypeImpl(Value value,
         user->getOperand(0).dump();
       value.dump();
       llvm::errs() << (user && user->getDialect() && user->getDialect()->getNamespace() == "vivado" &&
-          user->hasAttr("is_transposed") && user->getNumOperands() > 0 &&
+          user->hasAttr("transpose_mode") && user->getNumOperands() > 0 &&
           user->getOperand(0) == value) << "\n";
       llvm::errs() << "fatherOp: " << "\n";
       if (fatherOp) {
@@ -352,7 +352,7 @@ static std::string getSourceQuantOpTypeImpl(Value value,
     }
 
     if (user && user->getDialect() && user->getDialect()->getNamespace() == "vivado" &&
-        user->hasAttr("is_transposed") && user->getNumOperands() > 0 &&
+        user->hasAttr("transpose_mode") && user->getNumOperands() > 0 &&
         user->getOperand(0) == value) {
       return classifyVivadoQuantOpType(user);
     }
@@ -501,7 +501,7 @@ static LogicalResult transposeWeightGlobals(ModuleOp module) {
 }
 
 //===--------------------------------------------------------------------===//
-// Step 3: Toggle is_transposed and update shapes (AFTER inserting boundaries)
+// Step 3: Toggle transpose_mode and update shapes (AFTER inserting boundaries)
 // Now that boundaries are marked, shape updates won't affect non-quant regions
 //===--------------------------------------------------------------------====//
 
@@ -528,26 +528,23 @@ static bool updateIntermediateActivationShapes(ModuleOp module, MLIRContext *con
   collectVivadoQuantOps(module, quantOps);
 
   auto setRhsLayoutAttr = [&](Operation *op, Value rhs) {
-    auto setLayoutAndReduceDim = [&](StringRef layout) {
+    auto setLayoutAndReduceDim = [&](StringRef layout, int32_t reduceDim) {
       op->setAttr("rhs_layout", StringAttr::get(context, layout));
-      int32_t reduceDim = 2;
-      if (layout == "bhld")
-        reduceDim = 2;
-      else if (layout == "blhd")
-        reduceDim = 1;
-      else if (layout == "bhdl")
-        reduceDim = 3;
       op->setAttr("reduce_dim",
                   IntegerAttr::get(IntegerType::get(context, 32), reduceDim));
     };
 
     std::string rhsSource = getSourceQuantOpType(rhs, op);
     if (rhsSource == "qlinear.proj_k") {
-      setLayoutAndReduceDim("bhdl");
+      // proj_k (K): when used as RHS of attn.QK matmul, reduction is over head-dim `d`.
+      // Under rhs_layout="bhdl" (B,H,D,L), the d axis is 2.
+      setLayoutAndReduceDim("bhdl", /*reduceDim=*/2);
       return;
     }
     if (rhsSource == "qlinear.proj_v") {
-      setLayoutAndReduceDim("blhd");
+      // proj_v (V): when used as RHS of attn.SV matmul, reduction is over token-length `l`.
+      // Under rhs_layout="blhd" (B,L,H,D), the l axis is 1.
+      setLayoutAndReduceDim("blhd", /*reduceDim=*/1);
       return;
     }
     op->emitError() << "Unsupported RHS source type for rhs_layout: " << rhsSource
@@ -588,6 +585,12 @@ static bool updateIntermediateActivationShapes(ModuleOp module, MLIRContext *con
       setRhsLayoutAttr(op, qmmIsqrt.getRhs());
     }
 
+    // Special case: when toggling transpose mode, move Softmax reduction axis to
+    // the second-to-last dimension (i.e., dim=2 for rank-4 [B,H,L,L]).
+    if (op->getName().getStringRef() == "vivado.int_softmax") {
+      op->setAttr("axis", IntegerAttr::get(IntegerType::get(context, 64), 2));
+    }
+
     if (auto qlinear = dyn_cast<vivado_ops::QLinearOp>(op)) {
       auto layerTypeAttr = qlinear->getAttrOfType<StringAttr>("layer_type");
       StringRef layerType = layerTypeAttr ? layerTypeAttr.getValue() : "unknown";
@@ -600,7 +603,7 @@ static bool updateIntermediateActivationShapes(ModuleOp module, MLIRContext *con
       continue;
     }
 
-    // 其它 vivado quant op：统一转置激活形状并置 is_transposed
+    // 其它 vivado quant op：统一转置激活形状并置 transpose_mode 和 is_transposed
     // transposeResults(op);
     op->setAttr("transpose_mode", BoolAttr::get(context, true));
     op->setAttr("is_transposed", BoolAttr::get(context, true));
@@ -943,7 +946,7 @@ static LogicalResult insertBoundaryTransposes(ModuleOp module, MLIRContext *cont
     funcOp.walk([&](Operation *op) {
       if (op->getDialect() && 
           op->getDialect()->getNamespace() == "vivado" &&
-          op->hasAttr("is_transposed")) {
+          op->hasAttr("transpose_mode")) {
         hasQuantOp = true;
       }
     });
@@ -1102,7 +1105,7 @@ static LogicalResult insertBoundaryTransposes(ModuleOp module, MLIRContext *cont
           // Skip if user is another vivado quant op (inside quant region)
           if (userOp->getDialect() && 
               userOp->getDialect()->getNamespace() == "vivado" &&
-              userOp->hasAttr("is_transposed")) {
+              userOp->hasAttr("transpose_mode")) {
             continue;
           }
           // This is an external user, needs de-transposed buffer
@@ -1127,10 +1130,10 @@ static LogicalResult insertBoundaryTransposes(ModuleOp module, MLIRContext *cont
 //===----------------------------------------------------------------------===//
 
 bool applyToggleVivadoTranspose(ModuleOp &module, MLIRContext *context) {
-  // Step 0: Verify precondition - all ops should be is_transposed=false
+  // Step 0: Verify precondition - all ops should be transpose_mode=false
   if (!verifyAllNotTransposed(module)) {
     module.emitError() << "ToggleVivadoTransposePass requires all vivado "
-                       << "ops to have is_transposed=false. "
+                       << "ops to have transpose_mode=false. "
                        << "This pass only supports False -> True transformation.";
     return false;
   }
@@ -1148,7 +1151,7 @@ bool applyToggleVivadoTranspose(ModuleOp &module, MLIRContext *context) {
     return false;
   }
   
-  // Step 3: Toggle is_transposed on all vivado quant ops and update shapes
+  // Step 3: Toggle transpose_mode on all vivado quant ops and update shapes
   // Now that boundaries are marked, shape updates won't affect non-quant regions
   if (!toggleAllQuantOps(module, context))
     return false;
