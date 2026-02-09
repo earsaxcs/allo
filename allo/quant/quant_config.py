@@ -163,6 +163,8 @@ class QuantConfig:
         self.default_config = default_config or LayerQuantConfig()
         self.layer_type_configs: Dict[Type[nn.Module], LayerQuantConfig] = {}
         self.layer_name_configs: Dict[str, LayerQuantConfig] = {}  # name pattern -> config
+        # Exclude patterns: matched layers will NOT be replaced (point-wise special cases)
+        self.exclude_layer_name_patterns: List[str] = []
         self.skip_layers: List[str] = []  # Layer name patterns to skip quantization
         
         # Add custom ops to mapping if available
@@ -246,9 +248,28 @@ class QuantConfig:
         """
         self.skip_layers.append(name_pattern)
         return self
+
+    def exclude_layer_name_config(self, name_pattern: str) -> 'QuantConfig':
+        """
+        Exclude layers from quantization replacement by name.
+
+        If a layer name matches the given pattern, it will NOT be replaced even if its
+        type is quantizable. This is useful for point-wise special-casing.
+
+        Args:
+            name_pattern: Layer name or regex pattern
+
+        Returns:
+            self for method chaining
+        """
+        self.exclude_layer_name_patterns.append(name_pattern)
+        return self
     
     def should_skip(self, layer_name: str) -> bool:
         """Check if a layer should be skipped."""
+        for pattern in self.exclude_layer_name_patterns:
+            if re.fullmatch(pattern, layer_name) or pattern in layer_name:
+                return True
         for pattern in self.skip_layers:
             if re.fullmatch(pattern, layer_name) or pattern in layer_name:
                 return True
@@ -299,6 +320,8 @@ class QuantConfig:
             lines.append("  Layer Name Configs:")
             for name, cfg in self.layer_name_configs.items():
                 lines.append(f"    '{name}': {cfg}")
+        if self.exclude_layer_name_patterns:
+            lines.append(f"  Exclude Name Patterns: {self.exclude_layer_name_patterns}")
         if self.skip_layers:
             lines.append(f"  Skip Patterns: {self.skip_layers}")
         return "\n".join(lines)
@@ -366,6 +389,7 @@ def get_vit_optimized_config() -> QuantConfig:
     # Add: per-token
     if Add is not None:
         config.set_layer_type_config(Add, act_per_token=True)
+        config.exclude_layer_name_config("embd_add")  # Example of excluding specific layer from replacement
     
     return config
 

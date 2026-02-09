@@ -48,6 +48,23 @@ def MergeSubviewAndCopy : Pass<"merge-subview-and-copy", "ModuleOp"> {
   let constructor = "mlir::allo::createMergeSubviewAndCopyPass()";
 }
 
+def HoistGetGlobal : Pass<"hoist-get-global", "ModuleOp"> {
+  let summary = "Hoist memref.get_global ops to the top of their containing blocks";
+  let description = [{
+    This pass moves all `memref.get_global` operations to the beginning of the
+    block that contains them, preserving their relative order.
+
+    This is similar in spirit to `pynq-hoist-buffer-alloc`, but operates at
+    block granularity and targets global constant materialization.
+  }];
+  let constructor = "mlir::allo::createHoistGetGlobalPass()";
+
+  let dependentDialects = [
+    "mlir::func::FuncDialect",
+    "mlir::memref::MemRefDialect"
+  ];
+}
+
 //===----------------------------------------------------------------------===//
 // PYNQ Backend Passes
 //===----------------------------------------------------------------------===//
@@ -220,6 +237,10 @@ def PYNQMidLower : Pass<"pynq-mid-lower", "ModuleOp"> {
     - Lowers pynq.matmul and vector ops to their corresponding *_instr ops, removing scale bindings.
     - Lowers pynq.copy to pynq.data_transfer_instr for host<->device transfers.
 
+    Debug options:
+    - debug-scale-pack: verbose printing for scale/bias packing (raw values, pairing order, packed bytes, segments/transfers).
+    - debug-op-convert: printing for op conversion to *_instr (buffer ids, tile_count/reduceK, and key instruction fields).
+
     This pass must run after pynq-buffer-allocation; any virtual !pynq.buffer triggers an error.
   }];
   let constructor = "mlir::allo::createPYNQMidLowerPass()";
@@ -228,6 +249,50 @@ def PYNQMidLower : Pass<"pynq-mid-lower", "ModuleOp"> {
     "mlir::func::FuncDialect",
     "mlir::memref::MemRefDialect",
     "mlir::arith::ArithDialect"
+  ];
+}
+
+def PYNQOptimizeSync : Pass<"pynq-optimize-sync", "ModuleOp"> {
+  let summary = "Elide redundant pynq.sync ops using conservative dependency checks";
+  let description = [{
+    This pass removes redundant `pynq.sync` operations to reduce unnecessary
+    stalls.
+
+    Optimization rule (conservative):
+    - For a `pynq.sync` between two async PYNQ hardware-issuing windows, the sync
+      can be removed if the next operation after the sync has no potential
+      buffer hazards (RAW/WAR/WAW) with operations issued since the previous
+      kept sync.
+    - If buffer IDs or directions are not statically known, the pass keeps the
+      sync.
+
+    This pass is intended to run after `pynq-mid-lower`.
+  }];
+  let constructor = "mlir::allo::createPYNQOptimizeSyncPass()";
+  let dependentDialects = [
+    "mlir::allo::pynq::PYNQDialect",
+    "mlir::func::FuncDialect",
+    "mlir::arith::ArithDialect",
+    "mlir::memref::MemRefDialect"
+  ];
+}
+
+def PYNQOptimizeSubviewGlobals : Pass<"pynq-optimize-subview-globals", "ModuleOp"> {
+  let summary = "Optimize subview on static weight/bias globals";
+  let description = [{
+    This pass simplifies memref.subview on globals that represent static
+    weight/bias data at PYNQ level.
+
+    - If a subview is an identity (offsets all zero, sizes cover the full
+      source, strides all one), the subview is removed.
+    - Otherwise, a new memref.global is materialized for the slice and the
+      subview is replaced by a direct memref.get_global to the new global.
+
+    This avoids non-contiguous subviews for static data in later stages.
+  }];
+  let constructor = "mlir::allo::createPYNQOptimizeSubviewGlobalsPass()";
+  let dependentDialects = [
+    "mlir::memref::MemRefDialect"
   ];
 }
 
@@ -360,6 +425,33 @@ def ToggleVivadoTranspose : Pass<"toggle-vivado-transpose", "ModuleOp"> {
   }];
   let constructor = "mlir::allo::createToggleVivadoTransposePass()";
   let dependentDialects = ["mlir::allo::vivado::VivadoDialect"];
+}
+
+def VivadoMergeRedundantQuantDequant : Pass<"vivado-merge-redundant-quant-dequant", "ModuleOp"> {
+  let summary = "Merge identical vivado.quant/vivado.dequant ops that share the same source and quant parameters";
+  let description = [{
+    This pass deduplicates boundary quantization ops inserted at multiple use-sites.
+
+    It finds pairs of vivado.quant (or vivado.dequant) that:
+    - Quantize/dequantize the same input value
+    - Use the exact same scale/zero operands
+    - Have the exact same attribute dictionary (including quant_mode, packing/coefficient mode, transpose flags, etc.)
+    - Produce the same output buffer element type/shape
+
+    If all parameters match, the pass rewrites later consumers to reuse the earlier
+    quantized/dequantized buffer and removes the redundant quant/dequant op.
+
+    IMPORTANT:
+    - The pass is conservative: if it cannot prove that the buffer is only read after
+      quant/dequant (e.g., unknown memory effects), it will NOT merge.
+    - It must run before toggle-vivado-transpose so that the transpose toggling logic
+      sees a minimized set of boundary ops.
+  }];
+  let constructor = "mlir::allo::createVivadoMergeRedundantQuantDequantPass()";
+  let dependentDialects = [
+    "mlir::allo::vivado::VivadoDialect",
+    "mlir::memref::MemRefDialect"
+  ];
 }
 
 def VivadoPadding : Pass<"vivado-padding", "ModuleOp"> {

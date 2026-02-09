@@ -43,6 +43,22 @@ using namespace mlir::allo::pynq;
 
 namespace {
 
+static void erasePynqViewOps(Block &block) {
+  SmallVector<pynq::ViewOp, 8> views;
+  for (Operation &op : llvm::make_early_inc_range(block)) {
+    if (auto view = llvm::dyn_cast<pynq::ViewOp>(&op))
+      views.push_back(view);
+  }
+
+  for (pynq::ViewOp view : views) {
+    // pynq.view is a logical marker used earlier to connect different shapes.
+    // Scheduling and buffer allocation operate on buffers as raw storage, so
+    // forward its output to input and erase the op.
+    view.getOutput().replaceAllUsesWith(view.getInput());
+    view.erase();
+  }
+}
+
 static bool isPynqBuffer(Value v) {
   return v && llvm::isa<pynq::BufferType>(v.getType());
 }
@@ -486,6 +502,10 @@ public:
         continue;
 
       for (Block &block : funcOp.getBody().getBlocks()) {
+        // Remove pynq.view before scheduling so it doesn't act as a barrier and
+        // doesn't survive into later lowering stages.
+        erasePynqViewOps(block);
+
         llvm::SmallVector<Operation *, 64> window;
 
         for (Operation &op : block.getOperations()) {

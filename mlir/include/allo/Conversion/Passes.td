@@ -74,4 +74,35 @@ def LowerVivadoToPYNQ : Pass<"lower-vivado-to-pynq", "ModuleOp"> {
   let dependentDialects = ["mlir::allo::pynq::PYNQDialect"];
 }
 
+//===----------------------------------------------------------------------===//
+// Linalg lowering for host-side C emission
+//===----------------------------------------------------------------------===//
+
+def LowerLinalgToCStyleSCF : Pass<"allo-lower-linalg-to-cstyle-scf", "ModuleOp"> {
+  let summary = "Lower linalg (buffer semantics) to C-friendly scf via affine loops";
+  let description = [{
+    This pass is designed for the host-side C emission pipeline.
+
+    It lowers linalg ops with pure buffer semantics to a C-friendly subset:
+      linalg -> affine.for/affine.if (+ affine.load/store) -> scf.for/scf.if
+
+    Precondition:
+      - linalg ops must have pure buffer semantics (i.e., be bufferized).
+
+    Postcondition (goal):
+      - No remaining linalg ops.
+      - No remaining affine control-flow.
+  }];
+  let constructor = "mlir::allo::createLowerLinalgToCStyleSCFPass()";
+  let dependentDialects = [
+    "linalg::LinalgDialect",
+    "affine::AffineDialect",
+    "scf::SCFDialect",
+    "memref::MemRefDialect",
+    "arith::ArithDialect",
+    "func::FuncDialect",
+    "tensor::TensorDialect"
+  ];
+}
+
 #endif // ALLO_MLIR_PASSES

@@ -73,10 +73,10 @@ def test_calibrate_vit_block():
     print("Testing ViT Block Calibration")
     print("=" * 60)
 
-    n_embd = 384
-    n_head = 6
+    n_embd = 192
+    n_head = 3
     sample_batch_size = 32
-    batch_size = 10
+    batch_size = 1
 
     blk = ViTBlock(n_embd=n_embd, num_heads=n_head, ffn_hidden_dim=n_embd * 4)
     example_inputs = torch.randn(sample_batch_size, 197, n_embd) * 12
@@ -188,6 +188,8 @@ def test_calibrate_vit(
             leaf_modules=[ViTGetFirstToken, ViTTokenExpand, QLinear, QConv2d, IntLayerNorm, IntSoftmax, IntGELU, QAdd, QMatMul],
             quant_config=quant_config,
             verbose=False,
+            project='pynq_vivado.prj',
+            mode='default',
         )
         print("    Compilation completed!")
         return llvm_mod

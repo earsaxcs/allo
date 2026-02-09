@@ -12,13 +12,17 @@ add_mlir_library(MLIRAlloPasses
     DataPlacement.cpp
     UnifyKernels.cpp
     MergeSubviewAndCopy.cpp
+    HoistGetGlobal.cpp
     PYNQHoistBufferAlloc.cpp
     PYNQSimplifyHostTransfers.cpp
     PYNQElideRedundantCopies.cpp
     PYNQScheduleOps.cpp
     PYNQBufferAllocation.cpp
     PYNQMidLower.cpp
+    PYNQOptimizeSync.cpp
+    PYNQOptimizeSubviewGlobals.cpp
     RepackVivadoScales.cpp
+    VivadoMergeRedundantQuantDequant.cpp
     ToggleVivadoTranspose.cpp
     VivadoQLinearKSplit.cpp
     VivadoSeparateBias.cpp

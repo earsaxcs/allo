@@ -53,6 +53,40 @@ namespace allo {
 
 namespace {
 
+static void maybeInsertSetMagic(ModuleOp module) {
+  auto magicAttr = module->getAttrOfType<IntegerAttr>("allo.hidden_dim");
+  if (!magicAttr)
+    return;
+
+  auto *ctx = module.getContext();
+  auto i32Ty = IntegerType::get(ctx, 32);
+  auto i32MagicAttr = IntegerAttr::get(i32Ty, magicAttr.getInt());
+
+  for (auto func : module.getOps<func::FuncOp>()) {
+    if (func.isExternal())
+      continue;
+
+    // Only inject into the top-level forward.
+    StringRef name = func.getSymName();
+    if (!(name == "forward" || name.starts_with("forward_")))
+      continue;
+
+    Block &entry = func.getBody().front();
+
+    // Avoid double insertion.
+    for (Operation &op : entry.getOperations()) {
+      if (isa<pynq_ops::SetMagicOp>(op))
+        return;
+      break; // only check the first op; we always insert at entry start
+    }
+
+    OpBuilder builder(ctx);
+    builder.setInsertionPointToStart(&entry);
+    builder.create<pynq_ops::SetMagicOp>(func.getLoc(), i32MagicAttr);
+    return;
+  }
+}
+
 static Value stripCasts(Value v) {
   while (auto cast = v.getDefiningOp<memref::CastOp>())
     v = cast.getSource();
@@ -461,10 +495,11 @@ struct VivadoQMatMulToPYNQPattern
 
       // Matmul instruction tile_count fields follow qlinear: derived from tileM/tileN
       // and InstrConfig::kTileSize.
-      int64_t inputTileCountI64 = ceilDiv(static_cast<int64_t>(tileM),
-                                          static_cast<int64_t>(pynq::InstrConfig::kTileSize));
-      int64_t weightTileCountI64 = ceilDiv(static_cast<int64_t>(tileN),
-                                           static_cast<int64_t>(pynq::InstrConfig::kTileSize));
+      // IMPORTANT: These are instruction encoding fields and must reflect the
+      // actual per-tile buffer extents (not the configured tileM/tileN). Using
+      // tileM/tileN can over-count on boundary tiles.
+      int64_t inputTileCountI64 = ceilDiv(M, static_cast<int64_t>(pynq::InstrConfig::kTileSize));
+      int64_t weightTileCountI64 = ceilDiv(N, static_cast<int64_t>(pynq::InstrConfig::kTileSize));
       if (inputTileCountI64 < 1 || inputTileCountI64 > pynq::InstrConfig::kMaxTileCount)
         return rewriter.notifyMatchFailure(op, "input_tile_count out of hardware range [1, 8]");
       if (weightTileCountI64 < 1 || weightTileCountI64 > pynq::InstrConfig::kMaxTileCount)
@@ -1302,18 +1337,9 @@ struct VivadoQLinearToPYNQPattern
     // input_tile_count/weight_tile_count are *instruction encoding* fields and
     // count how many InstrConfig::kTileSize chunks are present along the last
     // dimension of the per-tile buffers. Padding is expected to have run.
-    int64_t inputTileCountI64 = ceilDiv(static_cast<int64_t>(tileM),
-                                       static_cast<int64_t>(pynq::InstrConfig::kTileSize));
-    int64_t weightTileCountI64 = ceilDiv(static_cast<int64_t>(tileN),
-                                        static_cast<int64_t>(pynq::InstrConfig::kTileSize));
-
-    if (inputTileCountI64 < 1 || inputTileCountI64 > pynq::InstrConfig::kMaxTileCount)
-      return rewriter.notifyMatchFailure(op, "input_tile_count out of hardware range [1, 8]");
-    if (weightTileCountI64 < 1 || weightTileCountI64 > pynq::InstrConfig::kMaxTileCount)
-      return rewriter.notifyMatchFailure(op, "weight_tile_count out of hardware range [1, 8]");
-
-    Value inputTileCountVal = createI32Const(static_cast<int32_t>(inputTileCountI64));
-    Value weightTileCountVal = createI32Const(static_cast<int32_t>(weightTileCountI64));
+    // IMPORTANT: These values must reflect the actual per-tile extents (mLen/nLen)
+    // rather than the configured tileM/tileN, otherwise boundary tiles may be
+    // over-counted and lead to incorrect behavior.
     Value reduceKVal = createI32Const(static_cast<int32_t>(K));
     Value headIdxVal = createI32Const(0); // default 0
     Value headTileAxisVal = createI32Const(0);
@@ -1329,16 +1355,31 @@ struct VivadoQLinearToPYNQPattern
         int64_t mLen = std::min<int64_t>(tileM, M - mStart);
         int64_t inputBufLinear = b * numTilesM + mTile;
 
+        int64_t inputTileCountI64 = ceilDiv(
+            static_cast<int64_t>(mLen),
+            static_cast<int64_t>(pynq::InstrConfig::kTileSize));
+        if (inputTileCountI64 < 1 || inputTileCountI64 > pynq::InstrConfig::kMaxTileCount)
+          return rewriter.notifyMatchFailure(op, "input_tile_count out of hardware range [1, 8]");
+
         for (int64_t nTile = 0; nTile < numTilesN; ++nTile) {
           int64_t nStart = nTile * tileN;
           int64_t nLen = std::min<int64_t>(tileN, N - nStart);
           int64_t outTileLinear = b * numTilesOut + mTile * numTilesN + nTile;
+
+          int64_t weightTileCountI64 = ceilDiv(
+              static_cast<int64_t>(nLen),
+              static_cast<int64_t>(pynq::InstrConfig::kTileSize));
+          if (weightTileCountI64 < 1 || weightTileCountI64 > pynq::InstrConfig::kMaxTileCount)
+            return rewriter.notifyMatchFailure(op, "weight_tile_count out of hardware range [1, 8]");
 
           // Compute marker via loc tags (no dedicated marker ops).
           std::string tag = ("pynq.qlinear.compute.b" + std::to_string(b) +
                              ".m" + std::to_string(mTile) +
                              ".n" + std::to_string(nTile));
           Location computeLoc = makeTaggedLoc(tag);
+
+          Value inputTileCountVal = createI32ConstAt(static_cast<int32_t>(inputTileCountI64), computeLoc);
+          Value weightTileCountVal = createI32ConstAt(static_cast<int32_t>(weightTileCountI64), computeLoc);
 
             rewriter.create<pynq_ops::MatMulOp>(
               computeLoc, fusedScale,
@@ -2564,6 +2605,211 @@ struct VivadoActivationDynamicPadToPYNQPattern
 };
 
 //===----------------------------------------------------------------------===//
+// Pattern: vivado.vit_get_first_token -> pynq.buffer_alloc + pynq.copy + pynq.view + pynq.copy
+//===----------------------------------------------------------------------===//
+
+struct VivadoViTGetFirstTokenToPYNQPattern
+    : public OpRewritePattern<vivado_ops::ViTGetFirstTokenOp> {
+  using OpRewritePattern<vivado_ops::ViTGetFirstTokenOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(vivado_ops::ViTGetFirstTokenOp op,
+                                PatternRewriter &rewriter) const override {
+    Location loc = op.getLoc();
+    Location loweredLoc = FusedLoc::get(
+        rewriter.getContext(),
+        {loc, NameLoc::get(rewriter.getStringAttr(
+                  "pynq.lowered_from_vivado.vit_get_first_token"))});
+
+    Value output = op.getOutput();
+    Value input = op.getInput();
+
+    bool transposeMode = op.getTransposeMode();
+    bool isTransposed = transposeMode ? op.getIsTransposed() : false;
+
+    auto inTy = llvm::dyn_cast<MemRefType>(input.getType());
+    auto outTy = llvm::dyn_cast<MemRefType>(output.getType());
+    if (!inTy || !outTy)
+      return rewriter.notifyMatchFailure(op, "expected input/output to be memrefs");
+    if (!inTy.hasStaticShape() || !outTy.hasStaticShape())
+      return rewriter.notifyMatchFailure(op, "expected static shapes for vit_get_first_token lowering");
+    if (inTy.getRank() != 3 || outTy.getRank() != 3)
+      return rewriter.notifyMatchFailure(op, "expected rank-3 tensors for vit_get_first_token");
+    if (inTy.getElementType() != outTy.getElementType())
+      return rewriter.notifyMatchFailure(op, "input/output element types must match");
+    if (!inTy.getElementType().isInteger(8))
+      return rewriter.notifyMatchFailure(op, "only i8 vit_get_first_token lowering is supported");
+
+    ArrayRef<int64_t> inShape = inTy.getShape();
+    ArrayRef<int64_t> outShape = outTy.getShape();
+
+    const int64_t B = inShape[0];
+    if (B <= 0)
+      return rewriter.notifyMatchFailure(op, "expected positive batch dimension");
+
+    int64_t L = 0;
+    int64_t D = 0;
+    int64_t outTokenDim = 0;
+    if (!isTransposed) {
+      // input: [B, L, D], output: [B, 1, D]
+      // NOTE: In the padded region, VivadoPadding may pad the token dimension
+      // (rank-2) from 1 up to tileSize for DMA packing.
+      L = inShape[1];
+      D = inShape[2];
+      int64_t tileSize = static_cast<int64_t>(pynq::InstrConfig::kTileSize);
+      outTokenDim = outShape[1];
+      if (outShape[0] != B || outShape[2] != D || !(outTokenDim == 1 || outTokenDim == tileSize))
+        return rewriter.notifyMatchFailure(
+            op, "output shape must be [B,1,D] or [B,tileSize,D] when is_transposed=false");
+    } else {
+      // input: [B, D, L], output: [B, D, 1]
+      // NOTE: A padding pass may run before this lowering and pad the last dim
+      // (logical token dimension) from 1 up to tileSize for DMA packing.
+      // Therefore, accept output last dimension = 1 or = tileSize.
+      D = inShape[1];
+      L = inShape[2];
+      int64_t tileSize = static_cast<int64_t>(pynq::InstrConfig::kTileSize);
+      outTokenDim = outShape[2];
+      if (outShape[0] != B || outShape[1] != D || !(outTokenDim == 1 || outTokenDim == tileSize))
+        return rewriter.notifyMatchFailure(
+            op, "output shape must be [B,D,1] or [B,D,tileSize] when is_transposed=true");
+    }
+
+    if (L <= 0 || D <= 0)
+      return rewriter.notifyMatchFailure(op, "expected non-empty L/D dimensions");
+
+    // Use default hardware tile sizes for 2D slicing.
+    int32_t tileM = pynq::TileConfig::kDefaultTileM;
+    int32_t tileN = pynq::TileConfig::kDefaultTileN;
+    if (tileM < 1 || tileN < 1)
+      return rewriter.notifyMatchFailure(op, "invalid default tileM/tileN configuration");
+
+    // Token axis maps to:
+    // - is_transposed=false: L is dimension 1, capped by tileM
+    // - is_transposed=true:  L is dimension 2, capped by tileN
+    const int32_t tileToken = isTransposed ? tileN : tileM;
+    const int32_t tileFeat = isTransposed ? tileM : tileN;
+
+    auto ceilDiv = [&](int64_t a, int64_t b) -> int64_t {
+      return (a + b - 1) / b;
+    };
+    auto alignUp = [&](int64_t a, int64_t b) -> int64_t {
+      if (b <= 0)
+        return a;
+      return ((a + b - 1) / b) * b;
+    };
+
+    const int64_t numFeatTiles = ceilDiv(D, tileFeat);
+    const int64_t numTokenTiles = ceilDiv(L, tileToken);
+
+    auto i8Type = rewriter.getIntegerType(8);
+    auto bufferType = pynq_ops::BufferType::getVirtual(
+        rewriter.getContext(), i8Type, pynq::BufferConfig::kDefaultCapacityBytes);
+
+    auto makeStaticOfr = [&](int64_t v) -> OpFoldResult {
+      return rewriter.getIndexAttr(v);
+    };
+
+    auto makeSubview = [&](Value src, ArrayRef<int64_t> offsets,
+                           ArrayRef<int64_t> sizes, Location l) -> Value {
+      auto srcTy = llvm::cast<MemRefType>(src.getType());
+      SmallVector<OpFoldResult, 4> ofrOffsets;
+      SmallVector<OpFoldResult, 4> ofrSizes;
+      SmallVector<OpFoldResult, 4> ofrStrides;
+      ofrOffsets.reserve(srcTy.getRank());
+      ofrSizes.reserve(srcTy.getRank());
+      ofrStrides.reserve(srcTy.getRank());
+      for (int64_t i = 0, e = srcTy.getRank(); i < e; ++i) {
+        ofrOffsets.push_back(makeStaticOfr(offsets[i]));
+        ofrSizes.push_back(makeStaticOfr(sizes[i]));
+        ofrStrides.push_back(makeStaticOfr(1));
+      }
+      return rewriter.create<memref::SubViewOp>(l, src, ofrOffsets, ofrSizes, ofrStrides)
+          .getResult();
+    };
+
+    // We only need the first token (range [0,1)) along L.
+    constexpr int64_t viewTokenStart = 0;
+    constexpr int64_t viewTokenLen = 1;
+
+    for (int64_t b = 0; b < B; ++b) {
+      for (int64_t tokenTile = 0; tokenTile < numTokenTiles; ++tokenTile) {
+        int64_t tokenStart = tokenTile * static_cast<int64_t>(tileToken);
+        int64_t tokenLen = std::min<int64_t>(tileToken, L - tokenStart);
+        if (tokenLen <= 0)
+          continue;
+
+        // If this tile doesn't overlap the viewed token range, skip entirely.
+        int64_t tileEnd = tokenStart + tokenLen;
+        int64_t viewEnd = viewTokenStart + viewTokenLen;
+        if (tileEnd <= viewTokenStart || tokenStart >= viewEnd)
+          continue;
+
+        // Within an overlapping tile, we always want the first token.
+        // IMPORTANT: Which axis corresponds to "row" vs "col" depends on
+        // is_transposed because memref layout changes while pynq.view does not
+        // permute data. We set splits to describe the logically-valid region.
+
+        for (int64_t featTile = 0; featTile < numFeatTiles; ++featTile) {
+          int64_t featStart = featTile * static_cast<int64_t>(tileFeat);
+          int64_t featLen = std::min<int64_t>(tileFeat, D - featStart);
+          if (featLen <= 0)
+            continue;
+
+          int32_t rowSplits = 0;
+          int32_t colSplits = 0;
+          if (!isTransposed) {
+            // Buffer tile is logically [token, feat] (rows=tokens, cols=features).
+            rowSplits = 1;
+            int64_t colAligned = alignUp(featLen, pynq::InstrConfig::kTileSize);
+            colSplits = static_cast<int32_t>(
+                std::min<int64_t>(colAligned, static_cast<int64_t>(tileFeat)));
+          } else {
+            // Buffer tile is logically [feat, token] (rows=features, cols=tokens).
+            // Only the first token (col 0) is logically valid; the physical
+            // storage may be padded to tileSize, and depad will later slice it.
+            rowSplits = static_cast<int32_t>(featLen);
+            colSplits = 1;
+          }
+
+          // Allocate one virtual on-chip buffer, load a (tokenTile x featTile)
+          // slab into it, apply view metadata, and store the first token back.
+          Value buf = rewriter.create<pynq_ops::BufferAllocOp>(
+              loweredLoc, bufferType, rewriter.getStringAttr("activation"));
+
+          Value inSubview;
+          Value outSubview;
+          if (!isTransposed) {
+            // input [B,L,D], output [B,1,D] (or [B,tileSize,D] after padding)
+            inSubview = makeSubview(input, {b, tokenStart, featStart},
+                                   {1, tokenLen, featLen}, loweredLoc);
+            outSubview = makeSubview(output, {b, 0, featStart},
+                                    {1, outTokenDim, featLen}, loweredLoc);
+          } else {
+            // input [B,D,L], output [B,D,1] (or [B,D,tileSize] after padding)
+            inSubview = makeSubview(input, {b, featStart, tokenStart},
+                                   {1, featLen, tokenLen}, loweredLoc);
+            outSubview = makeSubview(output, {b, featStart, 0},
+                                    {1, featLen, outTokenDim}, loweredLoc);
+          }
+
+          rewriter.create<pynq_ops::CopyOp>(loweredLoc, inSubview, buf);
+
+          auto viewOp = rewriter.create<pynq_ops::ViewOp>(
+              loweredLoc, bufferType, buf,
+              rewriter.getI32IntegerAttr(rowSplits),
+              rewriter.getI32IntegerAttr(colSplits));
+
+          rewriter.create<pynq_ops::CopyOp>(loweredLoc, viewOp.getOutput(), outSubview);
+        }
+      }
+    }
+
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
+
+//===----------------------------------------------------------------------===//
 // Pass Implementation
 //===----------------------------------------------------------------------===//
 
@@ -2584,8 +2830,14 @@ bool applyLowerVivadoToPYNQ(ModuleOp &module, MLIRContext *context) {
   patterns.add<VivadoDequantToPYNQPattern>(context);
   patterns.add<VivadoActivationLayoutTransposeToPYNQPattern>(context);
   patterns.add<VivadoActivationDynamicPadToPYNQPattern>(context);
+  patterns.add<VivadoViTGetFirstTokenToPYNQPattern>(context);
 
-  return !failed(applyPatternsAndFoldGreedily(module, std::move(patterns)));
+  if (failed(applyPatternsAndFoldGreedily(module, std::move(patterns))))
+    return false;
+
+  // Insert pynq.setMagic at the beginning of forward() if allo.hidden_dim exists.
+  maybeInsertSetMagic(module);
+  return true;
 }
 
 struct LowerVivadoToPYNQPass

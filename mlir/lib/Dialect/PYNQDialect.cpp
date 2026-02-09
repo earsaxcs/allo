@@ -7,6 +7,7 @@
 #include "allo/Dialect/PYNQTypes.h"
 #include "allo/Dialect/PYNQOps.h"
 #include "allo/Dialect/PYNQAttrs.h"
+#include "allo/Dialect/PYNQConfig.h"
 
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/DialectImplementation.h"
@@ -187,10 +188,6 @@ LogicalResult MatMulOp::verify() {
   return success();
 }
 
-//===----------------------------------------------------------------------===//
-// DataTransferInstrOp Verifier
-//===----------------------------------------------------------------------===//
-
 LogicalResult DataTransferInstrOp::verify() {
   // Verify direction is valid (0 or 1)
   // TableGen I1 type should enforce this
@@ -236,6 +233,48 @@ LogicalResult ActivationLayoutTransposeOp::verify() {
                            << outType << ", input=" << inType;
     }
   }
+
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
+// ViewOp Verifier
+//===----------------------------------------------------------------------===//
+
+LogicalResult ViewOp::verify() {
+  auto inTy = llvm::dyn_cast<pynq::BufferType>(getInput().getType());
+  auto outTy = llvm::dyn_cast<pynq::BufferType>(getOutput().getType());
+  if (!inTy || !outTy)
+    return emitOpError() << "expects input/output to be !pynq.buffer types";
+
+  if (inTy.getElementType() != outTy.getElementType())
+    return emitOpError() << "input/output buffer element types must match";
+
+  if (inTy.getCapacityBytes() != outTy.getCapacityBytes())
+    return emitOpError() << "input/output buffer capacities must match";
+
+  int64_t row = getRowSplits(); // .getInt();
+  int64_t col = getColSplits(); // .getInt();
+  if (row <= 0 || col <= 0)
+    return emitOpError() << "row_splits/col_splits must be positive";
+
+  // Conservative hardware-oriented checks: keep within default tile bounds.
+  // Note: the vivado->pynq lowering computes these values; this verifier is
+  // intentionally permissive enough for future tuning.
+  int64_t maxRow = std::max<int64_t>(pynq::TileConfig::kDefaultTileM,
+                                     pynq::TileConfig::kDefaultTileN);
+  int64_t maxCol = maxRow;
+  if (row > maxRow)
+    return emitOpError() << "row_splits (" << row << ") exceeds default tile limit (" << maxRow << ")";
+  if (col > maxCol)
+    return emitOpError() << "col_splits (" << col << ") exceeds default tile limit (" << maxCol << ")";
+
+  // Column extent must be aligned to the instruction tile size for DMA packing.
+  // Special-case: allow col_splits == 1 to represent "only 1 column logically
+  // valid" even when the underlying memref/buffer is padded up to tileSize.
+  if (pynq::InstrConfig::kTileSize > 0 && col != 1 &&
+      (col % pynq::InstrConfig::kTileSize) != 0)
+    return emitOpError("col_splits must be 1 or a multiple of tileSize");
 
   return success();
 }

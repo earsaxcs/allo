@@ -284,6 +284,7 @@ class VivadoModule:
                 f"empty-tensor-to-alloc-tensor,"
                 f"lower-allo-quant-to-vivado,"
                 f"repack-vivado-scales,"
+                f"vivado-merge-redundant-quant-dequant,"
                 f"toggle-vivado-transpose,"
                 f"vivado-padding,"
                 f"vivado-separate-bias," # NOTE: this pass must be after the toggle-vivado-transpose because it assumes the bias layout is 2D, instead of 3D, but this pass will make bias 3D by add batch dim.
@@ -297,7 +298,10 @@ class VivadoModule:
                 f"pynq-schedule-ops{{dry-run=false}},"
                 f"pynq-buffer-allocation,"
                 f"pynq-hoist-buffer-alloc,"
-                f"pynq-mid-lower"
+                f"pynq-optimize-subview-globals,hoist-get-global,symbol-dce,"
+                f"pynq-mid-lower{{debug-scale-pack=false}},"
+                f"pynq-optimize-sync,"
+                f"allo-lower-linalg-to-cstyle-scf"
                 f")"
             )
 

@@ -68,6 +68,50 @@ def from_pytorch_vivado(
             batch = int(first_inp.shape[0])
     global_vars.update({"__allo_batch__": batch})
 
+    # Propagate hidden dimension (e.g., transformer embedding dim) through the
+    # compilation pipeline to MLIR as a module attribute (allo.hidden_dim).
+    # Prefer reading it from LayerNorm/IntLayerNorm modules; fall back to (B,L,D)
+    # style example input shapes when applicable.
+    hidden_dim = None
+    modules_dict = dict(gm.named_modules())
+
+    # 1) IntLayerNorm commonly exposes `hidden_dim` explicitly.
+    for _, m in modules_dict.items():
+        if hasattr(m, "hidden_dim") and m.hidden_dim is not None:
+            try:
+                hidden_dim = int(m.hidden_dim)
+                if hidden_dim > 0:
+                    break
+            except Exception:
+                pass
+
+    # 2) Fallback: nn.LayerNorm (and some wrappers) expose normalized_shape.
+    if hidden_dim is None:
+        for _, m in modules_dict.items():
+            if hasattr(m, "normalized_shape"):
+                ns = getattr(m, "normalized_shape")
+                if isinstance(ns, (tuple, list)) and len(ns) == 1:
+                    try:
+                        hidden_dim = int(ns[0])
+                        if hidden_dim > 0:
+                            break
+                    except Exception:
+                        pass
+
+    # 3) Last resort: if example input looks like (B, L, D) or (L, D).
+    if hidden_dim is None and example_inputs is not None and len(example_inputs) > 0:
+        first_inp = example_inputs[0]
+        if hasattr(first_inp, "shape") and first_inp.shape is not None:
+            shp = tuple(first_inp.shape)
+            if len(shp) in (2, 3):
+                try:
+                    hidden_dim = int(shp[-1])
+                except Exception:
+                    hidden_dim = None
+
+    if hidden_dim is not None:
+        global_vars.update({"__allo_hidden_dim__": int(hidden_dim)})
+
     for name, param in gm.named_parameters():
         new_name = "g_" + name.replace(".", "_")
         global_vars.update({new_name: param.detach().numpy()})
@@ -88,7 +132,7 @@ def from_pytorch_vivado(
         code, verbose=verbose, global_vars=global_vars, enable_tensor=enable_tensor
     )
     # print(s.module)
-    mod = s.build(target='vivado')
+    mod = s.build(target='vivado', mode=mode, project=project)
     # print(mod)
     if verbose:
         print(s.module)

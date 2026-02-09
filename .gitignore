@@ -87,3 +87,6 @@ log
 
 _tmp
 *.txt
+
+*.mlir
+*.bin

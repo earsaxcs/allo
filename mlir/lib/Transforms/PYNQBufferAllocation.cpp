@@ -45,6 +45,18 @@ using namespace mlir::allo::pynq;
 
 namespace {
 
+/// Buffer allocation strategy for LinearScanAllocator.
+enum class AllocationStrategy {
+  /// Save buffers: allocate first available buffer (original behavior).
+  /// Prioritizes minimizing buffer count.
+  SaveBuffers = 0,
+  
+  /// Balanced utilization: balance buffer usage and reduce adjacent conflicts.
+  /// Tries to maximize buffer utilization while avoiding immediate reuse
+  /// of buffers released by adjacent operations.
+  BalancedUtilization = 1
+};
+
 /// Hardware configuration parameters for buffer allocation.
 /// These can be overridden via pass options for different PYNQ targets.
 struct PYNQHardwareConfig {
@@ -62,6 +74,9 @@ struct PYNQHardwareConfig {
   
   /// Whether to enable buffer spilling when all buffers are occupied
   bool enableSpilling = false;
+  
+  /// Buffer allocation strategy
+  AllocationStrategy strategy = AllocationStrategy::SaveBuffers;
   
   /// Validate the configuration
   bool isValid() const {
@@ -180,8 +195,12 @@ private:
 ///    c. If no buffer available, spill (if enabled) or fail
 class LinearScanAllocator {
 public:
-  LinearScanAllocator(const PYNQHardwareConfig &config)
-      : config(config), freeBuffers(config.numBuffers, true) {}
+  LinearScanAllocator(const PYNQHardwareConfig &config,
+                      const BufferAllocationAnalysis &analysis)
+      : config(config), analysis(analysis), 
+        freeBuffers(config.numBuffers, true),
+        bufferUsageCount(config.numBuffers, 0),
+        lastReleaseIndex(config.numBuffers, 0) {}
   
   /// Run allocation on the given live ranges
   /// Returns success if all ranges were allocated, failure otherwise
@@ -190,16 +209,27 @@ public:
   
 private:
   const PYNQHardwareConfig &config;
+  const BufferAllocationAnalysis &analysis;
   
   /// Bit vector tracking which buffer IDs are free
   llvm::SmallBitVector freeBuffers;
 
   /// Currently active segments.
   SmallVector<LiveSegment *, 16> active;
+  
+  /// Buffer usage count (for balanced utilization strategy)
+  SmallVector<unsigned, 8> bufferUsageCount;
+  
+  /// Last release index for each buffer (for adjacent conflict detection)
+  SmallVector<unsigned, 8> lastReleaseIndex;
 
   void expireOld(unsigned currentIndex);
 
   std::optional<unsigned> tryAllocate(LiveSegment &segment);
+  
+  std::optional<unsigned> tryAllocateSaveBuffers(LiveSegment &segment);
+  
+  std::optional<unsigned> tryAllocateBalancedUtilization(LiveSegment &segment);
 
   LiveSegment *selectSpillVictim(Operation *currentOp,
                                 ArrayRef<Value> currentOpBuffers) const;
@@ -249,6 +279,17 @@ public:
       *this, "enable-spilling",
       llvm::cl::desc("Enable buffer spilling when buffers are exhausted"),
       llvm::cl::init(false)};
+    
+    Option<AllocationStrategy> allocationStrategy{
+      *this, "allocation-strategy",
+      llvm::cl::desc("Buffer allocation strategy"),
+      llvm::cl::values(
+        clEnumValN(AllocationStrategy::SaveBuffers, "save-buffers",
+                   "Allocate first available buffer (default, minimize buffer count)"),
+        clEnumValN(AllocationStrategy::BalancedUtilization, "balanced-utilization",
+                   "Balance buffer utilization and reduce adjacent operation conflicts")
+      ),
+      llvm::cl::init(AllocationStrategy::SaveBuffers)};
   
   void runOnOperation() override;
   
@@ -391,8 +432,12 @@ void LinearScanAllocator::expireOld(unsigned currentIndex) {
   for (auto it = active.begin(); it != active.end();) {
     LiveSegment *seg = *it;
     if (seg && seg->endIndex < currentIndex) {
-      if (seg->assignedBufferId)
-        freeBuffer(*seg->assignedBufferId);
+      if (seg->assignedBufferId) {
+        unsigned bufferId = *seg->assignedBufferId;
+        freeBuffer(bufferId);
+        // 记录 buffer 释放位置，用于 balanced-utilization 策略
+        lastReleaseIndex[bufferId] = currentIndex;
+      }
       it = active.erase(it);
       continue;
     }
@@ -402,26 +447,86 @@ void LinearScanAllocator::expireOld(unsigned currentIndex) {
 
 std::optional<unsigned> LinearScanAllocator::tryAllocate(LiveSegment &segment) {
   /*
-   * 设计思路:
+   * 策略分发：根据配置选择不同的分配策略
+   */
+  
+  switch (config.strategy) {
+  case AllocationStrategy::SaveBuffers:
+    return tryAllocateSaveBuffers(segment);
+  case AllocationStrategy::BalancedUtilization:
+    return tryAllocateBalancedUtilization(segment);
+  }
+  
+  return std::nullopt;
+}
+
+std::optional<unsigned> LinearScanAllocator::tryAllocateSaveBuffers(LiveSegment &segment) {
+  /*
+   * SaveBuffers 策略（原始行为）:
    * 1. 找到第一个空闲的 buffer ID
    * 2. 检查该 buffer 的容量是否满足需求
    * 3. 如果满足，分配并返回 buffer ID
    * 4. 如果没有空闲 buffer，返回 nullopt
    * 
-   * 优化机会：
-   * - 可以根据 role hint 优先选择特定的 buffer（如 input 总是用 0-2）
-   * - 可以实现最小碎片化的选择策略
+   * 目标：最小化使用的 buffer 数量
    */
   
-  // 简单策略：找第一个空闲的 buffer
   for (unsigned i = 0; i < config.numBuffers; ++i) {
     if (freeBuffers[i]) {
-      // 检查容量
       if (segment.requiredSizeBytes <= config.defaultBufferCapacity) {
         allocateBuffer(i, segment);
         return i;
       }
     }
+  }
+  
+  return std::nullopt;
+}
+
+std::optional<unsigned> LinearScanAllocator::tryAllocateBalancedUtilization(LiveSegment &segment) {
+  /*
+   * BalancedUtilization 策略:
+   * 1. 尽量用满所有 buffer（负载均衡）
+   * 2. 避免与相邻操作的 buffer 立即复用（减少伪依赖）
+   * 3. 不增加 spill 风险（仍然只从空闲 buffer 中选择）
+   * 
+   * 评分规则：
+   * - 非相邻释放（lastReleaseIndex != currentIndex-1）: +1000
+   * - 使用次数少: -usageCount * 10
+   * - ID 小作为 tie-breaker（稳定性）
+   */
+  
+  // 检查容量是否满足
+  if (segment.requiredSizeBytes > config.defaultBufferCapacity)
+    return std::nullopt;
+  
+  int bestId = -1;
+  int bestScore = std::numeric_limits<int>::min();
+  
+  for (unsigned i = 0; i < config.numBuffers; ++i) {
+    if (!freeBuffers[i])
+      continue;
+    
+    // 评分
+    int score = 0;
+    
+    // 优先：避免刚在上一个 index 释放的 buffer（减少相邻冲突）
+    if (lastReleaseIndex[i] + 1 != segment.startIndex)
+      score += 1000;
+    
+    // 次要：负载均衡，优先使用历史使用次数少的 buffer
+    score -= bufferUsageCount[i] * 10;
+    
+    // 选择最佳或更小 ID（稳定性）
+    if (score > bestScore || (score == bestScore && (bestId < 0 || i < static_cast<unsigned>(bestId)))) {
+      bestId = i;
+      bestScore = score;
+    }
+  }
+  
+  if (bestId >= 0) {
+    allocateBuffer(static_cast<unsigned>(bestId), segment);
+    return static_cast<unsigned>(bestId);
   }
   
   return std::nullopt;
@@ -467,6 +572,8 @@ void LinearScanAllocator::allocateBuffer(unsigned bufferId,
   freeBuffers.reset(bufferId);
   segment.assignedBufferId = bufferId;
   active.push_back(&segment);
+  // 更新使用计数，用于 balanced-utilization 策略
+  bufferUsageCount[bufferId]++;
 }
 
 static SmallVector<Value, 8> collectPynqBufferOperands(Operation *op) {
@@ -586,6 +693,8 @@ LogicalResult LinearScanAllocator::allocate(
       }
     }
     freeBuffer(freedId);
+    // 记录 spill 释放位置
+    lastReleaseIndex[freedId] = seg.startIndex;
 
     bufferId = tryAllocate(seg);
     if (!bufferId) {
@@ -623,6 +732,7 @@ void PYNQBufferAllocationPass::runOnOperation() {
   hwConfig.numBuffers = numBuffers;
   hwConfig.defaultBufferCapacity = bufferCapacity;
   hwConfig.enableSpilling = enableSpilling;
+  hwConfig.strategy = allocationStrategy;
   
   // Validate hardware configuration
   if (!hwConfig.isValid()) {
@@ -683,7 +793,7 @@ LogicalResult PYNQBufferAllocationPass::processFunction(func::FuncOp funcOp) {
     return success();
   }
 
-  LinearScanAllocator allocator(hwConfig);
+  LinearScanAllocator allocator(hwConfig, analysis);
   if (failed(allocator.allocate(segments, analysis)))
     return failure();
 

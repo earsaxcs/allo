@@ -392,6 +392,43 @@ def PYNQ_CopyOp : PYNQ_Op<"copy", []> {
   }];
 }
 
+//===----------------------------------------------------------------------===//
+// PYNQ View Op (logical view into a buffer)
+//===----------------------------------------------------------------------===//
+
+def PYNQ_ViewOp : PYNQ_Op<"view", []> {
+  let summary = "Logical view of a PYNQ buffer (valid region metadata)";
+  let description = [{
+    Creates a logical view of an existing on-chip buffer without changing the
+    underlying stored data. After applying a view, only a specified prefix
+    region of the buffer is considered valid for subsequent uses (until the
+    buffer is overwritten/refreshed).
+
+    The view is described by two i32 attributes:
+    - row_splits: effective valid extent in the row direction
+    - col_splits: effective valid extent in the column direction
+
+    This op is a lightweight marker used by later passes / runtime lowering.
+  }];
+
+  let arguments = (ins
+    AnyPYNQBuffer:$input,
+    I32Attr:$row_splits,
+    I32Attr:$col_splits
+  );
+
+  let results = (outs
+    AnyPYNQBuffer:$output
+  );
+
+  let assemblyFormat = [{
+    $input `row_splits` `=` $row_splits `col_splits` `=` $col_splits attr-dict
+    `:` type($input) `->` type($output)
+  }];
+
+  let hasVerifier = 1;
+}
+
 // TODO: Add support for DDR to FIFO of Matrix/Vector
 
 //===----------------------------------------------------------------------===//
@@ -806,6 +843,29 @@ def PYNQ_SyncOp : PYNQ_Op<"sync", []> {
   let results = (outs);
   
   let assemblyFormat = [{ attr-dict }];
+}
+
+//===----------------------------------------------------------------------===//
+// PYNQ SetMagic Op
+//===----------------------------------------------------------------------===//
+
+def PYNQ_SetMagicOp : PYNQ_Op<"setMagic", []> {
+  let summary = "Set a runtime magic parameter (e.g. hidden_dim)";
+  let description = [{
+    A minimal op used to pass a single integer parameter to the runtime.
+    The lowering pipeline may insert this op at function entry to communicate
+    module-level configuration (e.g., `allo.hidden_dim`).
+  }];
+
+  let arguments = (ins
+    I32Attr:$magic
+  );
+
+  let results = (outs);
+
+  let assemblyFormat = [{
+    `magic` `=` $magic attr-dict
+  }];
 }
 
 //===----------------------------------------------------------------------===//

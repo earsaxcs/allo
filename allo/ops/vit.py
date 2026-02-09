@@ -62,14 +62,14 @@ class ViTEmbedding(nn.Module):
         self.n_embd = n_embd
         self.expand1 = ViTTokenExpand(self.cls_token.shape)
         self.expand2 = ViTTokenExpand(self.position_embeddings.shape)
-        self.add = Add()
+        self.embd_add = Add()
 
     def forward(self, x):
         embeddings = self.proj(x).view(x.shape[0], self.n_embd, -1).transpose(1, 2)
         # cls_tokens = self.cls_token.expand(x.shape[0], -1, -1)
         cls_tokens = self.expand1(self.cls_token, x)
         embeddings = torch.cat((cls_tokens, embeddings), dim=1)
-        embeddings = self.add(embeddings, self.expand2(self.position_embeddings, x))
+        embeddings = self.embd_add(embeddings, self.expand2(self.position_embeddings, x))
         return embeddings
 
 class ViTTokenExpand(nn.Module):

@@ -1695,6 +1695,12 @@ class ASTTransformer(ASTBuilder):
             module.operation.attributes["allo.batch"] = IntegerAttr.get(
                 IntegerType.get_signless(32), batch
             )
+        # Attach hidden dimension as a module attribute for downstream MLIR passes
+        if "__allo_hidden_dim__" in ctx.global_vars:
+            hidden_dim = int(ctx.global_vars["__allo_hidden_dim__"])
+            module.operation.attributes["allo.hidden_dim"] = IntegerAttr.get(
+                IntegerType.get_signless(32), hidden_dim
+            )
         ctx.set_ip(module.body)
         for stmt in node.body:
             build_stmt(ctx, stmt)

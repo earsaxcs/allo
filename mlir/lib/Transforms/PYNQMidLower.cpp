@@ -41,9 +41,11 @@
 
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/FormatVariadic.h"
+#include "llvm/Support/raw_ostream.h"
 
 #include <cstdint>
 #include <string>
+#include <optional>
 
 using namespace mlir;
 using namespace mlir::allo;
@@ -183,12 +185,71 @@ static void appendElementBytesLittleEndian(SmallVectorImpl<uint8_t> &out,
     out.push_back(static_cast<uint8_t>((raw >> (8 * i)) & 0xFFu));
 }
 
+static void debugDumpBytesHex(llvm::raw_ostream &os, ArrayRef<uint8_t> bytes,
+                              size_t bytesPerLine = 32) {
+  os << "bytes(" << bytes.size() << ") = [";
+  if (bytes.empty()) {
+    os << "]\n";
+    return;
+  }
+  os << "\n";
+  for (size_t i = 0; i < bytes.size(); ++i) {
+    if (i % bytesPerLine == 0)
+      os << "  " << llvm::formatv("{0,6}:", i);
+    os << " " << llvm::formatv("0x{0:X2}", bytes[i]);
+    if (i % bytesPerLine == bytesPerLine - 1 || i + 1 == bytes.size())
+      os << "\n";
+  }
+  os << "]\n";
+}
+
+static void debugDumpAPIntVector(llvm::raw_ostream &os,
+                                 ArrayRef<APInt> values,
+                                 unsigned elemBytes,
+                                 size_t elemsPerLine = 8) {
+  os << "values(" << values.size() << ") elemBytes=" << elemBytes << " = [\n";
+  for (size_t i = 0; i < values.size(); ++i) {
+    if (i % elemsPerLine == 0)
+      os << "  " << llvm::formatv("{0,6}:", i);
+    uint64_t raw = 0;
+    if (values[i].getBitWidth() <= 64)
+      raw = values[i].getZExtValue();
+    os << " " << llvm::formatv("0x{0:X}", raw);
+    if (i % elemsPerLine == elemsPerLine - 1 || i + 1 == values.size())
+      os << "\n";
+  }
+  os << "]\n";
+}
+
+static std::optional<int64_t> tryGetConstI64(Value v) {
+  if (!v)
+    return std::nullopt;
+  if (auto c = v.getDefiningOp<arith::ConstantIntOp>())
+    return static_cast<int64_t>(c.value());
+  return std::nullopt;
+}
+
+static void debugPrintValueOrConst(llvm::raw_ostream &os, Value v) {
+  if (!v) {
+    os << "<null>";
+    return;
+  }
+  if (auto c = tryGetConstI64(v)) {
+    os << *c;
+    return;
+  }
+  os << "<";
+  v.print(os);
+  os << ">";
+}
+
 static FailureOr<SmallVector<uint8_t>>
 packChunkHalfInterleaveBytes(ArrayRef<APInt> values,
                              unsigned elemBytes,
                              int32_t chunkElements,
                              Operation *user,
-                             StringRef what) {
+                             StringRef what,
+                             bool debugScalePack) {
   if (chunkElements <= 0) {
     if (user)
       user->emitError() << "invalid chunk size";
@@ -209,34 +270,70 @@ packChunkHalfInterleaveBytes(ArrayRef<APInt> values,
   SmallVector<uint8_t> out;
   out.reserve(values.size() * elemBytes);
 
+  if (debugScalePack) {
+    llvm::errs() << "[pynq-mid-lower][pack] " << what << "\n";
+    llvm::errs() << "  chunkElements=" << chunkElements
+                 << " half=" << (chunkElements / 2)
+                 << " elemBytes=" << elemBytes << "\n";
+    debugDumpAPIntVector(llvm::errs(), values, elemBytes);
+  }
+
   int32_t half = chunkElements / 2;
   for (size_t base = 0; base < values.size(); base += chunkElements) {
+    if (debugScalePack) {
+      llvm::errs() << "  chunk base=" << base << ".." << (base + chunkElements)
+                   << " (half-interleave pairs: i and i+" << half << ")\n";
+    }
     for (int32_t i = 0; i < half; ++i) {
+      if (debugScalePack) {
+        uint64_t a = values[base + i].getBitWidth() <= 64
+                         ? values[base + i].getZExtValue()
+                         : 0;
+        uint64_t b = values[base + i + half].getBitWidth() <= 64
+                         ? values[base + i + half].getZExtValue()
+                         : 0;
+        llvm::errs() << "    pair (" << (base + i) << "," << (base + i + half)
+                     << ") values=(" << llvm::formatv("0x{0:X}", a) << ","
+                     << llvm::formatv("0x{0:X}", b) << ")\n";
+      }
       appendElementBytesLittleEndian(out, values[base + i], elemBytes);
       appendElementBytesLittleEndian(out, values[base + i + half], elemBytes);
     }
+  }
+
+  if (debugScalePack) {
+    llvm::errs() << "  packed (after half-interleave):\n";
+    debugDumpBytesHex(llvm::errs(), out);
   }
 
   return out;
 }
 
 static FailureOr<SmallVector<uint8_t>>
-packMatMulScale(ModuleOp module, pynq::MatMulOp op) {
+packMatMulScale(ModuleOp module, pynq::MatMulOp op, bool debugScalePack) {
   auto gvOr = extract1DIntegerGlobal(module, op.getFusedScale(), op, "fused_scale");
   if (failed(gvOr))
     return failure();
   auto &gv = *gvOr;
 
+  if (debugScalePack) {
+    llvm::errs() << "[pynq-mid-lower][pack] matmul fused_scale global=@"
+                 << gv.global.getName() << " len=" << gv.values.size()
+                 << " elemBytes=" << gv.elementBytes << "\n";
+  }
+
   return packChunkHalfInterleaveBytes(gv.values, gv.elementBytes,
                                       FIFOConfig::kMatrixScaleChunk,
-                                      op, "matmul fused_scale");
+                                      op, "matmul fused_scale",
+                                      debugScalePack);
 }
 
 static FailureOr<SmallVector<uint8_t>>
 packVectorScalesStacked(ModuleOp module,
                         ArrayRef<std::pair<Value, StringRef>> scales,
                         Operation *op,
-                        int32_t chunkElements) {
+                        int32_t chunkElements,
+                        bool debugScalePack) {
   if (scales.empty())
     return SmallVector<uint8_t>();
 
@@ -288,6 +385,22 @@ packVectorScalesStacked(ModuleOp module,
   SmallVector<uint8_t> out;
   out.reserve(len * elemBytes * vecs.size());
 
+  if (debugScalePack) {
+    llvm::errs() << "[pynq-mid-lower][pack] vector scales stacked\n";
+    llvm::errs() << "  scales=" << vecs.size() << " len=" << len
+                 << " chunkElements=" << chunkElements
+                 << " blocks=" << blocks << " elemBytes=" << elemBytes << "\n";
+    for (size_t si = 0; si < vecs.size(); ++si) {
+      llvm::errs() << "  scale[" << si << "] " << scales[si].second << ": ";
+      llvm::errs() << "global=@" << vecs[si].global.getName() << " ";
+      llvm::errs() << "rawLen=" << vecs[si].values.size();
+      if (vecs[si].values.size() == 1 && len > 1)
+        llvm::errs() << " (broadcast)";
+      llvm::errs() << "\n";
+      debugDumpAPIntVector(llvm::errs(), vecs[si].values, vecs[si].elementBytes);
+    }
+  }
+
   int32_t half = chunkElements / 2;
   for (size_t b = 0; b < blocks; ++b) {
     size_t base = b * chunkElements;
@@ -296,46 +409,68 @@ packVectorScalesStacked(ModuleOp module,
         return s.values.size() == 1 ? s.values[0] : s.values[idx];
       };
       for (int32_t i = 0; i < half; ++i) {
+        if (debugScalePack) {
+          uint64_t a = getVal(base + i).getBitWidth() <= 64
+                           ? getVal(base + i).getZExtValue()
+                           : 0;
+          uint64_t bval = getVal(base + i + half).getBitWidth() <= 64
+                              ? getVal(base + i + half).getZExtValue()
+                              : 0;
+          llvm::errs() << "  block=" << b << " scale=@" << s.global.getName()
+                       << " pair(" << (base + i) << "," << (base + i + half)
+                       << ") values=(" << llvm::formatv("0x{0:X}", a) << ","
+                       << llvm::formatv("0x{0:X}", bval) << ")\n";
+        }
         appendElementBytesLittleEndian(out, getVal(base + i), elemBytes);
         appendElementBytesLittleEndian(out, getVal(base + i + half), elemBytes);
       }
     }
   }
 
+  if (debugScalePack) {
+    llvm::errs() << "  packed (after stacking + half-interleave):\n";
+    debugDumpBytesHex(llvm::errs(), out);
+  }
+
   return out;
 }
 
-static FailureOr<SmallVector<uint8_t>> packGELUScale(ModuleOp module,
-                                                     pynq::GELUOp op) {
+static FailureOr<SmallVector<uint8_t>>
+packGELUScale(ModuleOp module, pynq::GELUOp op, bool debugScalePack) {
   return packVectorScalesStacked(module,
                                  {{op.getInScale(), "in_scale"},
                                   {op.getOutScaleInv(), "out_scale_inv"}},
                                  op,
-                                 FIFOConfig::kVectorScaleChunk);
+                                 FIFOConfig::kVectorScaleChunk,
+                                 debugScalePack);
 }
 
-static FailureOr<SmallVector<uint8_t>> packSoftmaxScale(ModuleOp module,
-                                                        pynq::SoftmaxOp op) {
+static FailureOr<SmallVector<uint8_t>>
+packSoftmaxScale(ModuleOp module, pynq::SoftmaxOp op, bool debugScalePack) {
   return packVectorScalesStacked(module,
                                  {{op.getInScale(), "in_scale"},
                                   {op.getOutScaleInv(), "out_scale_inv"}},
                                  op,
-                                 FIFOConfig::kVectorScaleChunk);
+                                 FIFOConfig::kVectorScaleChunk,
+                                 debugScalePack);
 }
 
-static FailureOr<SmallVector<uint8_t>> packQAddScale(ModuleOp module,
-                                                     pynq::QAddOp op) {
+static FailureOr<SmallVector<uint8_t>>
+packQAddScale(ModuleOp module, pynq::QAddOp op, bool debugScalePack) {
   // Block-stacking order: y, x, o_inv.
   return packVectorScalesStacked(module,
                                  {{op.getYScale(), "y_scale"},
                                   {op.getXScale(), "x_scale"},
                                   {op.getOScaleInv(), "o_scale_inv"}},
                                  op,
-                                 FIFOConfig::kVectorScaleChunk);
+                                 FIFOConfig::kVectorScaleChunk,
+                                 debugScalePack);
 }
 
-static FailureOr<SmallVector<uint8_t>> packLayerNormScaleBias(ModuleOp module,
-                                                              pynq::LayerNormOp op) {
+static FailureOr<SmallVector<uint8_t>>
+packLayerNormScaleBias(ModuleOp module,
+                       pynq::LayerNormOp op,
+                       bool debugScalePack) {
   auto scaleOr = extract1DIntegerGlobal(module, op.getFusedScale(), op, "fused_scale");
   if (failed(scaleOr))
     return failure();
@@ -357,6 +492,21 @@ static FailureOr<SmallVector<uint8_t>> packLayerNormScaleBias(ModuleOp module,
     appendElementBytesLittleEndian(out, s.values[i], s.elementBytes);
     appendElementBytesLittleEndian(out, b.values[i], b.elementBytes);
   }
+
+  if (debugScalePack) {
+    llvm::errs() << "[pynq-mid-lower][pack] layernorm fused_scale+bias_int\n";
+    llvm::errs() << "  fused_scale global=@" << s.global.getName()
+                 << " len=" << s.values.size()
+                 << " elemBytes=" << s.elementBytes << "\n";
+    debugDumpAPIntVector(llvm::errs(), s.values, s.elementBytes);
+    llvm::errs() << "  bias_int global=@" << b.global.getName()
+                 << " len=" << b.values.size()
+                 << " elemBytes=" << b.elementBytes << "\n";
+    debugDumpAPIntVector(llvm::errs(), b.values, b.elementBytes);
+    llvm::errs() << "  packed (scale then bias, per element):\n";
+    debugDumpBytesHex(llvm::errs(), out);
+  }
+
   return out;
 }
 
@@ -519,6 +669,21 @@ class PYNQMidLowerPass
 public:
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(PYNQMidLowerPass)
 
+  PYNQMidLowerPass() = default;
+  PYNQMidLowerPass(const PYNQMidLowerPass &pass) : PassWrapper(pass) {}
+
+  Option<bool> debugScalePack{
+    *this, "debug-scale-pack",
+    llvm::cl::desc(
+      "Enable verbose debug printing for scale/bias packing (raw values, intermediate pairing, packed bytes, transfer segments)"),
+    llvm::cl::init(false)};
+
+  Option<bool> debugOpConvert{
+    *this, "debug-op-convert",
+    llvm::cl::desc(
+      "Enable debug printing for op conversion to *_instr (buffer ids, tile counts, and lowered instruction fields)"),
+    llvm::cl::init(false)};
+
   StringRef getArgument() const final { return "pynq-mid-lower"; }
   StringRef getDescription() const final {
     return "Mid-lower PYNQ: pack scale/bias to FIFO transfers and convert ops to instr";
@@ -549,6 +714,14 @@ void PYNQMidLowerPass::runOnOperation() {
     if (failedAny)
       return;
 
+    if (debugScalePack || debugOpConvert) {
+      llvm::errs() << "[pynq-mid-lower] func @" << funcOp.getName() << "\n";
+      if (debugScalePack)
+        llvm::errs() << "  debug-scale-pack=1\n";
+      if (debugOpConvert)
+        llvm::errs() << "  debug-op-convert=1\n";
+    }
+
     // Single-block assumption.
     if (!funcOp.getBody().hasOneBlock()) {
       funcOp.emitError() << "PYNQMidLower expects single-block functions";
@@ -577,54 +750,75 @@ void PYNQMidLowerPass::runOnOperation() {
       }
 
       if (auto mm = llvm::dyn_cast<pynq::MatMulOp>(&op)) {
-        auto bytesOr = packMatMulScale(module, mm);
+        auto bytesOr = packMatMulScale(module, mm, debugScalePack);
         if (failed(bytesOr)) {
           failedAny = true;
           return;
         }
+        if (debugScalePack)
+          llvm::errs() << "[pynq-mid-lower][pack] MatMulOp packedBytes="
+                       << bytesOr->size() << "\n";
         matrixOps.push_back(PackedOpData{&op, std::move(*bytesOr)});
         continue;
       }
 
       if (auto gelu = llvm::dyn_cast<pynq::GELUOp>(&op)) {
-        auto bytesOr = packGELUScale(module, gelu);
+        auto bytesOr = packGELUScale(module, gelu, debugScalePack);
         if (failed(bytesOr)) {
           failedAny = true;
           return;
         }
+        if (debugScalePack)
+          llvm::errs() << "[pynq-mid-lower][pack] GELUOp packedBytes="
+                       << bytesOr->size() << "\n";
         vectorOps.push_back(PackedOpData{&op, std::move(*bytesOr)});
         continue;
       }
 
       if (auto sm = llvm::dyn_cast<pynq::SoftmaxOp>(&op)) {
-        auto bytesOr = packSoftmaxScale(module, sm);
+        auto bytesOr = packSoftmaxScale(module, sm, debugScalePack);
         if (failed(bytesOr)) {
           failedAny = true;
           return;
         }
+        if (debugScalePack)
+          llvm::errs() << "[pynq-mid-lower][pack] SoftmaxOp packedBytes="
+                       << bytesOr->size() << "\n";
         vectorOps.push_back(PackedOpData{&op, std::move(*bytesOr)});
         continue;
       }
 
       if (auto qa = llvm::dyn_cast<pynq::QAddOp>(&op)) {
-        auto bytesOr = packQAddScale(module, qa);
+        auto bytesOr = packQAddScale(module, qa, debugScalePack);
         if (failed(bytesOr)) {
           failedAny = true;
           return;
         }
+        if (debugScalePack)
+          llvm::errs() << "[pynq-mid-lower][pack] QAddOp packedBytes="
+                       << bytesOr->size() << "\n";
         vectorOps.push_back(PackedOpData{&op, std::move(*bytesOr)});
         continue;
       }
 
       if (auto ln = llvm::dyn_cast<pynq::LayerNormOp>(&op)) {
-        auto bytesOr = packLayerNormScaleBias(module, ln);
+        auto bytesOr = packLayerNormScaleBias(module, ln, debugScalePack);
         if (failed(bytesOr)) {
           failedAny = true;
           return;
         }
+        if (debugScalePack)
+          llvm::errs() << "[pynq-mid-lower][pack] LayerNormOp packedBytes="
+                       << bytesOr->size() << "\n";
         vectorOps.push_back(PackedOpData{&op, std::move(*bytesOr)});
         continue;
       }
+    }
+
+    if (debugScalePack) {
+      llvm::errs() << "[pynq-mid-lower][pack] collected matrixOps="
+                   << matrixOps.size() << " vectorOps=" << vectorOps.size()
+                   << "\n";
     }
 
     // Build transfer segments (per FIFO).
@@ -640,6 +834,25 @@ void PYNQMidLowerPass::runOnOperation() {
     if (failed(vectorSegOr)) {
       failedAny = true;
       return;
+    }
+
+    if (debugScalePack) {
+      auto dumpSegs = [&](ArrayRef<TransferSegment> segs, StringRef kind) {
+        llvm::errs() << "[pynq-mid-lower][pack] segments kind=" << kind
+                     << " count=" << segs.size() << "\n";
+        for (size_t i = 0; i < segs.size(); ++i) {
+          const auto &seg = segs[i];
+          llvm::errs() << "  seg[" << i << "] direction=" << seg.direction
+                       << " bytes=" << seg.bytes.size();
+          if (seg.insertBefore) {
+            llvm::errs() << " insertBefore=" << seg.insertBefore->getName();
+          }
+          llvm::errs() << "\n";
+          debugDumpBytesHex(llvm::errs(), seg.bytes);
+        }
+      };
+      dumpSegs(*matrixSegOr, "matrix");
+      dumpSegs(*vectorSegOr, "vector");
     }
 
     // Insert new globals + transfer instrs.
@@ -671,8 +884,10 @@ void PYNQMidLowerPass::runOnOperation() {
           initAttr, /*constant=*/true, /*alignment=*/nullptr);
     };
 
-    auto insertTransfers = [&](ArrayRef<TransferSegment> segs,
-                               StringRef kindPrefix) {
+    // NOTE: scale-pack transfers are inserted without any pynq.sync.
+    // They stream constant payload to FIFOs and should not introduce extra waits.
+    auto insertScalePackTransfersWithoutSync = [&](ArrayRef<TransferSegment> segs,
+                                                   StringRef kindPrefix) {
       int idx = 0;
       for (auto &seg : segs) {
         if (!seg.insertBefore)
@@ -683,6 +898,12 @@ void PYNQMidLowerPass::runOnOperation() {
         ++idx;
 
         auto global = createPackedGlobalI8(sym, seg.bytes, funcOp.getLoc());
+
+        if (debugScalePack) {
+          llvm::errs() << "[pynq-mid-lower][pack] create global @" << sym
+                       << " bytes=" << seg.bytes.size()
+                       << " direction=" << seg.direction << "\n";
+        }
 
         OpBuilder b(seg.insertBefore);
         auto memrefTy = global.getType();
@@ -700,11 +921,17 @@ void PYNQMidLowerPass::runOnOperation() {
         b.create<pynq::DataTransferInstrOp>(seg.insertBefore->getLoc(),
                                             getg.getResult(), bufferId,
                                             tileCount, totalPkg, dir);
+
+        if (debugScalePack) {
+          llvm::errs() << "[pynq-mid-lower][pack] insert DataTransferInstrOp kind="
+                       << kindPrefix << " pkgNum=" << pkgNum
+                       << " dir=" << seg.direction << "\n";
+        }
       }
     };
 
-    insertTransfers(*matrixSegOr, "matrix_scale_pack");
-    insertTransfers(*vectorSegOr, "vector_scale_pack");
+    insertScalePackTransfersWithoutSync(*matrixSegOr, "matrix_scale_pack");
+    insertScalePackTransfersWithoutSync(*vectorSegOr, "vector_scale_pack");
 
     // Second pass: rewrite ops to instr.
     SmallVector<Operation *> toErase;
@@ -727,6 +954,26 @@ void PYNQMidLowerPass::runOnOperation() {
           failedAny = true;
           return;
         }
+        if (debugOpConvert) {
+          llvm::errs() << "[pynq-mid-lower][convert] MatMulOp ";
+          loc.print(llvm::errs());
+          llvm::errs() << " in=" << *inIdOr << " w=" << *wIdOr
+                       << " out=" << *oIdOr << " input_tile_count=";
+          debugPrintValueOrConst(llvm::errs(), mm.getInputTileCount());
+          llvm::errs() << " weight_tile_count=";
+          debugPrintValueOrConst(llvm::errs(), mm.getWeightTileCount());
+          llvm::errs() << " reduceK=";
+          debugPrintValueOrConst(llvm::errs(), mm.getReduceK());
+          llvm::errs() << " headIdx=";
+          debugPrintValueOrConst(llvm::errs(), mm.getHeadIdx());
+          llvm::errs() << " headTileAxis=";
+          debugPrintValueOrConst(llvm::errs(), mm.getHeadTileAxis());
+          llvm::errs() << " enableBias=";
+          debugPrintValueOrConst(llvm::errs(), mm.getEnableBias());
+          llvm::errs() << " enableTranspose=";
+          debugPrintValueOrConst(llvm::errs(), mm.getEnableTranspose());
+          llvm::errs() << "\n";
+        }
         b.create<pynq::MatMulInstrOp>(
             loc,
             i32c(static_cast<int32_t>(*inIdOr)),
@@ -744,6 +991,16 @@ void PYNQMidLowerPass::runOnOperation() {
         if (failed(bufIdOr)) {
           failedAny = true;
           return;
+        }
+        if (debugOpConvert) {
+          llvm::errs() << "[pynq-mid-lower][convert] VectorOp code=" << opCode
+                       << " ";
+          op.getLoc().print(llvm::errs());
+          llvm::errs() << " buffer=" << *bufIdOr << " tile_count=";
+          debugPrintValueOrConst(llvm::errs(), concreteOp.getTileCount());
+          llvm::errs() << " reduceK=";
+          debugPrintValueOrConst(llvm::errs(), concreteOp.getReduceK());
+          llvm::errs() << "\n";
         }
         b.create<pynq::VectorInstrOp>(
             loc, i32c(static_cast<int32_t>(*bufIdOr)),
@@ -771,6 +1028,16 @@ void PYNQMidLowerPass::runOnOperation() {
         if (failed(bufIdOr) || failed(extraIdOr)) {
           failedAny = true;
           return;
+        }
+        if (debugOpConvert) {
+          llvm::errs() << "[pynq-mid-lower][convert] QAddOp ";
+          loc.print(llvm::errs());
+          llvm::errs() << " buffer=" << *bufIdOr
+                       << " extra=" << *extraIdOr << " tile_count=";
+          debugPrintValueOrConst(llvm::errs(), qa.getTileCount());
+          llvm::errs() << " reduceK=";
+          debugPrintValueOrConst(llvm::errs(), qa.getReduceK());
+          llvm::errs() << "\n";
         }
         b.create<pynq::VectorInstrOp>(
             loc, i32c(static_cast<int32_t>(*bufIdOr)), qa.getTileCount(),
@@ -805,12 +1072,25 @@ void PYNQMidLowerPass::runOnOperation() {
               (static_cast<int64_t>(*bytesOr) + DMAConfig::kBytesPerPackage - 1) /
               DMAConfig::kBytesPerPackage);
 
+          if (debugOpConvert) {
+            llvm::errs() << "[pynq-mid-lower][convert] CopyOp memref->buffer ";
+            loc.print(llvm::errs());
+            llvm::errs() << " dstBuffer=" << *bufIdOr
+                         << " bytes=" << *bytesOr
+                         << " tiles=" << *tilesOr
+                         << " pkg=" << pkg
+                         << " dir=" << DMAConfig::kDirectionLoad << "\n";
+          }
+
           b.create<pynq::DataTransferInstrOp>(
               loc, src,
               i32c(static_cast<int32_t>(*bufIdOr)),
               i32c(*tilesOr),
               i32c(pkg),
               i32c(DMAConfig::kDirectionLoad));
+          // Host->device transfer is asynchronous; ensure completion before
+          // subsequent potentially-dependent ops.
+          b.create<pynq::SyncOp>(loc);
           toErase.push_back(&op);
           continue;
         }
@@ -831,12 +1111,24 @@ void PYNQMidLowerPass::runOnOperation() {
               (static_cast<int64_t>(*bytesOr) + DMAConfig::kBytesPerPackage - 1) /
               DMAConfig::kBytesPerPackage);
 
+          if (debugOpConvert) {
+            llvm::errs() << "[pynq-mid-lower][convert] CopyOp buffer->memref ";
+            loc.print(llvm::errs());
+            llvm::errs() << " srcBuffer=" << *bufIdOr
+                         << " bytes=" << *bytesOr
+                         << " tiles=" << *tilesOr
+                         << " pkg=" << pkg
+                         << " dir=" << DMAConfig::kDirectionStore << "\n";
+          }
+
           b.create<pynq::DataTransferInstrOp>(
               loc, dst,
               i32c(static_cast<int32_t>(*bufIdOr)),
               i32c(*tilesOr),
               i32c(pkg),
               i32c(DMAConfig::kDirectionStore));
+          // Device->host transfer is asynchronous; sync before host consumes data.
+          b.create<pynq::SyncOp>(loc);
           toErase.push_back(&op);
           continue;
         }
