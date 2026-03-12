@@ -177,6 +177,14 @@ static SmallVector<int64_t, 4> computeRowMajorStrides(ArrayRef<int64_t> shape) {
   return strides;
 }
 
+static int64_t computeAlignedByteSize(int64_t elementCount,
+                                      unsigned elementBytes) {
+  int64_t totalBytes = elementCount * static_cast<int64_t>(elementBytes);
+  if (totalBytes < 8)
+    return totalBytes;
+  return ((totalBytes + 7) / 8) * 8;
+}
+
 static bool writeDenseElementsToBinary(DenseElementsAttr denseAttr,
                                         Type elementType,
                                         StringRef filePath,
@@ -214,6 +222,17 @@ static bool writeDenseElementsToBinary(DenseElementsAttr denseAttr,
       errorMsg = "array has unsupported element type for binary export";
       return false;
     }
+  }
+
+  int64_t actualBytes =
+      denseAttr.getNumElements() * static_cast<int64_t>(byteWidth);
+  int64_t alignedBytes =
+      computeAlignedByteSize(denseAttr.getNumElements(), byteWidth);
+  int64_t padBytes = alignedBytes - actualBytes;
+  if (padBytes > 0) {
+    uint8_t zero = 0;
+    for (int64_t i = 0; i < padBytes; ++i)
+      output.write(reinterpret_cast<const char *>(&zero), 1);
   }
 
   return true;
@@ -408,6 +427,7 @@ private:
 
   bool embedGlobalData = false;
   std::string globalBinDir = "pynq_global_bins";
+  std::string globalParentDir = "vivado.prj";
   unsigned sharedMemTempCounter = 0;
   unsigned subviewTempCounter = 0;
   unsigned subviewPackCounter = 0;
@@ -1003,9 +1023,10 @@ void PYNQCEmitter::emitDataTransferInstr(pynq::DataTransferInstrOp op) {
           os << "pynq_sync();";
           emitInfoAndNewLine(op);
           indent();
-          os << "PYNQ_copyShare2Normal(&" << sharedTempName << ", (void*)("
+            os << "PYNQ_copyShare2Normal((void*)("
              << getCTypeName(subviewResultType.getElementType()) << "*)"
              << stagingFromNormalPtr << ", " << stagingFromNormalBytes
+              << "), &" << sharedTempName
              << ");";
           emitInfoAndNewLine(op);
           return;
@@ -1125,9 +1146,9 @@ void PYNQCEmitter::emitDataTransferInstr(pynq::DataTransferInstrOp op) {
     indent();
     os << "pynq_sync();\n";
     indent();
-    os << "PYNQ_copyShare2Normal(&" << sharedTempName << ", (void*)("
+     os << "PYNQ_copyShare2Normal((void*)("
        << getCTypeName(subviewResultType.getElementType()) << "*)"
-       << stagingFromNormalPtr << ", " << stagingFromNormalBytes << ");\n";
+       << stagingFromNormalPtr << ", " << stagingFromNormalBytes << "), &" << sharedTempName << ");\n";
   }
   reduceIndent();
   indent();
@@ -1435,19 +1456,80 @@ void PYNQCEmitter::emitActivationLayoutTranspose(
 
   auto inShared = resolveSharedName(input);
   auto outShared = resolveSharedName(output);
-  if (!inShared || !outShared) {
+  bool inputIsArg = input.isa<BlockArgument>();
+  bool outputIsArg = output.isa<BlockArgument>();
+  if (!outShared && !outputIsArg) {
     emitError(op,
-              "pynq.activation_layout_transpose requires operands backed by PYNQ_SHARED_MEMORY (memref.alloc or memref.get_global)");
+              "pynq.activation_layout_transpose requires output backed by PYNQ_SHARED_MEMORY (memref.alloc or memref.get_global) or a function argument");
+    return;
+  }
+  if (!inShared && !inputIsArg) {
+    emitError(op,
+              "pynq.activation_layout_transpose requires input backed by PYNQ_SHARED_MEMORY (memref.alloc or memref.get_global) or a function argument");
     return;
   }
 
   indent();
   if (*runtimeKind == RuntimeTransposeKind::I8) {
-    os << "PYNQ_transpose_int8(&" << *inShared << ", &" << *outShared << ", "
-       << rows << ", " << cols << ");";
+    if (inShared && outShared) {
+      os << "PYNQ_transpose_int8(&" << *outShared << ", &" << *inShared
+         << ", " << rows << ", " << cols << ");";
+    } else if (!inShared && outShared) {
+      auto inName = getName(input).str().str();
+      if (inName.empty()) {
+        emitError(op, "pynq.activation_layout_transpose requires a named input argument");
+        return;
+      }
+        os << "PYNQ_transpose_int8_from_host(&" << *outShared << ", " << inName
+         << ", " << rows << ", " << cols << ");";
+    } else if (inShared && !outShared) {
+      auto outName = getName(output).str().str();
+      if (outName.empty()) {
+        emitError(op, "pynq.activation_layout_transpose requires a named output argument");
+        return;
+      }
+        os << "PYNQ_transpose_int8_to_host(" << outName << ", &" << *inShared
+         << ", " << rows << ", " << cols << ");";
+    } else {
+      auto inName = getName(input).str().str();
+      auto outName = getName(output).str().str();
+      if (inName.empty() || outName.empty()) {
+        emitError(op, "pynq.activation_layout_transpose requires named input/output arguments");
+        return;
+      }
+        os << "PYNQ_transpose_int8_host_to_host(" << outName << ", " << inName
+         << ", " << rows << ", " << cols << ");";
+    }
   } else {
-    os << "PYNQ_transpose_fp32(&" << *inShared << ", &" << *outShared << ", "
-       << rows << ", " << cols << ");";
+    if (inShared && outShared) {
+      os << "PYNQ_transpose_fp32(&" << *outShared << ", &" << *inShared
+         << ", " << rows << ", " << cols << ");";
+    } else if (!inShared && outShared) {
+      auto inName = getName(input).str().str();
+      if (inName.empty()) {
+        emitError(op, "pynq.activation_layout_transpose requires a named input argument");
+        return;
+      }
+        os << "PYNQ_transpose_fp32_from_host(&" << *outShared << ", " << inName
+         << ", " << rows << ", " << cols << ");";
+    } else if (inShared && !outShared) {
+      auto outName = getName(output).str().str();
+      if (outName.empty()) {
+        emitError(op, "pynq.activation_layout_transpose requires a named output argument");
+        return;
+      }
+        os << "PYNQ_transpose_fp32_to_host(" << outName << ", &" << *inShared
+         << ", " << rows << ", " << cols << ");";
+    } else {
+      auto inName = getName(input).str().str();
+      auto outName = getName(output).str().str();
+      if (inName.empty() || outName.empty()) {
+        emitError(op, "pynq.activation_layout_transpose requires named input/output arguments");
+        return;
+      }
+        os << "PYNQ_transpose_fp32_host_to_host(" << outName << ", " << inName
+         << ", " << rows << ", " << cols << ");";
+    }
   }
   emitInfoAndNewLine(op);
 }
@@ -1606,10 +1688,10 @@ void PYNQCEmitter::emitActivationDynamicPad(pynq::ActivationDynamicPadOp op) {
 
   indent();
   if (toPadded) {
-    os << "PYNQ_activation_dynamic_pad_int8(&" << *inShared << ", &" << *outShared
+    os << "PYNQ_activation_dynamic_pad_int8(&" << *outShared << ", &" << *inShared
        << ", " << rows << ", " << colsIn << ", " << colsOut << ");";
   } else {
-    os << "PYNQ_activation_subview0_copy_int8(&" << *inShared << ", &" << *outShared
+     os << "PYNQ_activation_subview0_copy_int8(&" << *outShared << ", &" << *inShared
        << ", " << outer << ", " << rowsIn2D << ", " << colsIn2D << ", " << rowsOut2D << ", " << colsOut2D << ");";
   }
   emitInfoAndNewLine(op);
@@ -2236,8 +2318,8 @@ void PYNQCEmitter::emitMemrefCopy(memref::CopyOp op) {
       emitError(op, "memref.copy: shared source has no base name");
       return;
     }
-    os << "PYNQ_copyShare2Normal(&" << srcBaseName
-       << "_shared, (void*)" << *dstPtrExpr << ", " << totalBytes << ");";
+    os << "PYNQ_copyShare2Normal((void*)" << *dstPtrExpr << ", &" << srcBaseName
+       << "_shared, " << totalBytes << ");";
   } else if (!srcShared && dstShared) {
     auto dstBaseName = getName(dstBase);
     if (dstBaseName.empty()) {
@@ -2495,6 +2577,8 @@ void PYNQCEmitter::emitGetGlobal(memref::GetGlobalOp op) {
   unsigned elementSizeBits = elementType.getIntOrFloatBitWidth();
   unsigned elementSizeBytes = (elementSizeBits + 7) / 8;
   int64_t totalBytes = totalElements * elementSizeBytes;
+  int64_t alignedTotalBytes =
+      computeAlignedByteSize(totalElements, elementSizeBytes);
 
   auto varName = addName(op.getResult(), false);
   auto sharedMemName = varName + "_shared";
@@ -2512,13 +2596,16 @@ void PYNQCEmitter::emitGetGlobal(memref::GetGlobalOp op) {
        << op.getName() << ", " << totalBytes << ");\n";
   } else {
     indent();
+    os << "PYNQ_allocatedSharedMemory(&" << sharedMemName << ", "
+       << alignedTotalBytes << ", 1);\n";
+    indent();
     os << "PYNQ_loadBin(&" << sharedMemName << ", \"" << globalBinDir
-       << "/" << op.getName() << ".bin\", " << totalBytes << ");\n";
+       << "/" << op.getName() << ".bin\", " << alignedTotalBytes << ");\n";
   }
 
   indent();
   auto memrefTy = op.getType().cast<MemRefType>();
-  os << "c ";
+  // os << "c ";
   emitMemrefVarDecl(memrefTy, varName);
   os << " = (";
   emitMemrefPtrCastType(memrefTy);
@@ -2587,12 +2674,12 @@ void PYNQCEmitter::emitGlobal(memref::GlobalOp op) {
     return;
   }
 
-  if (llvm::sys::fs::create_directories(globalBinDir)) {
+  if (llvm::sys::fs::create_directories(globalParentDir + "/" + globalBinDir)) {
     emitError(op, "failed to create global binary output directory");
     return;
   }
 
-  SmallString<256> binPath(globalBinDir);
+  SmallString<256> binPath(globalParentDir + "/" + globalBinDir);
   llvm::sys::path::append(binPath, op.getSymName().str() + ".bin");
   std::string errorMsg;
   if (!writeDenseElementsToBinary(denseAttr, type, binPath, errorMsg)) {
@@ -3621,6 +3708,8 @@ void PYNQCEmitter::emitModule(ModuleOp module) {
     embedGlobalData = embedAttr.getValue();
   if (auto binDirAttr = module->getAttrOfType<StringAttr>("pynq.global_bin_dir"))
     globalBinDir = binDirAttr.getValue().str();
+  if (auto projectDirAttr = module->getAttrOfType<StringAttr>("allo.target_path"))
+    globalParentDir = projectDirAttr.getValue().str();
 
   emitHeader();
   emitIntrinsicDeclarations();

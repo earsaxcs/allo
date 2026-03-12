@@ -58,6 +58,8 @@ def from_pytorch_vivado(
     global_vars.update({"dsl": dsl})
     # Pass SCALE_FIXED_BITS to builder for quantization
     global_vars.update({"__allo_quant_fixed_bits__": quant_config.scale_fixed_bits})
+    # PATH
+    global_vars.update({"__allo_target_path__": project})
 
     # Assume batch size always comes from the left-most dimension of example_inputs[0]
     # and propagate it through the compilation pipeline to MLIR as a module attribute.
