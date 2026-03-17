@@ -17,10 +17,14 @@ include "allo/Dialect/AlloAttrs.td"
 include "mlir/IR/OpBase.td"
 include "mlir/Interfaces/SideEffectInterfaces.td"
 
-// NOTE: Quant_Mode currently by checking scale coe is single element or multiple elements to decide
-// for layernorm, it means per-tensor or per-channel quantization
-// for others, it means per-tensor or per-token quantization
-// you can later add direct quant mode
+// NOTE: Quant mode is now carried explicitly by a dedicated attribute.
+// Encoding (3-bit integer):
+//   - bit0: asymmetry flag (0=symmetric, 1=asymmetric)
+//   - bit[2:1]: granularity
+//       0b00 = per_tensor
+//       0b01 = per_token
+//       0b10 = per_channel
+//       0b11 = reserved
 
 // Type constraints for quantization parameters based on pytorch.py conversion
 // sign: i8 scalar or shaped (int8 sign, truly signed)
@@ -469,14 +473,13 @@ def Allo_IntLayerNormOp : Allo_Op<"int_layernorm", [AttrSizedOperandSegments]> {
 // These ops handle conversions between floating-point and integer representations
 // at the boundaries of quantized and non-quantized computational regions.
 //
-// Quant Mode Encoding (2-bit integer):
+// Quant Mode Encoding (3-bit integer):
 //   Bit 0: 0 = symmetric, 1 = asymmetric
-//   Bit 1: 0 = per-tensor, 1 = per-token
-//   Values:
-//     0 (0b00): symmetric, per-tensor
-//     1 (0b01): asymmetric, per-tensor
-//     2 (0b10): symmetric, per-token
-//     3 (0b11): asymmetric, per-token
+//   Bits [2:1]: granularity
+//     0b00: per-tensor
+//     0b01: per-token
+//     0b10: per-channel
+//     0b11: reserved
 
 // Quantize: float -> int
 // Performs: q = round(x / scale) [+ zero for asymmetric]
@@ -485,11 +488,13 @@ def Allo_QuantOp : Allo_Op<"quant", []> {
   let description = [{
     Converts floating-point tensor to integer tensor using fixed-point scale.
     
-    Quantization mode (quant_mode attribute, 2-bit encoding):
-    - 0: symmetric, per-tensor
-    - 1: asymmetric, per-tensor
-    - 2: symmetric, per-token
-    - 3: asymmetric, per-token
+    Quantization mode (quant_mode attribute, 3-bit encoding):
+    - bit0: asymmetric flag (0=symmetric, 1=asymmetric)
+    - bit[2:1]: granularity
+      - 0b00: per_tensor
+      - 0b01: per_token
+      - 0b10: per_channel
+      - 0b11: reserved
     
     Scale is decomposed as: scale = sign * coe * 2^(-rshift)
     
@@ -507,7 +512,7 @@ def Allo_QuantOp : Allo_Op<"quant", []> {
     CoeType:$scale_coe,          // Scale coefficient component
     RshiftType:$scale_rshift,    // Scale right-shift component
     Optional<ZeroType>:$zero,    // Zero point (for asymmetric mode)
-    I8Attr:$quant_mode           // Quantization mode (0-3)
+    I8Attr:$quant_mode           // Quantization mode (3-bit packed field)
   );
   let results = (outs);
   let assemblyFormat = [{
@@ -527,11 +532,13 @@ def Allo_DequantOp : Allo_Op<"dequant", []> {
   let description = [{
     Converts integer tensor to floating-point tensor using fixed-point scale.
     
-    Quantization mode (quant_mode attribute, 2-bit encoding):
-    - 0: symmetric, per-tensor
-    - 1: asymmetric, per-tensor  
-    - 2: symmetric, per-token
-    - 3: asymmetric, per-token
+    Quantization mode (quant_mode attribute, 3-bit encoding):
+    - bit0: asymmetric flag (0=symmetric, 1=asymmetric)
+    - bit[2:1]: granularity
+      - 0b00: per_tensor
+      - 0b01: per_token
+      - 0b10: per_channel
+      - 0b11: reserved
     
     Scale is decomposed as: scale = sign * coe * 2^(-rshift)
     
@@ -549,7 +556,7 @@ def Allo_DequantOp : Allo_Op<"dequant", []> {
     CoeType:$scale_coe,          // Scale coefficient component
     RshiftType:$scale_rshift,    // Scale right-shift component
     Optional<ZeroType>:$zero,    // Zero point (for asymmetric mode)
-    I8Attr:$quant_mode           // Quantization mode (0-3)
+    I8Attr:$quant_mode           // Quantization mode (3-bit packed field)
   );
   let results = (outs);
   let assemblyFormat = [{

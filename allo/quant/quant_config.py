@@ -378,7 +378,7 @@ def get_vit_optimized_config() -> QuantConfig:
     config.set_layer_type_config(nn.GELU, act_per_token=True)
     
     # LayerNorm: per-channel (per hidden dim)
-    config.set_layer_type_config(nn.LayerNorm, input_act_per_token=False, output_act_per_channel=False)
+    config.set_layer_type_config(nn.LayerNorm, input_act_per_token=True, output_act_per_channel=False)
     
     # MatMul: per-token
     if MatMul is not None:

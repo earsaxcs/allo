@@ -768,9 +768,10 @@ struct IntSoftmaxLoweringPattern : public OpRewritePattern<allo_ops::IntSoftmaxO
     Value inputZero = op.getInputZero();
     Value outputZero = op.getOutputZero();
     
-    // TODO：add axis parameter
-    // For 4-D tensor, default to axis=3 (last dimension)
-    int64_t axis = 3; // op.getAxis();
+    // NOTE: For 4-D tensor, default to axis=3 (last dimension)
+    // NOTE: For 3-D tensor, default to axis=2 (last dimension)
+    int64_t rank = output.getType().cast<MemRefType>().getRank();
+    int64_t axis = rank - 1; // op.getAxis();
 
     // Create vivado.int_softmax with LUT implementation
     rewriter.replaceOpWithNewOp<vivado_ops::IntSoftmaxOp>(

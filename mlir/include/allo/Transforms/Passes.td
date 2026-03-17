@@ -223,6 +223,31 @@ def PYNQScheduleOps : Pass<"pynq-schedule-ops", "ModuleOp"> {
   ];
 }
 
+def PYNQAdjustScaleRShift : Pass<"pynq-adjust-scale-rshift", "ModuleOp"> {
+  let summary = "Adjust packed-scale rshift for PYNQ ops using per-op desired offsets";
+  let description = [{
+    This pass visits PYNQ compute ops that carry bound packed-scale globals
+    (excluding `pynq.quant`/`pynq.dequant`) and adjusts packed `rshift`
+    according to each scale's desired offset.
+
+    Adjustment rule:
+    - delta = desired_offset - innate_rshift_bias
+
+    The pass unpacks each i32 packed-scale element using the canonical target
+    packing/coefficient mode, applies `delta` to `rshift`, then packs values
+    back to the same target format.
+
+    It is intended to run after `repack-vivado-scales` and before
+    `pynq-mid-lower`.
+  }];
+  let constructor = "mlir::allo::createPYNQAdjustScaleRShiftPass()";
+  let dependentDialects = [
+    "mlir::allo::pynq::PYNQDialect",
+    "mlir::func::FuncDialect",
+    "mlir::memref::MemRefDialect"
+  ];
+}
+
 def PYNQMidLower : Pass<"pynq-mid-lower", "ModuleOp"> {
   let summary = "Mid-lower PYNQ ops: pack scale/bias to FIFO transfers and lower to instr ops";
   let description = [{
@@ -249,6 +274,27 @@ def PYNQMidLower : Pass<"pynq-mid-lower", "ModuleOp"> {
     "mlir::func::FuncDialect",
     "mlir::memref::MemRefDialect",
     "mlir::arith::ArithDialect"
+  ];
+}
+
+def PYNQReturnMemrefToOutParam : Pass<"pynq-return-memref-to-out-param", "ModuleOp"> {
+  let summary = "Rewrite single-memref function returns into explicit output arguments";
+  let description = [{
+    For functions that satisfy strict preconditions, this pass rewrites
+    `func.func` signatures from returning a single memref to returning `void`
+    with one additional output memref argument.
+
+    It also rewrites corresponding `func.call` sites by creating an extra
+    `memref.alloc` as output buffer, passing it as the new trailing argument,
+    and replacing old call result uses with that allocated buffer.
+
+    Functions/calls that do not satisfy preconditions are reported with
+    concrete reasons.
+  }];
+  let constructor = "mlir::allo::createPYNQReturnMemrefToOutParamPass()";
+  let dependentDialects = [
+    "mlir::func::FuncDialect",
+    "mlir::memref::MemRefDialect"
   ];
 }
 

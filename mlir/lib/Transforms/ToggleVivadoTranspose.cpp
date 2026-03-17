@@ -306,7 +306,8 @@ static std::string classifyVivadoQuantOpType(Operation *op) {
 static std::string getSourceQuantOpTypeImpl(Value value,
                                             llvm::DenseSet<const void *> &visited,
                                             Operation *fatherOp,
-                                            int maxDepth) {
+                                            int maxDepth,
+                                            Operation **userOp = nullptr) {
   if (!value)
     return "non_quant";
   if (maxDepth <= 0)
@@ -354,6 +355,9 @@ static std::string getSourceQuantOpTypeImpl(Value value,
     if (user && user->getDialect() && user->getDialect()->getNamespace() == "vivado" &&
         user->hasAttr("transpose_mode") && user->getNumOperands() > 0 &&
         user->getOperand(0) == value) {
+      if (userOp) {
+        *userOp = user;
+      }
       return classifyVivadoQuantOpType(user);
     }
   }
@@ -364,11 +368,11 @@ static std::string getSourceQuantOpTypeImpl(Value value,
     //   return direct;
 
     if (auto subviewOp = dyn_cast<memref::SubViewOp>(defOp); subviewOp && defOp != fatherOp) {
-      return getSourceQuantOpTypeImpl(subviewOp.getSource(), visited, defOp, maxDepth - 1);
+      return getSourceQuantOpTypeImpl(subviewOp.getSource(), visited, defOp, maxDepth - 1, userOp);
     }
 
     if (auto reshapeOp = dyn_cast<memref::ReshapeOp>(defOp); reshapeOp && defOp != fatherOp) {
-      return getSourceQuantOpTypeImpl(reshapeOp.getSource(), visited, defOp, maxDepth - 1);
+      return getSourceQuantOpTypeImpl(reshapeOp.getSource(), visited, defOp, maxDepth - 1, userOp);
     }
 
     // if (auto transposeOp = dyn_cast<linalg::TransposeOp>(defOp)) {
@@ -384,14 +388,14 @@ static std::string getSourceQuantOpTypeImpl(Value value,
     if (auto subviewOp = dyn_cast<memref::SubViewOp>(user); subviewOp && user != fatherOp) {
       // memref.subview(%source, ...) -> %result
       if (value == subviewOp.getSource())
-        return getSourceQuantOpTypeImpl(subviewOp.getResult(), visited, user, maxDepth - 1);
+        return getSourceQuantOpTypeImpl(subviewOp.getResult(), visited, user, maxDepth - 1, userOp);
       continue;
     }
 
     if (auto reshapeOp = dyn_cast<memref::ReshapeOp>(user); reshapeOp && user != fatherOp) {
       // memref.reshape %source(%shape) -> %result
       if (value == reshapeOp.getSource())
-        return getSourceQuantOpTypeImpl(reshapeOp.getResult(), visited, user, maxDepth - 1);
+        return getSourceQuantOpTypeImpl(reshapeOp.getResult(), visited, user, maxDepth - 1, userOp);
       continue;
     }
 
@@ -400,9 +404,9 @@ static std::string getSourceQuantOpTypeImpl(Value value,
       // - If current value is the input, the data flows into the init buffer.
       // - If current value is the init buffer, its contents are sourced from input.
       if (value == transposeOp.getInput())
-        return getSourceQuantOpTypeImpl(transposeOp.getInit(), visited, user, maxDepth - 1);
+        return getSourceQuantOpTypeImpl(transposeOp.getInit(), visited, user, maxDepth - 1, userOp);
       if (value == transposeOp.getInit())
-        return getSourceQuantOpTypeImpl(transposeOp.getInput(), visited, user, maxDepth - 1);
+        return getSourceQuantOpTypeImpl(transposeOp.getInput(), visited, user, maxDepth - 1, userOp);
       continue;
     }
   }
@@ -410,11 +414,11 @@ static std::string getSourceQuantOpTypeImpl(Value value,
   return "non_quant";
 }
 
-static std::string getSourceQuantOpType(Value value, Operation* fatherOp, int maxDepth = 10) {
+static std::string getSourceQuantOpType(Value value, Operation* fatherOp, int maxDepth = 10, Operation **userOp = nullptr) {
   llvm::DenseSet<const void *> visited;
   if (DEBUG)
     llvm::errs() << "<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<" << "\n";
-  return getSourceQuantOpTypeImpl(value, visited, fatherOp, maxDepth);
+  return getSourceQuantOpTypeImpl(value, visited, fatherOp, maxDepth, userOp);
   if (DEBUG)
     llvm::errs() << ">>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>" << "\n";
 }
@@ -509,16 +513,22 @@ static LogicalResult transposeWeightGlobals(ModuleOp module) {
 /// Changes 3D memref types from (B,L,D) to (B,D,L)
 static bool updateIntermediateActivationShapes(ModuleOp module, MLIRContext *context) {
   bool ok = true;
+  // NOTE: Before use this function, make sure all quant ops that need to be toggled are updated (their mark)
   auto shouldTransposeActivation = [&](Value value, Operation* fatherOp) -> bool {
-    std::string sourceOpType = getSourceQuantOpType(value, fatherOp);
+    Operation *op = nullptr;
+    std::string sourceOpType = getSourceQuantOpType(value, fatherOp, 10, &op);
     if (sourceOpType == "non_quant")
       return false;
-    if (sourceOpType == "qlinear.proj_v")
-      return false;
-    if (sourceOpType == "qlinear.classifier")
-      return false;
-    if (sourceOpType == "dequant")
-      return false;
+    // 不再只判断type
+    // if (sourceOpType == "qlinear.proj_v")
+    //   return false;
+    // if (sourceOpType == "qlinear.classifier")
+    //   return false;
+    // if (sourceOpType == "dequant")
+    //   return false;
+    if (op->getAttr("transpose_mode").cast<BoolAttr>().getValue()) {
+      return op->getAttr("is_transposed").cast<BoolAttr>().getValue();
+    }
     return true;
   };
 
@@ -577,6 +587,7 @@ static bool updateIntermediateActivationShapes(ModuleOp module, MLIRContext *con
   //   }
   // };
 
+  // Step 1: Update all quant ops' result types and transpose attributes
   for (auto *op : quantOps) {
     // For qmatmul/qmatmul_isqrtd, tag RHS layout for backend lowering.
     if (auto qmm = dyn_cast<vivado_ops::QMatMulOp>(op)) {
@@ -586,19 +597,33 @@ static bool updateIntermediateActivationShapes(ModuleOp module, MLIRContext *con
     }
 
     // Special case: when toggling transpose mode, move Softmax reduction axis to
-    // the second-to-last dimension (i.e., dim=2 for rank-4 [B,H,L,L]).
-    if (op->getName().getStringRef() == "vivado.int_softmax") {
-      op->setAttr("axis", IntegerAttr::get(IntegerType::get(context, 64), 2));
+    // the second-to-last dimension (i.e., dim=2 for rank=4:[B,H,L,L]).
+    if (auto intSoftmax = dyn_cast<vivado_ops::IntSoftmaxOp>(op)) {
+      auto rank = intSoftmax.getOutput().getType().cast<MemRefType>().getRank();
+      op->setAttr("axis", IntegerAttr::get(IntegerType::get(context, 64), rank - 2));
     }
 
     if (auto qlinear = dyn_cast<vivado_ops::QLinearOp>(op)) {
       auto layerTypeAttr = qlinear->getAttrOfType<StringAttr>("layer_type");
       StringRef layerType = layerTypeAttr ? layerTypeAttr.getValue() : "unknown";
-      // proj_v 不转置，其余（q/k/out/fc 等）转置
+      // proj_v and classifier dense 不转置，其余（q/k/out/fc 等或者单一测试的线性层）转置
       op->setAttr("transpose_mode", BoolAttr::get(context, true));
       if (!pynq::QLinearLayerType::isQKVGemmProjV(layerType) && !pynq::QLinearLayerType::isClassifierDense(layerType)) {
         // transposeResults(op);
         op->setAttr("is_transposed", BoolAttr::get(context, true));
+      }
+      continue;
+    }
+
+    // Dequant和其前置量化op的转置模式一致
+    if (isa<vivado_ops::DequantOp>(op)) {
+      op->setAttr("transpose_mode", BoolAttr::get(context, true));
+      // op->setAttr("is_transposed", BoolAttr::get(context, false));
+      Operation *srcOp = nullptr;
+      std::string sourceOpType = getSourceQuantOpType(
+        dyn_cast<vivado_ops::DequantOp>(op).getInput(), op, 10, &srcOp);
+      if (sourceOpType != "non_quant" && srcOp->hasAttr("transpose_mode")) {
+        op->setAttr("is_transposed", BoolAttr::get(context, srcOp->getAttr("is_transposed").cast<BoolAttr>().getValue()));
       }
       continue;
     }

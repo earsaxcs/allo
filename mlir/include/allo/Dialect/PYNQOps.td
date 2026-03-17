@@ -887,18 +887,25 @@ def PYNQ_QuantOp : PYNQ_Op<"quant", []> {
     (e.g., cls_token, position_embeddings) need to be converted to
     integer format before being processed by quantized operations.
     
-    **Quant Mode Encoding (2-bit):**
-    - 0: symmetric, per-tensor
-    - 1: asymmetric, per-tensor  
-    - 2: symmetric, per-token
-    - 3: asymmetric, per-token
+    **Quant Combination Field (quant_cmb, low 3 bits):**
+    - quant_cmb[0]: 对称性标志
+      - 0: symmetric
+      - 1: asymmetric
+    - quant_cmb[1]: 量化参数是否为 1 维
+      - 0: 标量（0 维，per-tensor）
+      - 1: 1 维
+    - quant_cmb[2]: 1 维量化参数的变化方向（仅在 quant_cmb[1]=1 时有效）
+      - 0: 沿行方向变化
+      - 1: 沿列方向变化
+
+    该字段由上游根据 quant_mode 与 transpose_mode/is_transposed 组合得到。
     
     **Code Generation:**
     Will be lowered to CPU loop code that performs element-wise quantization.
     
     Example:
       pynq.quant output = %int_buf, input = %float_buf,
-                 scale = %scale, quant_mode = 0
+                 scale = %scale, quant_cmb = 0
   }];
   
   let arguments = (ins
@@ -906,7 +913,7 @@ def PYNQ_QuantOp : PYNQ_Op<"quant", []> {
     AnyMemRef:$input,            // Input float memref
     AnyMemRef:$scale,                  // Packed scale (sign, coe, rshift in 32-bit)
     Optional<AnyMemRef>:$zero,         // Zero point (for asymmetric mode)
-    I8Attr:$quant_mode           // Quantization mode (0-3)
+    I8Attr:$quant_cmb            // Quant combination field (low 3 bits used)
   );
   
   let results = (outs);
@@ -915,7 +922,7 @@ def PYNQ_QuantOp : PYNQ_Op<"quant", []> {
     `output` `=` $output `:` type($output) `,` `input` `=` $input `:` type($input) `,`
     `scale` `=` $scale `:` type($scale)
     (`zero` `=` $zero^ `:` type($zero))?
-    `quant_mode` `=` $quant_mode attr-dict
+    `quant_cmb` `=` $quant_cmb attr-dict
   }];
 }
 
@@ -938,18 +945,25 @@ def PYNQ_DequantOp : PYNQ_Op<"dequant", []> {
     need to be converted back to float format for operations that
     require floating-point precision (e.g., final output, comparison).
     
-    **Quant Mode Encoding (2-bit):**
-    - 0: symmetric, per-tensor
-    - 1: asymmetric, per-tensor
-    - 2: symmetric, per-token
-    - 3: asymmetric, per-token
+    **Quant Combination Field (quant_cmb, low 3 bits):**
+    - quant_cmb[0]: 对称性标志
+      - 0: symmetric
+      - 1: asymmetric
+    - quant_cmb[1]: 量化参数是否为 1 维
+      - 0: 标量（0 维，per-tensor）
+      - 1: 1 维
+    - quant_cmb[2]: 1 维量化参数的变化方向（仅在 quant_cmb[1]=1 时有效）
+      - 0: 沿行方向变化
+      - 1: 沿列方向变化
+
+    该字段由上游根据 quant_mode 与 transpose_mode/is_transposed 组合得到。
     
     **Code Generation:**
     Will be lowered to CPU loop code that performs element-wise dequantization.
     
     Example:
       pynq.dequant output = %float_buf, input = %int_buf,
-                   scale = %scale, quant_mode = 0
+                   scale = %scale, quant_cmb = 0
   }];
   
   let arguments = (ins
@@ -957,7 +971,7 @@ def PYNQ_DequantOp : PYNQ_Op<"dequant", []> {
     AnyMemRef:$input,            // Input integer memref
     AnyMemRef:$scale,                  // Packed scale (sign, coe, rshift in 32-bit)
     Optional<AnyMemRef>:$zero,         // Zero point (for asymmetric mode)
-    I8Attr:$quant_mode           // Quantization mode (0-3)
+    I8Attr:$quant_cmb            // Quant combination field (low 3 bits used)
   );
   
   let results = (outs);
@@ -966,7 +980,7 @@ def PYNQ_DequantOp : PYNQ_Op<"dequant", []> {
     `output` `=` $output `:` type($output) `,` `input` `=` $input `:` type($input) `,`
     `scale` `=` $scale `:` type($scale)
     (`zero` `=` $zero^ `:` type($zero))?
-    `quant_mode` `=` $quant_mode attr-dict
+    `quant_cmb` `=` $quant_cmb attr-dict
   }];
 }
 

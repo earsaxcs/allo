@@ -130,7 +130,7 @@ open_solution -reset solution1 -flow_target vivado
     out_str += f"set_top {top}\n"
     out_str += """
 # Add design and testbench files
-add_files kernel.cpp
+add_files kernel.c
 add_files -tb host.cpp -cflags "-std=gnu++0x"
 open_solution "solution1"
 """
@@ -169,8 +169,8 @@ def copy_ext_libs(ext_libs, project):
         for impl_path in ext_lib.impls:
             cpp_file = impl_path.split("/")[-1]
             assert (
-                cpp_file != "kernel.cpp"
-            ), "kernel.cpp is reserved for the top function"
+                cpp_file != "kernel.c"
+            ), "kernel.c is reserved for the top function"
             os.system(f"cp {impl_path} {project}/{cpp_file}")
             impls.append(cpp_file)
 
@@ -299,9 +299,11 @@ class VivadoModule:
                 f"pynq-buffer-allocation,"
                 f"pynq-hoist-buffer-alloc,"
                 f"pynq-optimize-subview-globals,hoist-get-global,symbol-dce,"
+                f"pynq-adjust-scale-rshift,"
                 f"pynq-mid-lower{{debug-scale-pack=false}},"
                 f"pynq-optimize-sync,"
-                f"allo-lower-linalg-to-cstyle-scf"
+                f"pynq-return-memref-to-out-param,symbol-dce,"
+                f"allo-lower-linalg-to-cstyle-scf,symbol-dce"
                 f")"
             )
 
@@ -435,16 +437,16 @@ class VivadoModule:
                     outfile.write(self.tapa_host)
             else:
                 self.host_code = ""
-            with open(f"{project}/kernel.cpp", "w", encoding="utf-8") as outfile:
+            with open(f"{project}/kernel.c", "w", encoding="utf-8") as outfile:
                 outfile.write(self.c_code)
-            with open(f"{project}/host.cpp", "w", encoding="utf-8") as outfile:
+            with open(f"{project}/host.c", "w", encoding="utf-8") as outfile:
                 outfile.write(self.host_code)
             if len(ext_libs) > 0:
                 for lib in ext_libs:
-                    # Update kernel.cpp
+                    # Update kernel.c
                     new_kernel = ""
                     with open(
-                        os.path.join(project, "kernel.cpp"), "r", encoding="utf-8"
+                        os.path.join(project, "kernel.c"), "r", encoding="utf-8"
                     ) as kernel:
                         for line in kernel:
                             new_kernel += line
@@ -453,7 +455,7 @@ class VivadoModule:
                                     header = header.split("/")[-1]
                                     new_kernel += f'#include "{header}"\n'
                     with open(
-                        os.path.join(project, "kernel.cpp"), "w", encoding="utf-8"
+                        os.path.join(project, "kernel.c"), "w", encoding="utf-8"
                     ) as kernel:
                         kernel.write(new_kernel)
                     # Update tcl file
@@ -540,7 +542,7 @@ class VivadoModule:
                 mod = IPModule(
                     top=self.top_func_name,
                     headers=[f"{cwd}/{self.project}/kernel.h"],
-                    impls=[f"{cwd}/{self.project}/kernel.cpp"],
+                    impls=[f"{cwd}/{self.project}/kernel.c"],
                     signature=[
                         f"{dtype}[{', '.join(shape)}]" for dtype, shape in self.args
                     ],

@@ -207,6 +207,47 @@ static FailureOr<Value> broadcastLen1ScaleTo(Value scale,
   return getg.getResult();
 }
 
+static FailureOr<int8_t> composeQuantCmbFromVivadoQuantMode(
+    int8_t quantMode, bool transposeMode, bool isTransposed) {
+  const uint8_t mode = static_cast<uint8_t>(quantMode);
+  const uint8_t asymBit = mode & 0x1u;
+  const uint8_t granularity = (mode >> 1) & 0x3u;
+
+  bool enable1D = false;
+  bool alongCol = false;
+
+  switch (granularity) {
+  case 0b00: // per-tensor
+    enable1D = false;
+    alongCol = false;
+    break;
+  case 0b01: { // per-token
+    enable1D = true;
+    // transpose_mode=true 时：is_transposed=false => token沿行；true => token沿列
+    const bool tokenAlongCol = transposeMode ? isTransposed : false;
+    alongCol = tokenAlongCol;
+    break;
+  }
+  case 0b10: { // per-channel
+    enable1D = true;
+    // channel 与 token 方向互补
+    const bool tokenAlongCol = transposeMode ? isTransposed : false;
+    alongCol = !tokenAlongCol;
+    break;
+  }
+  default:
+    return failure();
+  }
+
+  uint8_t cmb = asymBit;
+  if (enable1D)
+    cmb |= 0x2u;
+  if (enable1D && alongCol)
+    cmb |= 0x4u;
+
+  return static_cast<int8_t>(cmb);
+}
+
 } // namespace
 
 //===----------------------------------------------------------------------===//
@@ -2517,13 +2558,19 @@ struct VivadoQuantToPYNQPattern
     Value scale = op.getScale();    // Packed i32 scale
     Value zero = op.getZero();      // Optional zero point
     
-    // Get quant_mode attribute
+    // Compose quant_cmb from vivado quant_mode + transpose flags.
     int8_t quantMode = op.getQuantMode();
+    auto quantCmb = composeQuantCmbFromVivadoQuantMode(
+      quantMode, op.getTransposeMode(), op.getIsTransposed());
+    if (failed(quantCmb)) {
+      op.emitOpError("invalid quant_mode granularity in vivado.quant; expected bits[2:1] in {00,01,10}");
+      return failure();
+    }
     
     // Create pynq.quant op (CPU-side operation)
     rewriter.replaceOpWithNewOp<pynq_ops::QuantOp>(
         op, output, input, scale, zero,
-        rewriter.getI8IntegerAttr(quantMode)
+      rewriter.getI8IntegerAttr(*quantCmb)
     );
     
     return success();
@@ -2551,13 +2598,19 @@ struct VivadoDequantToPYNQPattern
     Value scale = op.getScale();    // Packed i32 scale
     Value zero = op.getZero();      // Optional zero point
     
-    // Get quant_mode attribute
+    // Compose quant_cmb from vivado quant_mode + transpose flags.
     int8_t quantMode = op.getQuantMode();
+    auto quantCmb = composeQuantCmbFromVivadoQuantMode(
+      quantMode, op.getTransposeMode(), op.getIsTransposed());
+    if (failed(quantCmb)) {
+      op.emitOpError("invalid quant_mode granularity in vivado.dequant; expected bits[2:1] in {00,01,10}");
+      return failure();
+    }
     
     // Create pynq.dequant op (CPU-side operation)
     rewriter.replaceOpWithNewOp<pynq_ops::DequantOp>(
         op, output, input, scale, zero,
-        rewriter.getI8IntegerAttr(quantMode)
+      rewriter.getI8IntegerAttr(*quantCmb)
     );
     
     return success();

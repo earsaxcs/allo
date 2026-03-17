@@ -29,6 +29,7 @@
 //===----------------------------------------------------------------------===/
 
 #include "allo/Conversion/Passes.h"
+#include "allo/Dialect/PYNQConfig.h"
 #include "allo/Dialect/VivadoOps.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -49,12 +50,6 @@ namespace allo {
 //===----------------------------------------------------------------------===//
 // Scale Repacking Helper Functions
 //===----------------------------------------------------------------------===//
-
-// Source and target configurations
-static constexpr const char* kSourcePackingAttr = "8,24,8,16,16,0";  // Source format (Tail)
-static constexpr const char* kSourceCoeModeAttr = "Tail";
-static constexpr const char* kTargetPackingAttr = "0,22,6,16,16,0";  // Target format (Full, sign-fused)
-static constexpr const char* kTargetCoeModeAttr = "Full";
 
 // Parse packing configuration string
 struct PackingConfig {
@@ -333,10 +328,10 @@ struct RepackVivadoOpPattern : public OpRewritePattern<VivadoOp> {
   
   RepackVivadoOpPattern(MLIRContext *context)
       : OpRewritePattern<VivadoOp>(context),
-        srcConfig(PackingConfig::parse(kSourcePackingAttr)),
-        tgtConfig(PackingConfig::parse(kTargetPackingAttr)),
-        src_mode(kSourceCoeModeAttr),
-        tgt_mode(kTargetCoeModeAttr) {}
+        srcConfig(PackingConfig::parse(pynq::PackedScaleConfig::kSourcePackingAttr)),
+        tgtConfig(PackingConfig::parse(pynq::PackedScaleConfig::kTargetPackingAttr)),
+        src_mode(pynq::PackedScaleConfig::kSourceCoeModeAttr),
+        tgt_mode(pynq::PackedScaleConfig::kTargetCoeModeAttr) {}
   
   // Helper to convert scale operands
   SmallVector<Value> convertScaleOperands(
@@ -366,8 +361,8 @@ struct RepackQMatMulPattern : public RepackVivadoOpPattern<vivado_ops::QMatMulOp
   LogicalResult matchAndRewrite(vivado_ops::QMatMulOp op,
                                  PatternRewriter &rewriter) const override {
     // Check if already in target format - avoid infinite loop
-    if (op.getScalePacking() == kTargetPackingAttr && 
-        op.getScaleCoeMode() == kTargetCoeModeAttr) {
+    if (op.getScalePacking() == pynq::PackedScaleConfig::kTargetPackingAttr && 
+        op.getScaleCoeMode() == pynq::PackedScaleConfig::kTargetCoeModeAttr) {
       return failure();  // Already converted, skip
     }
     
@@ -385,8 +380,8 @@ struct RepackQMatMulPattern : public RepackVivadoOpPattern<vivado_ops::QMatMulOp
         op.getEnableBiasAttr(), op.getTransposeWeightAttr(),
         op.getHlsPragmasAttr(), op.getAccumulatorTypeAttr(),
         op.getRequantModeAttr(),
-        rewriter.getStringAttr(kTargetPackingAttr),
-        rewriter.getStringAttr(kTargetCoeModeAttr),
+        rewriter.getStringAttr(pynq::PackedScaleConfig::kTargetPackingAttr),
+        rewriter.getStringAttr(pynq::PackedScaleConfig::kTargetCoeModeAttr),
         op.getTransposeModeAttr(),
       op.getIsTransposedAttr(),
       op.getRhsLayoutAttr(),
@@ -405,8 +400,8 @@ struct RepackQLinearPattern : public RepackVivadoOpPattern<vivado_ops::QLinearOp
   LogicalResult matchAndRewrite(vivado_ops::QLinearOp op,
                                  PatternRewriter &rewriter) const override {
     // Check if already in target format - avoid infinite loop
-    if (op.getScalePacking() == kTargetPackingAttr && 
-        op.getScaleCoeMode() == kTargetCoeModeAttr) {
+    if (op.getScalePacking() == pynq::PackedScaleConfig::kTargetPackingAttr && 
+        op.getScaleCoeMode() == pynq::PackedScaleConfig::kTargetCoeModeAttr) {
       return failure();  // Already converted, skip
     }
     
@@ -426,8 +421,8 @@ struct RepackQLinearPattern : public RepackVivadoOpPattern<vivado_ops::QLinearOp
         op.getBiasBufferIdAttr(), op.getFuseBiasAttr(),
         op.getTransposeWeightAttr(), op.getHlsPragmasAttr(),
         op.getAccumulatorTypeAttr(), op.getRequantModeAttr(),
-        rewriter.getStringAttr(kTargetPackingAttr),
-        rewriter.getStringAttr(kTargetCoeModeAttr),
+        rewriter.getStringAttr(pynq::PackedScaleConfig::kTargetPackingAttr),
+        rewriter.getStringAttr(pynq::PackedScaleConfig::kTargetCoeModeAttr),
         op.getTransposeModeAttr(),
         op.getIsTransposedAttr(),
         op.getLayerTypeAttr() 
@@ -444,8 +439,8 @@ struct RepackQAddPattern : public RepackVivadoOpPattern<vivado_ops::QAddOp> {
   LogicalResult matchAndRewrite(vivado_ops::QAddOp op,
                                  PatternRewriter &rewriter) const override {
     // Check if already in target format - avoid infinite loop
-    if (op.getScalePacking() == kTargetPackingAttr && 
-        op.getScaleCoeMode() == kTargetCoeModeAttr) {
+    if (op.getScalePacking() == pynq::PackedScaleConfig::kTargetPackingAttr && 
+        op.getScaleCoeMode() == pynq::PackedScaleConfig::kTargetCoeModeAttr) {
       return failure();  // Already converted, skip
     }
     
@@ -459,8 +454,8 @@ struct RepackQAddPattern : public RepackVivadoOpPattern<vivado_ops::QAddOp> {
         convertedScales[0], convertedScales[1], convertedScales[2], convertedScales[3],
         op.getXZero(), op.getYZero(), op.getOZero(),
         op.getFuseIntoProducerAttr(), op.getVectorizeAttr(),
-        rewriter.getStringAttr(kTargetPackingAttr),
-        rewriter.getStringAttr(kTargetCoeModeAttr),
+        rewriter.getStringAttr(pynq::PackedScaleConfig::kTargetPackingAttr),
+        rewriter.getStringAttr(pynq::PackedScaleConfig::kTargetCoeModeAttr),
         op.getTransposeModeAttr(),
         op.getIsTransposedAttr()
     );
@@ -476,8 +471,8 @@ struct RepackIntGELUPattern : public RepackVivadoOpPattern<vivado_ops::IntGELUOp
   LogicalResult matchAndRewrite(vivado_ops::IntGELUOp op,
                                  PatternRewriter &rewriter) const override {
     // Check if already in target format - avoid infinite loop
-    if (op.getScalePacking() == kTargetPackingAttr && 
-        op.getScaleCoeMode() == kTargetCoeModeAttr) {
+    if (op.getScalePacking() == pynq::PackedScaleConfig::kTargetPackingAttr && 
+        op.getScaleCoeMode() == pynq::PackedScaleConfig::kTargetCoeModeAttr) {
       return failure();  // Already converted, skip
     }
     
@@ -491,8 +486,8 @@ struct RepackIntGELUPattern : public RepackVivadoOpPattern<vivado_ops::IntGELUOp
         convertedScales[0], convertedScales[1], convertedScales[2], convertedScales[3], convertedScales[4],
         op.getInputZero(), op.getOutputZero(),
         op.getImplementationAttr(),
-        rewriter.getStringAttr(kTargetPackingAttr),
-        rewriter.getStringAttr(kTargetCoeModeAttr),
+        rewriter.getStringAttr(pynq::PackedScaleConfig::kTargetPackingAttr),
+        rewriter.getStringAttr(pynq::PackedScaleConfig::kTargetCoeModeAttr),
         op.getTransposeModeAttr(),
         op.getIsTransposedAttr()
     );
@@ -508,8 +503,8 @@ struct RepackIntSoftmaxPattern : public RepackVivadoOpPattern<vivado_ops::IntSof
   LogicalResult matchAndRewrite(vivado_ops::IntSoftmaxOp op,
                                  PatternRewriter &rewriter) const override {
     // Check if already in target format - avoid infinite loop
-    if (op.getScalePacking() == kTargetPackingAttr && 
-        op.getScaleCoeMode() == kTargetCoeModeAttr) {
+    if (op.getScalePacking() == pynq::PackedScaleConfig::kTargetPackingAttr && 
+        op.getScaleCoeMode() == pynq::PackedScaleConfig::kTargetCoeModeAttr) {
       return failure();  // Already converted, skip
     }
     
@@ -523,8 +518,8 @@ struct RepackIntSoftmaxPattern : public RepackVivadoOpPattern<vivado_ops::IntSof
         convertedScales[0], convertedScales[1], convertedScales[2], convertedScales[3], convertedScales[4],
         op.getInputZero(), op.getOutputZero(),
         op.getAxisAttr(), op.getImplementationAttr(),
-        rewriter.getStringAttr(kTargetPackingAttr),
-        rewriter.getStringAttr(kTargetCoeModeAttr),
+        rewriter.getStringAttr(pynq::PackedScaleConfig::kTargetPackingAttr),
+        rewriter.getStringAttr(pynq::PackedScaleConfig::kTargetCoeModeAttr),
         op.getTransposeModeAttr(),
         op.getIsTransposedAttr()
     );
@@ -540,8 +535,8 @@ struct RepackIntLayerNormPattern : public RepackVivadoOpPattern<vivado_ops::IntL
   LogicalResult matchAndRewrite(vivado_ops::IntLayerNormOp op,
                                  PatternRewriter &rewriter) const override {
     // Check if already in target format - avoid infinite loop
-    if (op.getScalePacking() == kTargetPackingAttr && 
-        op.getScaleCoeMode() == kTargetCoeModeAttr) {
+    if (op.getScalePacking() == pynq::PackedScaleConfig::kTargetPackingAttr && 
+        op.getScaleCoeMode() == pynq::PackedScaleConfig::kTargetCoeModeAttr) {
       return failure();  // Already converted, skip
     }
     
@@ -557,8 +552,8 @@ struct RepackIntLayerNormPattern : public RepackVivadoOpPattern<vivado_ops::IntL
         convertedScales[3], convertedScales[4], convertedScales[5],
         op.getInputZero(), op.getOutputZero(),
         op.getEpsAttr(), op.getRsqrtMethodAttr(),
-        rewriter.getStringAttr(kTargetPackingAttr),
-        rewriter.getStringAttr(kTargetCoeModeAttr),
+        rewriter.getStringAttr(pynq::PackedScaleConfig::kTargetPackingAttr),
+        rewriter.getStringAttr(pynq::PackedScaleConfig::kTargetCoeModeAttr),
         op.getTransposeModeAttr(),
         op.getIsTransposedAttr()
     );
@@ -574,8 +569,8 @@ struct RepackQConv2dPattern : public RepackVivadoOpPattern<vivado_ops::QConv2dOp
   LogicalResult matchAndRewrite(vivado_ops::QConv2dOp op,
                                  PatternRewriter &rewriter) const override {
     // Check if already in target format - avoid infinite loop
-    if (op.getScalePacking() == kTargetPackingAttr && 
-        op.getScaleCoeMode() == kTargetCoeModeAttr) {
+    if (op.getScalePacking() == pynq::PackedScaleConfig::kTargetPackingAttr && 
+        op.getScaleCoeMode() == pynq::PackedScaleConfig::kTargetCoeModeAttr) {
       return failure();  // Already converted, skip
     }
     
@@ -594,8 +589,8 @@ struct RepackQConv2dPattern : public RepackVivadoOpPattern<vivado_ops::QConv2dOp
         op.getBufferStrategyAttr(), op.getBufferIdsAttr(),
         op.getEnableBiasAttr(), op.getHlsPragmasAttr(),
         op.getAccumulatorTypeAttr(), op.getRequantModeAttr(),
-        rewriter.getStringAttr(kTargetPackingAttr),
-        rewriter.getStringAttr(kTargetCoeModeAttr),
+        rewriter.getStringAttr(pynq::PackedScaleConfig::kTargetPackingAttr),
+        rewriter.getStringAttr(pynq::PackedScaleConfig::kTargetCoeModeAttr),
         op.getTransposeModeAttr(),
         op.getIsTransposedAttr()
     );
@@ -611,8 +606,8 @@ struct RepackQMatMulIsqrtDPattern : public RepackVivadoOpPattern<vivado_ops::QMa
   LogicalResult matchAndRewrite(vivado_ops::QMatMulIsqrtDOp op,
                                  PatternRewriter &rewriter) const override {
     // Check if already in target format - avoid infinite loop
-    if (op.getScalePacking() == kTargetPackingAttr && 
-        op.getScaleCoeMode() == kTargetCoeModeAttr) {
+    if (op.getScalePacking() == pynq::PackedScaleConfig::kTargetPackingAttr && 
+        op.getScaleCoeMode() == pynq::PackedScaleConfig::kTargetCoeModeAttr) {
       return failure();  // Already converted, skip
     }
     
@@ -630,8 +625,8 @@ struct RepackQMatMulIsqrtDPattern : public RepackVivadoOpPattern<vivado_ops::QMa
         op.getEnableBiasAttr(), op.getTransposeWeightAttr(),
         op.getHlsPragmasAttr(), op.getAccumulatorTypeAttr(),
         op.getRequantModeAttr(),
-        rewriter.getStringAttr(kTargetPackingAttr),
-        rewriter.getStringAttr(kTargetCoeModeAttr),
+        rewriter.getStringAttr(pynq::PackedScaleConfig::kTargetPackingAttr),
+        rewriter.getStringAttr(pynq::PackedScaleConfig::kTargetCoeModeAttr),
         op.getTransposeModeAttr(),
       op.getIsTransposedAttr(),
       op.getRhsLayoutAttr(),
@@ -652,8 +647,8 @@ struct RepackQuantPattern : public RepackVivadoOpPattern<vivado_ops::QuantOp> {
   LogicalResult matchAndRewrite(vivado_ops::QuantOp op,
                                  PatternRewriter &rewriter) const override {
     // Check if already in target format - avoid infinite loop
-    if (op.getScalePacking() == kTargetPackingAttr && 
-        op.getScaleCoeMode() == kTargetCoeModeAttr) {
+    if (op.getScalePacking() == pynq::PackedScaleConfig::kTargetPackingAttr && 
+        op.getScaleCoeMode() == pynq::PackedScaleConfig::kTargetCoeModeAttr) {
       return failure();  // Already converted, skip
     }
     
@@ -665,8 +660,8 @@ struct RepackQuantPattern : public RepackVivadoOpPattern<vivado_ops::QuantOp> {
         op.getOutput(), op.getInput(),
         convertedScales[0], op.getZero(),
         op.getQuantModeAttr(),
-        rewriter.getStringAttr(kTargetPackingAttr),
-        rewriter.getStringAttr(kTargetCoeModeAttr),
+        rewriter.getStringAttr(pynq::PackedScaleConfig::kTargetPackingAttr),
+        rewriter.getStringAttr(pynq::PackedScaleConfig::kTargetCoeModeAttr),
         op.getTransposeModeAttr(),
         op.getIsTransposedAttr()
     );
@@ -684,8 +679,8 @@ struct RepackDequantPattern : public RepackVivadoOpPattern<vivado_ops::DequantOp
   LogicalResult matchAndRewrite(vivado_ops::DequantOp op,
                                  PatternRewriter &rewriter) const override {
     // Check if already in target format - avoid infinite loop
-    if (op.getScalePacking() == kTargetPackingAttr && 
-        op.getScaleCoeMode() == kTargetCoeModeAttr) {
+    if (op.getScalePacking() == pynq::PackedScaleConfig::kTargetPackingAttr && 
+        op.getScaleCoeMode() == pynq::PackedScaleConfig::kTargetCoeModeAttr) {
       return failure();  // Already converted, skip
     }
     
@@ -697,8 +692,8 @@ struct RepackDequantPattern : public RepackVivadoOpPattern<vivado_ops::DequantOp
         op.getOutput(), op.getInput(),
         convertedScales[0], op.getZero(),
         op.getQuantModeAttr(),
-        rewriter.getStringAttr(kTargetPackingAttr),
-        rewriter.getStringAttr(kTargetCoeModeAttr),
+        rewriter.getStringAttr(pynq::PackedScaleConfig::kTargetPackingAttr),
+        rewriter.getStringAttr(pynq::PackedScaleConfig::kTargetCoeModeAttr),
         op.getTransposeModeAttr(),
         op.getIsTransposedAttr()
     );
@@ -712,10 +707,10 @@ struct RepackDequantPattern : public RepackVivadoOpPattern<vivado_ops::DequantOp
 //===----------------------------------------------------------------------===//
 
 bool applyRepackVivadoScales(ModuleOp &module, MLIRContext *context) {
-  auto srcConfig = PackingConfig::parse(kSourcePackingAttr);
-  auto tgtConfig = PackingConfig::parse(kTargetPackingAttr);
-  srcConfig.coe_mode = kSourceCoeModeAttr;
-  tgtConfig.coe_mode = kTargetCoeModeAttr;
+  auto srcConfig = PackingConfig::parse(pynq::PackedScaleConfig::kSourcePackingAttr);
+  auto tgtConfig = PackingConfig::parse(pynq::PackedScaleConfig::kTargetPackingAttr);
+  srcConfig.coe_mode = pynq::PackedScaleConfig::kSourceCoeModeAttr;
+  tgtConfig.coe_mode = pynq::PackedScaleConfig::kTargetCoeModeAttr;
   
   // First pass: convert all memref::GlobalOp with packed scales (in-place modification)
   module.walk([&](memref::GlobalOp globalOp) {

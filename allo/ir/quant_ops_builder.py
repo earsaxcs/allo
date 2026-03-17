@@ -342,6 +342,7 @@ def build_quant_placeholder(ctx, node, attr, new_args, output_buffer, transforme
     
     elif attr == "quant":
         # DSL call: quant(x, quant_mode, scale_sign, scale_coe, scale_rshift, zero=?)
+        # quant_mode (low 3 bits): bit0=asym flag, bit[2:1]=granularity code
         # Python binding: QuantOp(output, input, scale_sign, scale_coe, scale_rshift, zero=?, quant_mode=N)
         # x: float input, output: int
         if len(arg_results) < 5:
@@ -354,7 +355,7 @@ def build_quant_placeholder(ctx, node, attr, new_args, output_buffer, transforme
         if isinstance(quant_mode_arg, MockConstant):
             quant_mode = int(quant_mode_arg.val)
         else:
-            quant_mode = 0  # Default: symmetric, per-tensor
+            quant_mode = 0  # Default: symmetric + per-tensor
         
         scl_sign, scl_coe, scl_rshift = arg_results[2], arg_results[3], arg_results[4]
         zero = get_kwarg("zero", 5, arg_results)
@@ -369,6 +370,7 @@ def build_quant_placeholder(ctx, node, attr, new_args, output_buffer, transforme
     
     elif attr == "dequant":
         # DSL call: dequant(x, quant_mode, scale_sign, scale_coe, scale_rshift, zero=?)
+        # quant_mode (low 3 bits): bit0=asym flag, bit[2:1]=granularity code
         # Python binding: DequantOp(output, input, scale_sign, scale_coe, scale_rshift, zero=?, quant_mode=N)
         # x: int input, output: float
         if len(arg_results) < 5:
@@ -380,7 +382,7 @@ def build_quant_placeholder(ctx, node, attr, new_args, output_buffer, transforme
         if isinstance(quant_mode_arg, MockConstant):
             quant_mode = int(quant_mode_arg.val)
         else:
-            quant_mode = 0  # Default: symmetric, per-tensor
+            quant_mode = 0  # Default: symmetric + per-tensor
         
         scl_sign, scl_coe, scl_rshift = arg_results[2], arg_results[3], arg_results[4]
         zero = get_kwarg("zero", 5, arg_results)

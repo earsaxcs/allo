@@ -1262,7 +1262,8 @@ void PYNQCEmitter::emitSetMagic(pynq::SetMagicOp op) {
   auto magicAttr = op->getAttrOfType<IntegerAttr>("magic");
   int64_t magic = magicAttr ? magicAttr.getInt() : 0;
   indent();
-  os << "// pynq.setMagic: magic=" << magic;
+  // os << "// pynq.setMagic: magic=" << magic;
+  os << "write_magic_num_reg(" << magic << ");";
   emitInfoAndNewLine(op);
 }
 
@@ -1795,30 +1796,30 @@ void PYNQCEmitter::emitQuant(pynq::QuantOp op) {
     return;
   }
 
-  auto modeAttr = op->getAttrOfType<IntegerAttr>("quant_mode");
-  int64_t mode = modeAttr ? modeAttr.getInt() : 0;
-  if (mode < 0 || mode > 3) {
-    emitError(op, "pynq.quant quant_mode must be in [0,3]");
+  auto cmbAttr = op->getAttrOfType<IntegerAttr>("quant_cmb");
+  int64_t cmbRaw = cmbAttr ? cmbAttr.getInt() : 0;
+  if (cmbRaw < 0 || cmbRaw > 255) {
+    emitError(op, "pynq.quant quant_cmb must be representable in i8");
     return;
   }
 
+  uint8_t quantCmb = static_cast<uint8_t>(cmbRaw) & 0x7u;
+  bool isAsymmetric = (quantCmb & 0x1u) != 0;
+  bool is1D = (quantCmb & 0x2u) != 0;
+  bool alongCol = (quantCmb & 0x4u) != 0;
+
   const char *callee = nullptr;
-  bool needsZero = false;
-  switch (mode) {
-  case 0:
-    callee = "PYNQ_quant_fp32_to_int8_sym_tensor";
-    break;
-  case 1:
-    callee = "PYNQ_quant_fp32_to_int8_asym_tensor";
-    needsZero = true;
-    break;
-  case 2:
-    callee = "PYNQ_quant_fp32_to_int8_sym_token";
-    break;
-  case 3:
-    callee = "PYNQ_quant_fp32_to_int8_asym_token";
-    needsZero = true;
-    break;
+  bool needsZero = isAsymmetric;
+
+  if (!is1D) {
+    callee = isAsymmetric ? "PYNQ_quant_fp32_to_int8_asym_0d"
+                          : "PYNQ_quant_fp32_to_int8_sym_0d";
+  } else if (alongCol) {
+    callee = isAsymmetric ? "PYNQ_quant_fp32_to_int8_asym_col"
+                          : "PYNQ_quant_fp32_to_int8_sym_col";
+  } else {
+    callee = isAsymmetric ? "PYNQ_quant_fp32_to_int8_asym_row"
+                          : "PYNQ_quant_fp32_to_int8_sym_row";
   }
 
   if (needsZero) {
@@ -1945,30 +1946,30 @@ void PYNQCEmitter::emitDequant(pynq::DequantOp op) {
     return;
   }
 
-  auto modeAttr = op->getAttrOfType<IntegerAttr>("quant_mode");
-  int64_t mode = modeAttr ? modeAttr.getInt() : 0;
-  if (mode < 0 || mode > 3) {
-    emitError(op, "pynq.dequant quant_mode must be in [0,3]");
+  auto cmbAttr = op->getAttrOfType<IntegerAttr>("quant_cmb");
+  int64_t cmbRaw = cmbAttr ? cmbAttr.getInt() : 0;
+  if (cmbRaw < 0 || cmbRaw > 255) {
+    emitError(op, "pynq.dequant quant_cmb must be representable in i8");
     return;
   }
 
+  uint8_t quantCmb = static_cast<uint8_t>(cmbRaw) & 0x7u;
+  bool isAsymmetric = (quantCmb & 0x1u) != 0;
+  bool is1D = (quantCmb & 0x2u) != 0;
+  bool alongCol = (quantCmb & 0x4u) != 0;
+
   const char *callee = nullptr;
-  bool needsZero = false;
-  switch (mode) {
-  case 0:
-    callee = "PYNQ_dequant_int8_to_fp32_sym_tensor";
-    break;
-  case 1:
-    callee = "PYNQ_dequant_int8_to_fp32_asym_tensor";
-    needsZero = true;
-    break;
-  case 2:
-    callee = "PYNQ_dequant_int8_to_fp32_sym_token";
-    break;
-  case 3:
-    callee = "PYNQ_dequant_int8_to_fp32_asym_token";
-    needsZero = true;
-    break;
+  bool needsZero = isAsymmetric;
+
+  if (!is1D) {
+    callee = isAsymmetric ? "PYNQ_dequant_int8_to_fp32_asym_0d"
+                          : "PYNQ_dequant_int8_to_fp32_sym_0d";
+  } else if (alongCol) {
+    callee = isAsymmetric ? "PYNQ_dequant_int8_to_fp32_asym_col"
+                          : "PYNQ_dequant_int8_to_fp32_sym_col";
+  } else {
+    callee = isAsymmetric ? "PYNQ_dequant_int8_to_fp32_asym_row"
+                          : "PYNQ_dequant_int8_to_fp32_sym_row";
   }
 
   if (needsZero) {

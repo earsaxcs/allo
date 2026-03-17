@@ -18,7 +18,9 @@ add_mlir_library(MLIRAlloPasses
     PYNQElideRedundantCopies.cpp
     PYNQScheduleOps.cpp
     PYNQBufferAllocation.cpp
+    PYNQAdjustScaleRShift.cpp
     PYNQMidLower.cpp
+    PYNQReturnMemrefToOutParam.cpp
     PYNQOptimizeSync.cpp
     PYNQOptimizeSubviewGlobals.cpp
     RepackVivadoScales.cpp

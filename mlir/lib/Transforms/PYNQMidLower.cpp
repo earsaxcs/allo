@@ -402,6 +402,8 @@ packVectorScalesStacked(ModuleOp module,
   }
 
   int32_t half = chunkElements / 2;
+  // Emit packed bytes in chunk-major order across scale streams:
+  // [scale0_chunk0, scale1_chunk0, ..., scaleN_chunk0, scale0_chunk1, ...].
   for (size_t b = 0; b < blocks; ++b) {
     size_t base = b * chunkElements;
     for (auto &s : vecs) {
@@ -489,21 +491,21 @@ packLayerNormScaleBias(ModuleOp module,
   SmallVector<uint8_t> out;
   out.reserve(s.values.size() * (s.elementBytes + b.elementBytes));
   for (size_t i = 0; i < s.values.size(); ++i) {
-    appendElementBytesLittleEndian(out, s.values[i], s.elementBytes);
     appendElementBytesLittleEndian(out, b.values[i], b.elementBytes);
+    appendElementBytesLittleEndian(out, s.values[i], s.elementBytes);
   }
 
   if (debugScalePack) {
     llvm::errs() << "[pynq-mid-lower][pack] layernorm fused_scale+bias_int\n";
-    llvm::errs() << "  fused_scale global=@" << s.global.getName()
-                 << " len=" << s.values.size()
-                 << " elemBytes=" << s.elementBytes << "\n";
-    debugDumpAPIntVector(llvm::errs(), s.values, s.elementBytes);
     llvm::errs() << "  bias_int global=@" << b.global.getName()
                  << " len=" << b.values.size()
                  << " elemBytes=" << b.elementBytes << "\n";
     debugDumpAPIntVector(llvm::errs(), b.values, b.elementBytes);
-    llvm::errs() << "  packed (scale then bias, per element):\n";
+    llvm::errs() << "  fused_scale global=@" << s.global.getName()
+                 << " len=" << s.values.size()
+                 << " elemBytes=" << s.elementBytes << "\n";
+    debugDumpAPIntVector(llvm::errs(), s.values, s.elementBytes);
+    llvm::errs() << "  packed (bias then scale, per element):\n";
     debugDumpBytesHex(llvm::errs(), out);
   }
 

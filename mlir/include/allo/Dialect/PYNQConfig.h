@@ -162,6 +162,55 @@ struct ScaleMode {
   static constexpr unsigned kPerToken = 2;
 };
 
+/// Canonical packed-scale format configuration used by quantized lowering.
+///
+/// Packing format string schema:
+///   "sign_bits,sign_offset,rshift_bits,rshift_offset,coe_bits,coe_offset"
+///
+/// Coe mode:
+/// - "Tail": coefficient excludes implicit leading 1
+/// - "Full": coefficient includes explicit leading 1 (or sign-fused form)
+struct PackedScaleConfig {
+  /// Source format before repacking.
+  static constexpr const char *kSourcePackingAttr = "8,24,8,16,16,0";
+  static constexpr const char *kSourceCoeModeAttr = "Tail";
+
+  /// Target canonical format after repacking.
+  static constexpr const char *kTargetPackingAttr = "0,22,6,16,16,0";
+  static constexpr const char *kTargetCoeModeAttr = "Full";
+};
+
+/// Fixed-point fractional-bit configuration aligned with
+/// externals/transformer_lib/example/quantize/config/hyper_config.py.
+struct VectorFixedPointConfig {
+  /// GELU input/output fixed-point formats: Fixed(2, 13)
+  static constexpr int32_t kGELUInputFracBits = 13;
+  static constexpr int32_t kGELUOutputFracBits = 13;
+
+  /// Softmax fixed-point formats: x=Fixed(3, 12), ex=Fixed(0, 16, False)
+  static constexpr int32_t kSoftmaxInputFracBits = 12;
+  static constexpr int32_t kSoftmaxExpFracBits = 16;
+  static constexpr int32_t kSoftmaxLogEFracBits = 12;
+
+  /// LayerNorm fixed-point formats from hyper_config.py
+  /// norm_x = Fixed(16, 0, False), norm_insqrt = Fixed(0, 16, False)
+  static constexpr int32_t kLayerNormInputFracBits = 0;
+  static constexpr int32_t kLayerNormInvSqrtFracBits = 16;
+
+  /// Shortcut(QAdd) input/output fixed-point formats: Fixed(7, 8)
+  static constexpr int32_t kShortcutInputFracBits = 8;
+  static constexpr int32_t kShortcutOutputFracBits = 8;
+};
+
+/// Rshift adjustment configuration used by PYNQ scale-adjust pass.
+struct RShiftAdjustConfig {
+  /// Innate front-end bias added in float_to_fixed_point.
+  static constexpr int32_t kInnateRshiftBias = 16;
+
+  /// MatMul accumulator drop width used by matmul quant flow.
+  static constexpr int32_t kMatMulDropWidth = 8;
+};
+
 /// QLinear layer type identification
 struct QLinearLayerType {
   /// Query projection in multi-head attention

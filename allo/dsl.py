@@ -287,23 +287,30 @@ def qadd(lhs, rhs,
 # ==================== Quantize/Dequantize Operations ====================
 # 
 # Quant Mode Encoding:
-#   quant_mode (int8): 2-bit encoding
-#     - Bit 0: 0 = symmetric, 1 = asymmetric
-#     - Bit 1: 0 = per-tensor, 1 = per-token
-#   Values:
-#     0b00 = 0: symmetric, per-tensor
-#     0b01 = 1: asymmetric, per-tensor
-#     0b10 = 2: symmetric, per-token
-#     0b11 = 3: asymmetric, per-token
+#   quant_mode (int8): 3-bit packed encoding (low 3 bits used)
+#     - Bit 0 (LSB): 0 = symmetric, 1 = asymmetric
+#     - Bits [2:1]: granularity (00..10)
+#         00 = per-tensor  (0D scale, single scale value)
+#         01 = per-token   (1D scale varying along token dimension)
+#         10 = per-channel (1D scale varying along channel dimension)
+#   Values (binary: bit2 bit1 bit0):
+#     0b000 = 0: symmetric, per-tensor
+#     0b001 = 1: asymmetric, per-tensor
+#     0b010 = 2: symmetric, per-token
+#     0b011 = 3: asymmetric, per-token
+#     0b100 = 4: symmetric, per-channel
+#     0b101 = 5: asymmetric, per-channel
 #
 # Quant:  float input  -> int output
 # Dequant: int input   -> float output
 
 # Quant mode constants
-QUANT_SYM_TENSOR = 0    # 0b00: symmetric, per-tensor
-QUANT_ASYM_TENSOR = 1   # 0b01: asymmetric, per-tensor
-QUANT_SYM_TOKEN = 2     # 0b10: symmetric, per-token
-QUANT_ASYM_TOKEN = 3    # 0b11: asymmetric, per-token
+QUANT_SYM_TENSOR = 0    # 0b000: symmetric, per-tensor
+QUANT_ASYM_TENSOR = 1   # 0b001: asymmetric, per-tensor
+QUANT_SYM_TOKEN = 2     # 0b010: symmetric, per-token
+QUANT_ASYM_TOKEN = 3    # 0b011: asymmetric, per-token
+QUANT_SYM_CHANNEL = 4   # 0b100: symmetric, per-channel
+QUANT_ASYM_CHANNEL = 5  # 0b101: asymmetric, per-channel
 
 
 def quant(x, quant_mode, scale_sign, scale_coe, scale_rshift, zero=None, name=None):
@@ -313,11 +320,11 @@ def quant(x, quant_mode, scale_sign, scale_coe, scale_rshift, zero=None, name=No
     
     Args:
         x: 输入浮点张量
-        quant_mode: 量化模式 (int8)
-            - 0: symmetric, per-tensor
-            - 1: asymmetric, per-tensor
-            - 2: symmetric, per-token
-            - 3: asymmetric, per-token
+        quant_mode: 量化模式 (int8, 低 3 位有效)
+            - bit0 (LSB): 0 = symmetric, 1 = asymmetric
+            - bits[2:1]: granularity: 00=per-tensor, 01=per-token, 10=per-channel
+            - 常用值: 0=sym per-tensor, 1=asym per-tensor, 2=sym per-token, 3=asym per-token,
+                      4=sym per-channel, 5=asym per-channel
         scale_sign, scale_coe, scale_rshift: scale 的定点表示三元组
             scale = sign * coe * 2^(-rshift)
         zero: 零点 (仅 asymmetric 模式需要)
@@ -341,11 +348,11 @@ def dequant(x, quant_mode, scale_sign, scale_coe, scale_rshift, zero=None, name=
     
     Args:
         x: 输入整数张量
-        quant_mode: 量化模式 (int8)
-            - 0: symmetric, per-tensor
-            - 1: asymmetric, per-tensor
-            - 2: symmetric, per-token
-            - 3: asymmetric, per-token
+        quant_mode: 量化模式 (int8, 低 3 位有效)
+            - bit0 (LSB): 0 = symmetric, 1 = asymmetric
+            - bits[2:1]: granularity: 00=per-tensor, 01=per-token, 10=per-channel
+            - 常用值: 0=sym per-tensor, 1=asym per-tensor, 2=sym per-token, 3=asym per-token,
+                      4=sym per-channel, 5=asym per-channel
         scale_sign, scale_coe, scale_rshift: scale 的定点表示三元组
             scale = sign * coe * 2^(-rshift)
         zero: 零点 (仅 asymmetric 模式需要)

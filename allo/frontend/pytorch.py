@@ -31,6 +31,17 @@ from ..quant.quant_config import DEFAULT_ACT_BIT, DEFAULT_WEIGHT_BIT, DEFAULT_BI
 from ..ops.vit import ViTGetFirstToken, ViTTokenExpand
 
 
+def _safe_identifier(name):
+    """Convert external names (module/param targets) to valid Python identifiers."""
+    ident = str(name).replace(".", "_")
+    ident = "".join(ch if (ch.isalnum() or ch == "_") else "_" for ch in ident)
+    if not ident:
+        return "_"
+    if ident[0].isdigit():
+        ident = "_" + ident
+    return ident
+
+
 # maybe used in pytorch_vivado.py
 def _process_quantized_params(gm, global_vars, quant_config=None):
     """
@@ -139,6 +150,7 @@ def _process_quantized_params(gm, global_vars, quant_config=None):
         max_fixed_value = (1 << fixed_bits) - 1  # 2^17 - 1 = 131071
         min_fixed_value = (1 << (fixed_bits - 1))  # 2^16 = 65536
         
+        # NOTE: coe_float * (1 << fixed_bits)对应下面的转移fixed_point到rshift中
         coe_fixed = np.round(coe_float * (1 << fixed_bits)).astype(dtype)
         coe_fixed = np.clip(coe_fixed, min_fixed_value, max_fixed_value)
         
@@ -182,6 +194,7 @@ def _process_quantized_params(gm, global_vars, quant_config=None):
         # 由外部负责转换到需要的类型
 
         # NOTE: 合并coe_fixed的fixed_bits到rshift里，之后coe_fixed当成一个纯粹的介于[2^(fixed_bits-1), 2^fixed_bits)的整数看待
+        # 这是个等价变换，和硬件无关，所以放前端做没问题
         rshift = rshift + fixed_bits
         return sign, coe_fixed, rshift
     
@@ -204,7 +217,7 @@ def _process_quantized_params(gm, global_vars, quant_config=None):
             continue
             
         # 模块名转换为变量名格式
-        var_prefix = "g_" + module_name.replace(".", "_")
+        var_prefix = "g_" + _safe_identifier(module_name) # "g_" + module_name.replace(".", "_")
         
         # ========== 处理权重 (weight) ==========
         if hasattr(module, 'weight') and hasattr(module, 'weight_int'):
@@ -809,16 +822,90 @@ class TorchBuilder:
         
         return None, None
     
-    def _get_quant_mode_from_module(self, module):
-        """从量化模块获取量化模式编码"""
-        # 默认：symmetric, per-tensor
-        mode = 0
-        if hasattr(module, 'quant_mode'):
+    def _get_quant_mode_from_module(self, module, io_role='input', input_idx=0):
+        """从量化模块获取量化模式编码（3-bit）。
+
+        Args:
+            module: 量化模块实例
+            io_role: 'input' 或 'output'，决定读取输入/输出侧粒度定义
+            input_idx: 双输入算子时输入索引（仅 io_role='input' 有效）
+
+        编码规则（3-bit）：
+        - bit0: 是否非对称，0=symmetric，1=asymmetric
+        - bit[2:1]: 粒度
+          - 0b00: per_tensor
+          - 0b01: per_token
+          - 0b10: per_channel
+        """
+        if io_role not in ('input', 'output'):
+            raise ValueError(f"Unsupported io_role: {io_role}")
+
+        mode = 0  # 默认：symmetric + per_tensor => 0b000
+
+        # bit0: asymmetric flag
+        qmode = None
+        if hasattr(module, 'act_quant_mode'):
+            qmode = module.act_quant_mode
+        elif hasattr(module, 'quant_mode'):
             qmode = module.quant_mode
-            if qmode == 'asym':
-                mode |= 1  # asymmetric
-            if hasattr(module, 'per_token') and module.per_token:
-                mode |= 2  # per-token
+
+        if qmode is not None:
+            qmode_norm = str(qmode).lower()
+            if qmode_norm == 'asym':
+                mode |= 1
+            elif qmode_norm != 'sym':
+                raise NotImplementedError(f"Unsupported quant mode string: {qmode}")
+
+        # bit[2:1]: granularity
+        per_token = False
+        per_channel = False
+
+        if isinstance(module, QLinear):
+            if io_role == 'input':
+                per_token = bool(getattr(module, 'input_act_per_token', False))
+            else:
+                per_token = bool(getattr(module, 'output_act_per_token', False))
+
+        elif isinstance(module, QConv2d):
+            per_token = False
+            per_channel = False
+
+        elif isinstance(module, IntGELU):
+            per_token = bool(getattr(module, 'act_per_token', False))
+
+        elif isinstance(module, IntSoftmax):
+            per_token = bool(getattr(module, 'act_per_token', False))
+            per_channel = bool(getattr(module, 'act_per_head', False)) and not per_token
+
+        elif isinstance(module, IntLayerNorm):
+            if io_role == 'input':
+                per_token = bool(getattr(module, 'input_act_per_token', False))
+            else:
+                per_channel = bool(getattr(module, 'output_act_per_channel', False))
+
+        elif isinstance(module, QAdd):
+            # QAdd 的 x/y/o 都跟随 act_per_token
+            per_token = bool(getattr(module, 'act_per_token', False))
+
+        elif isinstance(module, (QMatMul, QMatMulIsqrtD)):
+            if io_role == 'input':
+                # x_scale 可 per-token，y_scale 固定 per-tensor
+                per_token = bool(getattr(module, 'act_per_token', False)) if input_idx == 0 else False
+            else:
+                per_token = bool(getattr(module, 'act_per_token', False))
+
+        else:
+            # 兜底：兼容旧字段
+            per_channel = bool(getattr(module, 'per_channel', False))
+            per_token = bool(getattr(module, 'per_token', False))
+
+        granularity_bits = 0b00
+        if per_channel:
+            granularity_bits = 0b10
+        elif per_token:
+            granularity_bits = 0b01
+
+        mode |= (granularity_bits << 1)
         return mode
     
     def _generate_boundary_conversion(self, conversion_info, producer_name, consumer_name, input_idx):
@@ -831,12 +918,14 @@ class TorchBuilder:
         
         if conv_type == 'quant':
             # 非量化 -> 量化：使用消费者（量化模块）的 input_scale
-            module_name = conversion_info['consumer_module'].replace(".", "_")
+            module_name = _safe_identifier(conversion_info['consumer_module'])
             module_obj = conversion_info['consumer_module_obj']
-            quant_mode = self._get_quant_mode_from_module(module_obj)
+            quant_mode = self._get_quant_mode_from_module(
+                module_obj, io_role='input', input_idx=input_idx
+            )
             
             # 生成新变量名
-            new_var_name = f"{producer_name}_quant_{consumer_name}_{input_idx}"
+            new_var_name = f"{_safe_identifier(producer_name)}_quant_{_safe_identifier(consumer_name)}_{input_idx}"
             
             # 根据模块类型和输入索引选择正确的 scale 名称
             scale_base_name = self._get_input_scale_name(module_obj, input_idx)
@@ -860,12 +949,14 @@ class TorchBuilder:
         
         elif conv_type == 'dequant':
             # 量化 -> 非量化：使用生产者（量化模块）的 output_scale
-            module_name = conversion_info['producer_module'].replace(".", "_")
+            module_name = _safe_identifier(conversion_info['producer_module'])
             module_obj = conversion_info['producer_module_obj']
-            quant_mode = self._get_quant_mode_from_module(module_obj)
+            quant_mode = self._get_quant_mode_from_module(
+                module_obj, io_role='output'
+            )
             
             # 生成新变量名
-            new_var_name = f"{producer_name}_dequant_{consumer_name}_{input_idx}"
+            new_var_name = f"{_safe_identifier(producer_name)}_dequant_{_safe_identifier(consumer_name)}_{input_idx}"
             
             # 根据模块类型选择正确的 output scale 名称
             scale_base_name = self._get_output_scale_name(module_obj)
@@ -1057,7 +1148,7 @@ class TorchBuilder:
         # 处理命名参数声明
         if self.named_params:
             for name, param in self.named_params:
-                new_name = name.replace(".", "_")
+                new_name = _safe_identifier(name)
                 shape_str = ', '.join([str(s) for s in param.shape])
                 
                 # 默认类型
@@ -1122,7 +1213,7 @@ class TorchBuilder:
                 continue
             
             # 模块名转换为变量名格式
-            var_prefix = module_name.replace(".", "_")
+            var_prefix = _safe_identifier(module_name)
             
             # ========== 权重相关 ==========
             if hasattr(module, 'weight_int'):
@@ -1607,20 +1698,23 @@ class TorchBuilder:
                 )
                 if producer_module is not None and isinstance(producer_module, quantized_module_types):
                     # 需要在返回前插入 dequant
-                    dequant_var_name = f"{return_arg.name}_dequant_return"
-                    quant_mode = self._get_quant_mode_from_module(producer_module)
+                    dequant_var_name = f"{_safe_identifier(return_arg.name)}_dequant_return"
+                    quant_mode = self._get_quant_mode_from_module(
+                        producer_module, io_role='output'
+                    )
                     scale_name = self._get_output_scale_name(producer_module)
                     zero_name = self._get_output_zero_name(producer_module)
+                    return_target_name = _safe_identifier(return_arg.target)
                     
                     # 生成 dequant 代码
                     dequant_code = self.generate_dequant_call(
                         dequant_var_name,
                         return_arg.name,
                         quant_mode,
-                        f"{return_arg.target.replace('.', '_')}_{scale_name}_sign",
-                        f"{return_arg.target.replace('.', '_')}_{scale_name}_coe",
-                        f"{return_arg.target.replace('.', '_')}_{scale_name}_rshift",
-                        f"{return_arg.target.replace('.', '_')}_{zero_name}" if hasattr(producer_module, zero_name) and getattr(producer_module, zero_name) is not None else None
+                        f"{return_target_name}_{scale_name}_sign",
+                        f"{return_target_name}_{scale_name}_coe",
+                        f"{return_target_name}_{scale_name}_rshift",
+                        f"{return_target_name}_{zero_name}" if hasattr(producer_module, zero_name) and getattr(producer_module, zero_name) is not None else None
                     )
                     self.code.append(dequant_code)
                     return_vars.append(dequant_var_name)
@@ -1765,7 +1859,7 @@ class TorchBuilder:
         return f"{node.name} = dsl.relu({inp})"
 
     def build_linear(self, node, bias):
-        target_name = node.target.replace(".", "_")
+        target_name = _safe_identifier(node.target)
         inp = get_var_name(node.args[0])
         weight = get_var_name(target_name + "_weight")
         if bias:
@@ -1774,7 +1868,7 @@ class TorchBuilder:
         return f"{node.name} = dsl.linear({inp}, {weight})"
     
     def build_conv2d(self, node, stride, bias):
-        target_name = node.target.replace(".", "_")
+        target_name = _safe_identifier(node.target)
         inp = get_var_name(node.args[0])
         weight = get_var_name(target_name + "_weight")
         if bias:
@@ -1791,7 +1885,7 @@ class TorchBuilder:
         return f"{node.name} = dsl.tanh({inp})"
 
     def build_layernorm(self, node):
-        target_name = node.target.replace(".", "_")
+        target_name = _safe_identifier(node.target)
         inp = get_var_name(node.args[0])
         weight = get_var_name(target_name + "_weight")
         bias = get_var_name(target_name + "_bias")
@@ -1906,6 +2000,7 @@ class TorchBuilder:
 
     def build_ViTTokenExpand(self, node, shape):
         shape = (self.example_inputs[0].shape[0], shape[1], shape[2])
+        node_name_safe = _safe_identifier(node.name)
         # 根据输入节点的实际类型选择数据类型
         # 检查输入参数的类型（从 _node_output_types 查询）
         dtype_str = "float32"  # 默认值
@@ -1924,11 +2019,11 @@ class TorchBuilder:
             src.replace("s_0", str(shape[0]))
             .replace("s_1", str(shape[1]))
             .replace("s_2", str(shape[2]))
-            .replace("ViTTokenExpand", f"ViTTokenExpand_{node.name}")
+            .replace("ViTTokenExpand", f"ViTTokenExpand_{node_name_safe}")
         )
         if src not in self.subfunctions:
             self.subfunctions.append(src)
-        return f"{node.name} = ViTTokenExpand_{node.name}({', '.join([get_var_name(arg) for arg in node.args][:1])})"
+        return f"{node_name_safe} = ViTTokenExpand_{node_name_safe}({', '.join([get_var_name(arg) for arg in node.args][:1])})"
 
     def build_CoreAttention(self, node):
         shape = tuple(self.example_inputs[1][0].shape)
@@ -1960,7 +2055,7 @@ class TorchBuilder:
     
     def build_QConv2d(self, node):
         module = self.get_module(node.target)
-        target_name = node.target.replace(".", "_")
+        target_name = _safe_identifier(node.target)
         # 使用可能被边界转换替换的输入变量名
         inp = self._get_substituted_var_name(node, node.args[0], 0)
         weight = get_var_name(target_name + "_weight_int")
@@ -2031,7 +2126,7 @@ class TorchBuilder:
 
     def build_QLinear(self, node):
         module = self.get_module(node.target)
-        target_name = node.target.replace(".", "_")
+        target_name = _safe_identifier(node.target)
         # 使用可能被边界转换替换的输入变量名
         inp = self._get_substituted_var_name(node, node.args[0], 0)
         weight = get_var_name(target_name + "_weight_int")
@@ -2114,7 +2209,7 @@ class TorchBuilder:
     def build_QAdd(self, node):
         """构建 QAdd 的 DSL 调用"""
         module = self.get_module(node.target)
-        target_name = node.target.replace(".", "_")
+        target_name = _safe_identifier(node.target)
         # 使用可能被边界转换替换的输入变量名
         inp1 = self._get_substituted_var_name(node, node.args[0], 0)
         inp2 = self._get_substituted_var_name(node, node.args[1], 1)
@@ -2163,7 +2258,7 @@ class TorchBuilder:
     def build_IntSoftmax(self, node):
         """构建 IntSoftmax 的 DSL 调用"""
         module = self.get_module(node.target)
-        target_name = node.target.replace(".", "_")
+        target_name = _safe_identifier(node.target)
         # 使用可能被边界转换替换的输入变量名
         inp = self._get_substituted_var_name(node, node.args[0], 0)
         
@@ -2218,7 +2313,7 @@ class TorchBuilder:
     def build_IntLayerNorm(self, node):
         """构建 IntLayerNorm 的 DSL 调用"""
         module = self.get_module(node.target)
-        target_name = node.target.replace(".", "_")
+        target_name = _safe_identifier(node.target)
         # 使用可能被边界转换替换的输入变量名
         inp = self._get_substituted_var_name(node, node.args[0], 0)
         
@@ -2281,7 +2376,7 @@ class TorchBuilder:
     def build_IntGELU(self, node):
         """构建 IntGELU 的 DSL 调用"""
         module = self.get_module(node.target)
-        target_name = node.target.replace(".", "_")
+        target_name = _safe_identifier(node.target)
         # 使用可能被边界转换替换的输入变量名
         inp = self._get_substituted_var_name(node, node.args[0], 0)
         
@@ -2331,7 +2426,7 @@ class TorchBuilder:
     def build_QMatMul(self, node):
         """构建 QMatMul 的 DSL 调用"""
         module = self.get_module(node.target)
-        target_name = node.target.replace(".", "_")
+        target_name = _safe_identifier(node.target)
         # 使用可能被边界转换替换的输入变量名
         inp1 = self._get_substituted_var_name(node, node.args[0], 0)
         inp2 = self._get_substituted_var_name(node, node.args[1], 1)
@@ -2400,7 +2495,7 @@ class TorchBuilder:
         """构建 QMatMulIsqrtD 的 DSL 调用 (带 sqrt(d) 归一化的 MatMul)"""
         # 与 QMatMul 基本相同，只是函数名不同
         module = self.get_module(node.target)
-        target_name = node.target.replace(".", "_")
+        target_name = _safe_identifier(node.target)
         # 使用可能被边界转换替换的输入变量名
         inp1 = self._get_substituted_var_name(node, node.args[0], 0)
         inp2 = self._get_substituted_var_name(node, node.args[1], 1)
@@ -2471,7 +2566,9 @@ class TorchBuilder:
         Args:
             output_name: 输出变量名
             input_name: 输入变量名 (float)
-            quant_mode: 量化模式 (0=sym_tensor, 1=asym_tensor, 2=sym_token, 3=asym_token)
+            quant_mode: 量化模式（3-bit 编码）
+                - bit0: 0=symmetric, 1=asymmetric
+                - bit[2:1]: 0b00=per_tensor, 0b01=per_token, 0b10=per_channel
             scale_sign, scale_coe, scale_rshift: scale 参数名
             zero: 零点参数名 (可选，仅 asymmetric 模式)
         
@@ -2492,7 +2589,9 @@ class TorchBuilder:
         Args:
             output_name: 输出变量名
             input_name: 输入变量名 (int)
-            quant_mode: 量化模式 (0=sym_tensor, 1=asym_tensor, 2=sym_token, 3=asym_token)
+            quant_mode: 量化模式（3-bit 编码）
+                - bit0: 0=symmetric, 1=asymmetric
+                - bit[2:1]: 0b00=per_tensor, 0b01=per_token, 0b10=per_channel
             scale_sign, scale_coe, scale_rshift: scale 参数名
             zero: 零点参数名 (可选，仅 asymmetric 模式)
         

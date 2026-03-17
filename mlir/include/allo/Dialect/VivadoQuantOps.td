@@ -665,11 +665,13 @@ def Vivado_QuantOp : Vivado_Op<"quant", []> {
     - Uses packed 32-bit scale instead of separate sign/coe/rshift
     - Adds backend-specific attributes for hardware implementation
     
-    **Quant Mode Encoding (2-bit):**
-    - 0: symmetric, per-tensor
-    - 1: asymmetric, per-tensor
-    - 2: symmetric, per-token
-    - 3: asymmetric, per-token
+    **Quant Mode Encoding (3-bit):**
+    - bit0: asymmetric flag (0=symmetric, 1=asymmetric)
+    - bit[2:1]: granularity
+      - 0b00: per_tensor
+      - 0b01: per_token
+      - 0b10: per_channel
+      - 0b11: reserved
     
     **Lowering Target:**
     Will be lowered to PYNQ CPU-side (PS) operations.
@@ -682,7 +684,7 @@ def Vivado_QuantOp : Vivado_Op<"quant", []> {
     Optional<ZeroType>:$zero,         // Zero point (for asymmetric mode)
     
     // Backend-specific attributes
-    I8Attr:$quant_mode,               // Quantization mode (0-3)
+    I8Attr:$quant_mode,               // Quantization mode (3-bit packed field)
     DefaultValuedAttr<StrAttr, "\"8,24,8,16,16,0\"">:$scale_packing,
     DefaultValuedAttr<StrAttr, "\"Tail\"">:$scale_coe_mode,
     
@@ -720,11 +722,13 @@ def Vivado_DequantOp : Vivado_Op<"dequant", [/*AttrSizedOperandSegments*/]> {
     - Uses packed 32-bit scale instead of separate sign/coe/rshift
     - Adds backend-specific attributes for hardware implementation
     
-    **Quant Mode Encoding (2-bit):**
-    - 0: symmetric, per-tensor
-    - 1: asymmetric, per-tensor
-    - 2: symmetric, per-token
-    - 3: asymmetric, per-token
+    **Quant Mode Encoding (3-bit):**
+    - bit0: asymmetric flag (0=symmetric, 1=asymmetric)
+    - bit[2:1]: granularity
+      - 0b00: per_tensor
+      - 0b01: per_token
+      - 0b10: per_channel
+      - 0b11: reserved
     
     **Lowering Target:**
     Will be lowered to PYNQ CPU-side (PS) operations.
@@ -737,7 +741,7 @@ def Vivado_DequantOp : Vivado_Op<"dequant", [/*AttrSizedOperandSegments*/]> {
     Optional<ZeroType>:$zero,         // Zero point (for asymmetric mode)
     
     // Backend-specific attributes
-    I8Attr:$quant_mode,               // Quantization mode (0-3)
+    I8Attr:$quant_mode,               // Quantization mode (3-bit packed field)
     DefaultValuedAttr<StrAttr, "\"8,24,8,16,16,0\"">:$scale_packing,
     DefaultValuedAttr<StrAttr, "\"Tail\"">:$scale_coe_mode,
     

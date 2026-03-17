@@ -1094,8 +1094,8 @@ class IntLayerNorm(QuantizableModule):
             input_tensor=x_float,
             bitwidth=self.out_act_bit,
             quant_mode=self.act_quant_mode,
-            per_channel=False, 
-            channel_dim=1 if self.input_act_per_token else None, 
+            per_channel=self.input_act_per_token,
+            channel_dim=1 if self.input_act_per_token else None,
             is_weight=False,
         )
 
