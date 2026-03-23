@@ -231,7 +231,7 @@ def PYNQAdjustScaleRShift : Pass<"pynq-adjust-scale-rshift", "ModuleOp"> {
     according to each scale's desired offset.
 
     Adjustment rule:
-    - delta = desired_offset - innate_rshift_bias
+    - delta = -desired_offset # - innate_rshift_bias
 
     The pass unpacks each i32 packed-scale element using the canonical target
     packing/coefficient mode, applies `delta` to `rshift`, then packs values

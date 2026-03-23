@@ -1,12 +1,129 @@
 import allo
 import torch
 import math
+import os
 import numpy as np
 import torch.nn as nn
 import torch.nn.functional as F
 from .quant_utils import *
 from typing import Any
 from ..ops.vit import Add, MatMul, MatMulIsqrtD
+
+# ----- LUT (Lookup Table) Initialization for Vector Operations -----
+
+# Global LUT initialization flag
+_g_lut_initialized = False
+_g_gelu_lut = None
+_g_softmax_ex_lut = None
+_g_softmax_loge_lut = None
+_g_norm_insqrt_lut = None
+_g_gelu_rev_lut = None
+_g_softmax_ex_rev_lut = None
+
+def _double_to_fixed(value: float, m: int, n: int, signed_value: bool = True) -> int:
+    """Convert double to fixed-point representation."""
+    total_bits = (1 if signed_value else 0) + m + n
+    if total_bits <= 0 or total_bits > 31:
+        return 0
+    
+    scale = float(1 << n)
+    fixed = int(value * scale)
+    
+    if signed_value:
+        max_v = (1 << (total_bits - 1)) - 1
+        min_v = -(1 << (total_bits - 1))
+        fixed = max(min_v, min(max_v, fixed))
+    else:
+        max_u = (1 << total_bits) - 1
+        fixed = max(0, min(max_u, fixed))
+    
+    return fixed
+
+def _gelu_func(x: float) -> float:
+    """GELU activation function."""
+    k = 0.7978845608028654  # sqrt(2/pi)
+    return 0.5 * x * (1.0 + math.tanh(k * (x + 0.044715 * x * x * x)))
+
+def _init_vector_luts():
+    """Initialize lookup tables for GELU, Softmax, and LayerNorm operations."""
+    global _g_lut_initialized, _g_gelu_lut, _g_softmax_ex_lut, _g_softmax_loge_lut, _g_norm_insqrt_lut
+    global _g_gelu_rev_lut, _g_softmax_ex_rev_lut
+    
+    if _g_lut_initialized:
+        return
+    
+    LUT_SIZE = 1024
+    
+    # GELU LUT: input range [-4, 4]
+    gelu_step = 8.0 / LUT_SIZE
+    gelu_lut = torch.zeros(LUT_SIZE, dtype=torch.int16)
+    for i in range(LUT_SIZE):
+        x_gelu = -4.0 + gelu_step * i
+        x_gelu = max(-4.0, min(4.0, x_gelu))
+        gelu_lut[i] = _double_to_fixed(_gelu_func(x_gelu), 2, 13, True)
+    
+    # Softmax exp LUT: input range [-8, 0]
+    ex_step = 8.0 / LUT_SIZE
+    ex_lut = torch.zeros(LUT_SIZE, dtype=torch.uint16)
+    for i in range(LUT_SIZE):
+        x_ex = -8.0 + ex_step * i
+        x_ex = max(-8.0, min(0.0, x_ex))
+        ex_lut[i] = _double_to_fixed(math.exp(x_ex), 0, 16, False)
+    
+    # Softmax log LUT: input range [0, 256]
+    loge_step = 256.0 / LUT_SIZE
+    loge_lut = torch.zeros(LUT_SIZE, dtype=torch.int16)
+    for i in range(LUT_SIZE):
+        x_loge = 0.0 + loge_step * i
+        x_loge = max(1.0, min(256.0, x_loge))
+        loge_lut[i] = _double_to_fixed(math.log(x_loge), 3, 12, True)
+    
+    # LayerNorm inverse square root LUT: input range [0, 65536] # [0, 8192]
+    LAYERNORM_MAX = 8192
+    insqrt_step = LAYERNORM_MAX / LUT_SIZE
+    insqrt_lut = torch.zeros(LUT_SIZE, dtype=torch.uint16)
+    for i in range(LUT_SIZE):
+        x_insqrt = 0.0 + insqrt_step * i
+        x_insqrt = max(1.1, min(LAYERNORM_MAX, x_insqrt))
+        insqrt_lut[i] = _double_to_fixed(1.0 / math.sqrt(x_insqrt), 0, 16, False)
+    
+    _g_gelu_lut = gelu_lut
+    _g_softmax_ex_lut = ex_lut
+    _g_softmax_loge_lut = loge_lut
+    _g_norm_insqrt_lut = insqrt_lut
+    _g_softmax_ex_rev_lut = torch.roll(ex_lut, shifts=1, dims=0) # 一开始是torch.roll(ex_lut, shifts=-1, dims=0)，错误
+    _g_gelu_rev_lut = torch.roll(gelu_lut, shifts=LUT_SIZE // 2, dims=0)
+    _g_lut_initialized = True
+
+
+def _clip_i16(x: torch.Tensor) -> torch.Tensor:
+    return torch.clamp(x, min=(-32768 + (1 << 5)), max=32767).to(torch.int32)
+
+
+def _extract_bits_i16(x: torch.Tensor, lsb: int, length: int) -> torch.Tensor:
+    mask = (1 << length) - 1
+    return ((x.to(torch.int32) & 0xFFFF) >> lsb) & mask
+
+def _safe_scale_div(x: torch.Tensor, scale: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    return x / torch.clamp(scale, min=eps)
+
+def _lookup_with_interp(lut: torch.Tensor, x: float, x_min: float, x_max: float) -> float:
+    """Linear interpolation lookup in LUT."""
+    LUT_SIZE = lut.shape[0]
+    x = max(x_min, min(x_max, x))
+    
+    # Normalize to [0, 1]
+    normalized = (x - x_min) / (x_max - x_min)
+    # Map to LUT index
+    idx_float = normalized * (LUT_SIZE - 1)
+    idx_lo = int(math.floor(idx_float))
+    idx_hi = min(idx_lo + 1, LUT_SIZE - 1)
+    
+    frac = idx_float - idx_lo
+    val_lo = float(lut[idx_lo])
+    val_hi = float(lut[idx_hi])
+    
+    return val_lo + frac * (val_hi - val_lo)
 
 # ----- Abstract Base Class for Quantizable Modules -----
 
@@ -20,6 +137,7 @@ class QuantizableModule(nn.Module):
         super(QuantizableModule, self).__init__()
         self.calibrate_mode = False
         self.fakequant_mode = False
+        self.use_lut_inference = False
 
     def stop_calibrate(self):
         self.calibrate_mode = False
@@ -32,6 +150,12 @@ class QuantizableModule(nn.Module):
 
     def enable_fakequant(self):
         self.fakequant_mode = True
+
+    def enable_lut_inference(self):
+        self.use_lut_inference = True
+
+    def disable_lut_inference(self):
+        self.use_lut_inference = False
 
 # ----- Linear -----
 
@@ -248,6 +372,59 @@ class QLinear(QuantizableModule):
 
         return o_int
     
+    def forward_int_lut(self, x_int):
+        """
+        Integer QLinear with fused scale lookup variant.
+        For linear layers, LUT is less applicable; this uses pseudo-quantized integer arithmetic.
+        Forward path: i8 -> dequantize -> matmul -> quantize -> i8
+        """
+        def _view_1d_param(param: torch.Tensor, ref: torch.Tensor):
+            if param is None:
+                return None
+            if param.numel() == 1:
+                return param
+            if ref.ndim == 3 and param.numel() == ref.shape[1]:
+                return param.view(1, -1, 1)
+            if ref.ndim == 3 and param.numel() == ref.shape[-1]:
+                return param.view(1, 1, -1)
+            if ref.ndim == 2 and param.numel() == ref.shape[0]:
+                return param.view(-1, 1)
+            if ref.ndim == 2 and param.numel() == ref.shape[1]:
+                return param.view(1, -1)
+            return param
+
+        if self.act_quant_mode == "asym" and self.input_zero is not None:
+            x_int = x_int - _view_1d_param(self.input_zero, x_int)
+
+        acc = F.linear(x_int, self.weight_int, None)
+
+        drop_bits = 8
+        acc_drop = torch.floor(acc / (2 ** drop_bits))
+        fused_scale_view = _view_1d_param(self.fused_scale, acc_drop) * (2 ** drop_bits)
+        o_int_lut = torch.round(acc_drop * fused_scale_view)
+        o_int_lut = torch.clamp(o_int_lut, -2 ** (self.act_bit - 1), 2 ** (self.act_bit - 1) - 1)
+
+        if self.bias_int is not None and self.bias_scale is not None:
+            bias_num = (self.bias_int * self.bias_scale).to(torch.float32)
+            if self.output_scale.numel() == 1:
+                bias_q = torch.round(bias_num / self.output_scale).view(1, *([1] * (o_int_lut.ndim - 2)), -1)
+            elif o_int_lut.ndim == 3 and self.output_scale.numel() == o_int_lut.shape[1]:
+                bias_q = torch.round(bias_num.view(1, 1, -1) / self.output_scale.view(1, -1, 1))
+            elif self.output_scale.numel() == self.out_features:
+                bias_q = torch.round(
+                    bias_num.view(1, *([1] * (o_int_lut.ndim - 2)), -1)
+                    / self.output_scale.view(1, *([1] * (o_int_lut.ndim - 2)), -1)
+                )
+            else:
+                bias_q = torch.round(bias_num / self.output_scale)
+            o_int_lut = o_int_lut + bias_q
+            o_int_lut = torch.clamp(o_int_lut, -2 ** (self.act_bit - 1), 2 ** (self.act_bit - 1) - 1)
+
+        if self.act_quant_mode == "asym" and self.output_zero is not None:
+            o_int_lut = o_int_lut + _view_1d_param(self.output_zero, o_int_lut)
+
+        return o_int_lut
+    
     def forward_float(self, x_float):
         # w_float = self.weight_int * self.weight_scale.view(-1, 1)
         # b_float = self.bias_int * self.bias_scale
@@ -281,7 +458,7 @@ class QLinear(QuantizableModule):
                 -2 ** (self.act_bit - 1),
                 2 ** (self.act_bit - 1) - 1,
             )
-            y_int = self.forward_int(x_int=x_int)
+            y_int = self.forward_int_lut(x_int=x_int) if self.use_lut_inference else self.forward_int(x_int=x_int)
             out_scale = _view_1d_param(self.output_scale, y_int)
             return y_int * out_scale
         else:
@@ -506,11 +683,20 @@ class QConv2d(QuantizableModule):
 
         return o_int
     
+    def forward_int_lut(self, x_int):
+        """
+        Integer QConv2d with pseudo-quantized arithmetic.
+        Forward path: i8 -> dequantize -> conv -> quantize -> i8
+        """
+        return self.forward_int(x_int)
+    
     def forward(self, x_float):
         if self.calibrate_mode:
             return self.calibrate(x_float)
         elif self.fakequant_mode:
-            return self.forward_int(x_int=torch.clamp(torch.round(x_float / self.input_scale), -2**(self.act_bit-1), 2**(self.act_bit-1)-1)) * self.output_scale[:, None, None]
+            x_int = torch.clamp(torch.round(x_float / self.input_scale), -2**(self.act_bit-1), 2**(self.act_bit-1)-1)
+            y_int = self.forward_int_lut(x_int=x_int) if self.use_lut_inference else self.forward_int(x_int=x_int)
+            return y_int * self.output_scale[:, None, None]
         else:
             return self.forward_float(x_float)
 
@@ -580,10 +766,27 @@ class QFFN(QuantizableModule):
         self.fc1.enable_fakequant()
         self.fc2.enable_fakequant()
 
+    def enable_lut_inference(self):
+        self.fc1.enable_lut_inference()
+        self.activation.enable_lut_inference()
+        self.fc2.enable_lut_inference()
+
+    def disable_lut_inference(self):
+        self.fc1.disable_lut_inference()
+        self.activation.disable_lut_inference()
+        self.fc2.disable_lut_inference()
+
     def forward_int(self, x_int):
         x_int = self.fc1.forward_int(x_int)
         x_int = self.activation.forward_int(x_int)
         x_int = self.fc2.forward_int(x_int)
+        return x_int
+    
+    def forward_int_lut(self, x_int):
+        """Integer FFN with LUT-based activation."""
+        x_int = self.fc1.forward_int_lut(x_int)
+        x_int = self.activation.forward_int_lut(x_int)
+        x_int = self.fc2.forward_int_lut(x_int)
         return x_int
 
     def forward(self, x):
@@ -755,12 +958,51 @@ class IntGELU(QuantizableModule):
             y_int = y_int + self.output_zero
 
         return y_int
+    
+    def forward_int_lut(self, x_int):
+        """
+        Integer GELU using LUT (Lookup Table).
+        Forward path: i8 -> dequantize -> fixed-point -> lookup -> quantize -> i8
+        """
+        _init_vector_luts()
+        
+        if self.act_quant_mode == "asym":
+            x_int = x_int - self.input_zero
+
+        x_float = x_int.float() * self.input_scale[None, :, None]
+
+        # LUT only applies to [-4, 4]; outside this range use piecewise behavior:
+        # x < -4 -> 0, x > 4 -> x
+        x_fix_q13 = torch.round(torch.clamp(x_float, -4.0, 4.0) * (2 ** 13)).to(torch.int32)
+        x_fix_q13 = _clip_i16(x_fix_q13)
+
+        idx = _extract_bits_i16(x_fix_q13, 6, 10).long()
+        gelu_fix_q13 = _g_gelu_rev_lut[idx].to(torch.int32)
+
+        gelu_lut_float = gelu_fix_q13.float() / (2 ** 13)
+        gelu_float = gelu_lut_float
+        # optional: not saturate
+        # gelu_float = torch.where(
+        #     x_float < -4.0,
+        #     torch.zeros_like(x_float),
+        #     torch.where(x_float > 4.0, x_float, gelu_lut_float),
+        # )
+
+        y_int_lut = torch.round(_safe_scale_div(gelu_float, self.output_scale[None, :, None]))
+        y_int_lut = torch.clamp(y_int_lut, -2**(self.act_bit-1), 2**(self.act_bit-1)-1)
+        
+        if self.act_quant_mode == "asym":
+            y_int_lut = y_int_lut + self.output_zero
+
+        return y_int_lut
 
     def forward(self, x_float):
         if self.calibrate_mode:
             return self.calibrate(x_float)
         elif self.fakequant_mode:
-            return self.forward_int(x_int=torch.clamp(torch.round(x_float / self.input_scale[None, :, None]), -2**(self.act_bit-1), 2**(self.act_bit-1)-1)) * self.output_scale[None, :, None]
+            x_int = torch.clamp(torch.round(x_float / self.input_scale[None, :, None]), -2**(self.act_bit-1), 2**(self.act_bit-1)-1)
+            y_int = self.forward_int_lut(x_int=x_int) if self.use_lut_inference else self.forward_int(x_int=x_int)
+            return y_int * self.output_scale[None, :, None]
         else:
             return self.forward_float(x_float)
     
@@ -898,7 +1140,7 @@ class IntSoftmax(QuantizableModule):
         elif self.act_quant_mode == "asym":
             self.input_zero.data = x_zero
             self.output_zero.data = y_zero
-            self.qact.output_zero.data = y_zero
+            # self.qact.output_zero.data = y_zero
 
         return y
 
@@ -934,12 +1176,56 @@ class IntSoftmax(QuantizableModule):
         
         return softmax_int
 
+    def forward_int_lut(self, x_int):
+        """
+        Integer Softmax using LUT.
+        Forward path: i8 -> dequantize -> exp_lut -> sum -> softmax -> quantize -> i8
+        """
+        _init_vector_luts()
+        
+        if self.act_quant_mode == "asym":
+            x_int = x_int - self.input_zero
+
+        x_int = x_int - torch.max(x_int, dim=self.dim, keepdim=True)[0] # 127 # torch.max(x_int, dim=self.dim, keepdim=True)[0]
+
+        # i8 -> dequant(float) -> fixed(3,12)
+        x_float = x_int.float() * self.input_scale[None, None, :, None]
+        x_fix_q12 = torch.round(x_float * (2 ** 12)).to(torch.int32)
+        x_fix_q12 = _clip_i16(x_fix_q12)
+
+        # driver_sim stage1: idx1=bits[14:5], ex_sum
+        idx1 = _extract_bits_i16(x_fix_q12, 5, 10).long()
+        ex_rev_lut_i32 = _g_softmax_ex_rev_lut.to(torch.int32)
+        ex_val = ex_rev_lut_i32[idx1]  # Q0.16
+        ex_sum = torch.sum(ex_val, dim=self.dim, keepdim=True)
+
+        # driver_sim / softmax_quant.py: loge_idx = ex_sum >> (16 + 8 - 10)
+        loge_idx = torch.clamp((ex_sum >> 14).to(torch.long), 0, len(_g_softmax_loge_lut) - 1)
+        loge_val = _g_softmax_loge_lut[loge_idx].to(torch.int32)  # Q3.12
+
+        # driver_sim stage2: idx2 from (x - loge)
+        minus_loge = _clip_i16(x_fix_q12 - loge_val)
+        idx2 = _extract_bits_i16(minus_loge, 5, 10).long()
+        out_fix_q16 = ex_rev_lut_i32[idx2]  # Q0.16
+
+        # fixed -> float -> i8
+        out_float = out_fix_q16.float() / (2 ** 16)
+        softmax_int_lut = torch.round(_safe_scale_div(out_float, self.output_scale[None, None, :, None]))
+        softmax_int_lut = torch.clamp(softmax_int_lut, -2**(self.out_act_bit-1), 2**(self.out_act_bit-1)-1)
+        
+        if self.act_quant_mode == "asym":
+            softmax_int_lut = softmax_int_lut + self.output_zero
+        
+        return softmax_int_lut
+
     def forward(self, x_float):
         if self.calibrate_mode:
             return self.calibrate(x_float)
         elif self.fakequant_mode:
             self.debug_count += 1
-            tmp = self.forward_int(x_int=torch.clamp(torch.round(x_float / self.input_scale[None, None, :, None]), -2**(self.in_act_bit-1), 2**(self.in_act_bit-1)-1)) * self.output_scale[None, None, :, None]
+            x_int = torch.clamp(torch.round(x_float / self.input_scale[None, None, :, None]), -2**(self.in_act_bit-1), 2**(self.in_act_bit-1)-1)
+            y_int = self.forward_int_lut(x_int=x_int) if self.use_lut_inference else self.forward_int(x_int=x_int)
+            tmp = y_int * self.output_scale[None, None, :, None]
             if self.debug_count == 1:
                 print("Debug Info of IntSoftmax:")
                 print("Input Scale:", self.input_scale)
@@ -1092,7 +1378,7 @@ class IntLayerNorm(QuantizableModule):
 
         x_scale, x_zero = max_min_quantize_params(
             input_tensor=x_float,
-            bitwidth=self.out_act_bit,
+            bitwidth=self.in_act_bit,
             quant_mode=self.act_quant_mode,
             per_channel=self.input_act_per_token,
             channel_dim=1 if self.input_act_per_token else None,
@@ -1195,6 +1481,74 @@ class IntLayerNorm(QuantizableModule):
 
         return y_int
     
+    def forward_int_lut(self, x_int):
+        """
+        Integer LayerNorm using LUT.
+        Forward path: i8 -> dequantize -> normalize -> insqrt_lut -> quantize -> i8
+        """
+        _init_vector_luts()
+        
+        if self.act_quant_mode == "asym":
+            x_int = x_int - self.input_zero
+
+        x_i32 = x_int.to(torch.int32)
+        rows = x_i32.shape[-1]
+        inv_rows_q16 = int(2 ** 16 // rows)
+
+        if self.int_cal_mode == "Vivado-PYNQ":
+            sum_i64 = torch.sum(x_i32.to(torch.int64), dim=-1, keepdim=True)
+            sumsq_i64 = torch.sum((x_i32.to(torch.int64) * x_i32.to(torch.int64)), dim=-1, keepdim=True)
+
+            mean_i64 = torch.bitwise_right_shift(sum_i64 * inv_rows_q16, 16)
+            mean_square_i64 = torch.bitwise_right_shift(sumsq_i64 * inv_rows_q16, 16)
+            sq_mean_i64 = mean_i64 * mean_i64
+            var_i64 = torch.clamp(mean_square_i64 - sq_mean_i64, min=0)
+
+            centered_i32 = x_i32 - mean_i64.to(torch.int32)
+            idx = torch.clamp(
+                torch.bitwise_right_shift(var_i64, 3),
+                min=0,
+                max=len(_g_norm_insqrt_lut) - 1,
+            ).to(torch.long)
+            insqrt_q16 = _g_norm_insqrt_lut.to(torch.int32)[idx]
+            y_q16 = centered_i32.to(torch.int64) * insqrt_q16.to(torch.int64)
+
+            y_int_like = y_q16.to(torch.float32)
+            if self.bias_int is not None:
+                y_int_like = y_int_like + self.bias_int
+        else:
+            raise NotImplementedError("unsupported int_cal_mode for LUT inference: {}".format(self.int_cal_mode))
+            # mean_i64 = torch.round(x_i32.to(torch.float32).mean(dim=-1, keepdim=True)).to(torch.int64)
+            # centered_i32 = x_i32 - mean_i64.to(torch.int32)
+
+            # # Keep I-ViT statistics compatible with forward_int: var = sum((x-mean)^2)
+            # var_i64 = torch.sum(
+            #     centered_i32.to(torch.int64) * centered_i32.to(torch.int64),
+            #     dim=-1,
+            #     keepdim=True,
+            # )
+            # idx = torch.clamp(torch.bitwise_right_shift(var_i64, 6), min=0, max=len(_g_norm_insqrt_lut) - 1).to(torch.long)
+            # insqrt_q16 = _g_norm_insqrt_lut.to(torch.int32)[idx]
+            # y_q16 = centered_i32.to(torch.int64) * insqrt_q16.to(torch.int64)
+
+            # # Q16 -> Q30, matching 2^30/std style factor in I-ViT branch.
+            # y_q30 = torch.bitwise_left_shift(y_q16, 14)
+            # y_int_like = y_q30.to(torch.float32)
+            # if self.bias_int is not None:
+            #     y_int_like = y_int_like + self.bias_int
+
+        out_scale = self.fused_scale[None, None, :]
+        if self.int_cal_mode == "Vivado-PYNQ":
+            out_scale = out_scale / (2 ** 16)
+
+        y_int_lut = torch.round(y_int_like * out_scale)
+        y_int_lut = torch.clamp(y_int_lut, -2**(self.out_act_bit-1), 2**(self.out_act_bit-1)-1)
+        
+        if self.act_quant_mode == "asym":
+            y_int_lut = y_int_lut + self.output_zero
+        
+        return y_int_lut
+    
     def forward_float(self, x_float):
         return F.layer_norm(
             input=x_float, 
@@ -1208,7 +1562,9 @@ class IntLayerNorm(QuantizableModule):
         if self.calibrate_mode:
             return self.calibrate(x_float)
         elif self.fakequant_mode:
-            return self.forward_int(x_int=torch.clamp(torch.round(x_float / self.input_scale[None, None, :]), -2**(self.in_act_bit-1), 2**(self.in_act_bit-1)-1)) * self.output_scale[None, None, :]
+            x_int = torch.clamp(torch.round(x_float / self.input_scale[None, :, None]), -2**(self.in_act_bit-1), 2**(self.in_act_bit-1)-1)
+            y_int = self.forward_int_lut(x_int=x_int) if self.use_lut_inference else self.forward_int(x_int=x_int)
+            return y_int * self.output_scale[None, None, :]
         else:
             return self.forward_float(x_float)
     
@@ -1410,6 +1766,13 @@ class QAdd(QuantizableModule):
             o_int = o_int + self.o_zero
 
         return o_int
+    
+    def forward_int_lut(self, x_int, y_int):
+        """
+        Integer QAdd with pseudo-quantized arithmetic.
+        Forward path: i8 + i8 -> dequantize -> add -> quantize -> i8
+        """
+        return self.forward_int(x_int, y_int)
 
     def forward_float(self, x_float, y_float):
         return x_float + y_float
@@ -1421,7 +1784,10 @@ class QAdd(QuantizableModule):
             # TODO: think of add the zero of asym quant here, the others are the same!!!
             # TODO: think of add the zero of asym quant here
             # TODO: think of add the zero of asym quant here
-            return self.forward_int(x_int=torch.clamp(torch.round(x_float / self.x_scale[None, :, None]), -2**(self.act_bit-1), 2**(self.act_bit-1)-1), y_int=torch.clamp(torch.round(y_float / self.y_scale[None, :, None]), -2**(self.act_bit-1), 2**(self.act_bit-1)-1)) * self.o_scale[None, :, None]
+            x_int = torch.clamp(torch.round(x_float / self.x_scale[None, :, None]), -2**(self.act_bit-1), 2**(self.act_bit-1)-1)
+            y_int = torch.clamp(torch.round(y_float / self.y_scale[None, :, None]), -2**(self.act_bit-1), 2**(self.act_bit-1)-1)
+            o_int = self.forward_int_lut(x_int=x_int, y_int=y_int) if self.use_lut_inference else self.forward_int(x_int=x_int, y_int=y_int)
+            return o_int * self.o_scale[None, :, None]
         else:
             return self.forward_float(x_float, y_float)
 
@@ -1537,6 +1903,27 @@ class QMatMul(QuantizableModule):
             o_int = o_int + self.o_zero
 
         return o_int
+    
+    def forward_int_lut(self, x_int, y_int):
+        """
+        Integer QMatMul with pseudo-quantized arithmetic.
+        Forward path: i8 @ i8 -> dequantize -> matmul -> quantize -> i8
+        """
+        if self.act_quant_mode == "asym":
+            x_int = x_int - self.x_zero
+            y_int = y_int - self.y_zero
+
+        acc = x_int @ y_int
+        drop_bits = 8
+        acc_drop = torch.bitwise_right_shift(acc.to(torch.int64), drop_bits).to(torch.float32)
+        fused = self.fused_scale[None, None, :, None] * (2 ** drop_bits)
+        o_int_lut = torch.round(acc_drop * fused)
+        o_int_lut = torch.clamp(o_int_lut, -2**(self.act_bit-1), 2**(self.act_bit-1)-1)
+
+        if self.act_quant_mode == "asym":
+            o_int_lut = o_int_lut + self.o_zero
+
+        return o_int_lut
 
     def forward_float(self, x_float, y_float):
         return torch.matmul(x_float, y_float)
@@ -1545,7 +1932,10 @@ class QMatMul(QuantizableModule):
         if self.calibrate_mode:
             return self.calibrate(x_float, y_float)
         elif self.fakequant_mode:
-            return self.forward_int(x_int=torch.clamp(torch.round(x_float / self.x_scale[None, None, :, None]), -2**(self.act_bit-1), 2**(self.act_bit-1)-1), y_int=torch.clamp(torch.round(y_float / self.y_scale), -2**(self.act_bit-1), 2**(self.act_bit-1)-1)) * self.o_scale[None, None, :, None]
+            x_int = torch.clamp(torch.round(x_float / self.x_scale[None, None, :, None]), -2**(self.act_bit-1), 2**(self.act_bit-1)-1)
+            y_int = torch.clamp(torch.round(y_float / self.y_scale), -2**(self.act_bit-1), 2**(self.act_bit-1)-1)
+            o_int = self.forward_int_lut(x_int=x_int, y_int=y_int) if self.use_lut_inference else self.forward_int(x_int=x_int, y_int=y_int)
+            return o_int * self.o_scale[None, None, :, None]
         else:
             return self.forward_float(x_float, y_float)
 
@@ -1576,6 +1966,49 @@ class QMatMulIsqrtD(QMatMul):
             act_per_token=act_per_token,
         )
         self.sqrt_dim = torch.sqrt(torch.Tensor([dim]))
+    #     self.enable_row_gain_calibration = str(os.getenv("ALLO_QK_ROW_GAIN_CALIB", "1")).lower() not in (
+    #         "0", "false", "off"
+    #     )
+    #     self.row_gain_clip = float(os.getenv("ALLO_QK_ROW_GAIN_CLIP", "0.15"))
+    #     self.row_gain_eps = float(os.getenv("ALLO_QK_ROW_GAIN_EPS", "1e-8"))
+
+    # def _estimate_row_gain_from_lut(self, x1_float, x2_float, y_float_ref):
+    #     # Only apply to qk-like 4D path with per-token fused scales.
+    #     if x1_float.ndim != 4 or x2_float.ndim != 4:
+    #         return None
+    #     if self.fused_scale.numel() <= 1:
+    #         return None
+
+    #     # Quantize using calibrated scales (same formula as forward fakequant path).
+    #     x_int = torch.clamp(
+    #         torch.round(x1_float / self.x_scale[None, None, :, None]),
+    #         -2 ** (self.act_bit - 1),
+    #         2 ** (self.act_bit - 1) - 1,
+    #     )
+    #     y_int = torch.clamp(
+    #         torch.round(x2_float / self.y_scale),
+    #         -2 ** (self.act_bit - 1),
+    #         2 ** (self.act_bit - 1) - 1,
+    #     )
+
+    #     # Match current LUT integer path (drop_bits=8) to estimate deploy-time bias.
+    #     acc = x_int @ y_int
+    #     drop_bits = 8
+    #     acc_drop = torch.bitwise_right_shift(acc.to(torch.int64), drop_bits).to(torch.float32)
+    #     fused = self.fused_scale[None, None, :, None] * (2 ** drop_bits)
+    #     o_int_lut = torch.round(acc_drop * fused)
+    #     o_int_lut = torch.clamp(o_int_lut, -2 ** (self.act_bit - 1), 2 ** (self.act_bit - 1) - 1)
+
+    #     y_lut = o_int_lut * self.o_scale[None, None, :, None]
+
+    #     # Per-token least-squares slope: alpha_t = <y_ref, y_lut> / <y_lut, y_lut>
+    #     num = torch.sum(y_float_ref * y_lut, dim=(0, 1, 3))
+    #     den = torch.sum(y_lut * y_lut, dim=(0, 1, 3)) + self.row_gain_eps
+    #     alpha = num / den
+
+    #     clip = max(0.0, float(self.row_gain_clip))
+    #     alpha = torch.clamp(alpha, 1.0 - clip, 1.0 + clip)
+    #     return alpha
 
     def forward_float(self, x_float, y_float):
         return super().forward_float(x_float, y_float) / self.sqrt_dim
@@ -1583,15 +2016,31 @@ class QMatMulIsqrtD(QMatMul):
     def calibrate(self, x1_float, x2_float):
         # Keep QMatMul generic: fuse sqrt(dim) only for this variant.
         y = super().calibrate(x1_float, x2_float)
+
         # fused_scale == x_scale * y_scale / o_scale, and for ISqrtD we need an
         # extra 1/sqrt(dim) so that dequant restores (x@y)/sqrt(dim).
         self.fused_scale.data = self.fused_scale / self.sqrt_dim
+
+        # print(self.o_scale)
+
+        # if self.enable_row_gain_calibration and self.act_quant_mode == "sym":
+        #     alpha = self._estimate_row_gain_from_lut(x1_float, x2_float, y)
+        #     if alpha is not None:
+        #         self.fused_scale.data = self.fused_scale * alpha
+
         return y
     
     def forward_int(self, x_int, y_int):
         # NOTICE: Here we fuse the sqrt_dim into output_scale and cofused_scalee
         # But this request you to get the correct fused_scale and scale first
         return super().forward_int(x_int, y_int)
+    
+    def forward_int_lut(self, x_int, y_int):
+        """
+        Integer QMatMulIsqrtD with division by sqrt(dim).
+        Forward path: i8 @ i8 / sqrt(dim) -> quantized scaling
+        """
+        return super().forward_int_lut(x_int, y_int)
     
     def copy_from(self, matmul):
         self.sqrt_dim = matmul.sqrt_dim

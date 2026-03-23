@@ -114,6 +114,45 @@ def from_pytorch_vivado(
     if hidden_dim is not None:
         global_vars.update({"__allo_hidden_dim__": int(hidden_dim)})
 
+    # Propagate sequence length through the compilation pipeline to MLIR as
+    # a module attribute (allo.seqlen).
+    # Prefer reading explicit attributes from modules; then infer from shapes.
+    seqlen = None
+
+    # 1) Explicit sequence-length attributes on modules (if present).
+    for _, m in modules_dict.items():
+        if hasattr(m, "seq_len") and m.seq_len is not None:
+            try:
+                seqlen = int(m.seq_len)
+                if seqlen > 0:
+                    break
+            except Exception:
+                pass
+        if hasattr(m, "seqlen") and m.seqlen is not None:
+            try:
+                seqlen = int(m.seqlen)
+                if seqlen > 0:
+                    break
+            except Exception:
+                pass
+
+    # 2) Fallback from example input shapes.
+    #    For (B, L, D), use L; for (L, D), use L.
+    if seqlen is None and example_inputs is not None and len(example_inputs) > 0:
+        first_inp = example_inputs[0]
+        if hasattr(first_inp, "shape") and first_inp.shape is not None:
+            shp = tuple(first_inp.shape)
+            try:
+                if len(shp) >= 3:
+                    seqlen = int(shp[-2])
+                elif len(shp) == 2:
+                    seqlen = int(shp[0])
+            except Exception:
+                seqlen = None
+
+    if seqlen is not None and seqlen > 0:
+        global_vars.update({"__allo_seqlen__": int(seqlen)})
+
     for name, param in gm.named_parameters():
         new_name = "g_" + name.replace(".", "_")
         global_vars.update({new_name: param.detach().numpy()})

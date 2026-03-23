@@ -362,10 +362,16 @@ def get_vit_optimized_config() -> QuantConfig:
     
     # Linear layers: per-channel weights
     config.set_layer_type_config(nn.Linear, wgt_per_channel=False, act_per_token=True)
-    config.set_layer_name_config("attention.linear_q", wgt_per_channel=False, input_act_per_token=False, output_act_per_token=True)
-    config.set_layer_name_config("ffn.fc1", wgt_per_channel=False, input_act_per_token=False, output_act_per_token=True)
-    config.set_layer_name_config("attention.linear_k", wgt_per_channel=False, input_act_per_token=False, output_act_per_token=False)
-    config.set_layer_name_config("attention.linear_v", wgt_per_channel=False, input_act_per_token=False, output_act_per_token=False)
+    # config.set_layer_name_config("attention.linear_q", wgt_per_channel=False, input_act_per_token=False, output_act_per_token=True)
+    # config.set_layer_name_config("ffn.fc1", wgt_per_channel=False, input_act_per_token=False, output_act_per_token=True)
+    # config.set_layer_name_config("attention.linear_k", wgt_per_channel=False, input_act_per_token=False, output_act_per_token=False)
+    # config.set_layer_name_config("attention.linear_v", wgt_per_channel=False, input_act_per_token=False, output_act_per_token=False)
+    # config.set_layer_name_config("classifier.dense", wgt_per_channel=False, input_act_per_token=False, output_act_per_token=False)
+    # more flexible without parent module limitation
+    config.set_layer_name_config("linear_q", wgt_per_channel=False, input_act_per_token=False, output_act_per_token=True)
+    config.set_layer_name_config("fc1", wgt_per_channel=False, input_act_per_token=False, output_act_per_token=True)
+    config.set_layer_name_config("linear_k", wgt_per_channel=False, input_act_per_token=False, output_act_per_token=False)
+    config.set_layer_name_config("linear_v", wgt_per_channel=False, input_act_per_token=False, output_act_per_token=False)
     config.set_layer_name_config("classifier.dense", wgt_per_channel=False, input_act_per_token=False, output_act_per_token=False)
     
     # Conv2d: per-channel weights
@@ -640,6 +646,16 @@ class Calibrator:
         """Disable fake quantization mode for all quantizable modules."""
         for name, module in self._get_quantizable_modules():
             module.disable_fakequant()
+
+    def enable_lut_inference(self):
+        """Enable LUT inference mode for all quantizable modules."""
+        for name, module in self._get_quantizable_modules():
+            module.enable_lut_inference()
+
+    def disable_lut_inference(self):
+        """Disable LUT inference mode for all quantizable modules."""
+        for name, module in self._get_quantizable_modules():
+            module.disable_lut_inference()
     
     def get_quant_params(self) -> Dict[str, Dict[str, Any]]:
         """

@@ -156,7 +156,9 @@ static LogicalResult adjustGlobalRshift(memref::GlobalOp globalOp,
 
   for (uint32_t val : denseAttr.getValues<uint32_t>()) {
     UnpackedScale unpacked = unpackScale(val, targetConfig);
-    unpacked.rshift = static_cast<int16_t>(unpacked.rshift + delta);
+    if (!(unpacked.coe == 0 && unpacked.rshift == 0 && unpacked.sign == 1)) { // don't adjust pure zero scale
+      unpacked.rshift = static_cast<int16_t>(unpacked.rshift + delta);
+    }
     adjusted.push_back(packScale(unpacked, targetConfig));
   }
 

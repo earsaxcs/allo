@@ -10,6 +10,9 @@ For deprecated manual calibration methods, see vit_int8_legacy.py
 import allo
 import torch
 import torch.nn as nn
+import numpy as np
+import os
+from datetime import datetime
 
 # Use allo.ops.vit structures to ensure compatibility
 from allo.ops.vit import (
@@ -80,6 +83,38 @@ class SingleInputModule(nn.Module):
     def forward(self, x):
         return self.mod(x)
 
+
+class FirstLayerNormLinearModule(nn.Module):
+    def __init__(self, n_embd: int):
+        super().__init__()
+        self.norm = nn.LayerNorm(n_embd)
+        self.linear_q = nn.Linear(n_embd, n_embd)
+
+    def forward(self, x):
+        return self.linear_q(self.norm(x))
+
+
+class FirstLayerNormQKMatMulModule(nn.Module):
+    def __init__(self, n_embd: int, n_head: int):
+        super().__init__()
+        self.norm = nn.LayerNorm(n_embd)
+        self.linear_q = nn.Linear(n_embd, n_embd)
+        self.linear_k = nn.Linear(n_embd, n_embd)
+        self.n_head = n_head
+        self.head_dim = n_embd // n_head
+        self.matmul = MatMulIsqrtD(self.head_dim)
+
+    def forward(self, x):
+        x = self.norm(x)
+        q = self.linear_q(x)
+        k = self.linear_k(x)
+
+        bsz, seq_len, _ = q.shape
+        q = q.reshape(bsz, seq_len, self.n_head, self.head_dim).transpose(1, 2)
+        k = k.reshape(bsz, seq_len, self.n_head, self.head_dim).transpose(1, 2)
+        k_t = k.transpose(-1, -2)
+        return self.matmul(q, k_t)
+
 def load_vit_block_from_hf(blk: ViTBlock, hf_vit, layer_idx: int = 0) -> ViTBlock:
     """Load the weights of a HuggingFace ViT encoder block into a ViTBlock."""
     layer = hf_vit.vit.encoder.layer[layer_idx]
@@ -104,6 +139,147 @@ def load_vit_block_from_hf(blk: ViTBlock, hf_vit, layer_idx: int = 0) -> ViTBloc
     return blk
 
 
+def compare_tensors_with_plot(
+    golden, 
+    ref, 
+    name: str = "Tensor Comparison",
+    tolerance_rtol: float = 1e-5, 
+    tolerance_atol: float = 1e-6,
+    enable_plot: bool = True,
+    plot_filename: str = "tensor_comparison.png"
+):
+    """
+    Compare two tensors and optionally generate visualization plots.
+    
+    Mimics the behavior of utils.compare_binary_files but works with torch tensors directly.
+    Creates 4 subplots: data overlay, absolute difference, first 100 points detail, and scatter plot.
+    
+    Args:
+        golden: Reference/golden output tensor
+        ref: Test/quantized output tensor
+        name: Name of the comparison (for display)
+        tolerance_rtol: Relative tolerance for matching
+        tolerance_atol: Absolute tolerance for matching
+        enable_plot: Whether to generate visualization plot
+        plot_filename: Name of the output plot file
+    
+    Returns:
+        dict: Contains keys 'matched', 'mean_diff', 'max_diff', 'max_rel_diff'
+    """
+    # Convert to numpy for computation
+    if isinstance(golden, torch.Tensor):
+        golden = golden.detach().cpu().numpy()
+    if isinstance(ref, torch.Tensor):
+        ref = ref.detach().cpu().numpy()
+    
+    # Flatten for analysis
+    golden_flat = golden.flatten()
+    ref_flat = ref.flatten()
+    
+    if len(golden_flat) != len(ref_flat):
+        print(f"Error: Size mismatch - {golden_flat.shape} vs {ref_flat.shape}")
+        return {'matched': False, 'error': 'Size mismatch'}
+    
+    # Compute statistics
+    diff = np.abs(golden_flat - ref_flat)
+    max_diff = np.max(diff)
+    mean_diff = np.mean(diff)
+    max_rel_diff = np.max(diff / (np.abs(ref_flat) + 1e-8))
+    
+    # Print statistics
+    print("\n" + "=" * 80)
+    print(f"{name} - Tensor Comparison")
+    print("=" * 80)
+    print(f"Golden shape:  {golden.shape}")
+    print(f"Ref shape:     {ref.shape}")
+    print(f"Golden stats:  mean={golden_flat.mean():.6f}, std={golden_flat.std():.6f}")
+    print(f"               min={golden_flat.min():.6f}, max={golden_flat.max():.6f}")
+    print(f"Ref stats:     mean={ref_flat.mean():.6f}, std={ref_flat.std():.6f}")
+    print(f"               min={ref_flat.min():.6f}, max={ref_flat.max():.6f}")
+    
+    print(f"\n{'='*80}")
+    print(f"差异统计 (Error Statistics)")
+    print(f"{'='*80}")
+    print(f"  绝对差异 - mean: {mean_diff:.6f}, max: {max_diff:.6f}")
+    print(f"  相对差异 - max: {max_rel_diff:.6f}")
+    
+    # Generate visualization if requested
+    if enable_plot:
+        try:
+            import matplotlib.pyplot as plt
+            
+            # Create figure with 2x2 subplots
+            fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+            
+            # 1. Full data comparison (sampled)
+            indices = np.arange(len(golden_flat))
+            sample_step = max(1, len(golden_flat) // 1000)  # At most 1000 points
+            sample_indices = indices[::sample_step]
+            
+            axes[0, 0].plot(sample_indices, golden_flat[::sample_step], label='Golden', alpha=0.7, linewidth=0.5)
+            axes[0, 0].plot(sample_indices, ref_flat[::sample_step], label='Ref (Quantized)', alpha=0.7, linewidth=0.5)
+            axes[0, 0].set_xlabel('Index')
+            axes[0, 0].set_ylabel('Value')
+            axes[0, 0].set_title('Full Output Comparison (Sampled)')
+            axes[0, 0].legend()
+            axes[0, 0].grid(True, alpha=0.3)
+            
+            # 2. Absolute difference curve
+            axes[0, 1].plot(sample_indices, diff[::sample_step], color='red', alpha=0.7, linewidth=0.5)
+            axes[0, 1].set_xlabel('Index')
+            axes[0, 1].set_ylabel('Absolute Difference')
+            axes[0, 1].set_title('Absolute Difference (|Golden - Ref|)')
+            axes[0, 1].grid(True, alpha=0.3)
+            
+            # 3. First 100 points detail
+            num_points = min(100, len(golden_flat))
+            axes[1, 0].plot(np.arange(num_points), golden_flat[:num_points], label='Golden', marker='o', markersize=3, alpha=0.7)
+            axes[1, 0].plot(np.arange(num_points), ref_flat[:num_points], label='Ref', marker='s', markersize=3, alpha=0.7)
+            axes[1, 0].set_xlabel('Index')
+            axes[1, 0].set_ylabel('Value')
+            axes[1, 0].set_title('First 100 Points Comparison')
+            axes[1, 0].legend()
+            axes[1, 0].grid(True, alpha=0.3)
+            
+            # 4. Scatter plot: Golden vs Ref
+            axes[1, 1].scatter(golden_flat[::sample_step], ref_flat[::sample_step], alpha=0.5, s=1)
+            axes[1, 1].plot([golden_flat.min(), golden_flat.max()], [golden_flat.min(), golden_flat.max()],
+                           'r--', label='y = x', linewidth=1)
+            axes[1, 1].set_xlabel('Golden')
+            axes[1, 1].set_ylabel('Ref (Quantized)')
+            axes[1, 1].set_title('Scatter Plot: Golden vs Ref')
+            axes[1, 1].legend()
+            axes[1, 1].grid(True, alpha=0.3)
+            
+            plt.tight_layout()
+            
+            # Save plot with timestamp
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            plot_path = f"{plot_filename[:-4]}_{timestamp}.png"
+            plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+            print(f"\n✓ Comparison plot saved to: {plot_path}")
+            plt.close()
+            
+        except ImportError:
+            print("\n⚠ Warning: matplotlib not available, skipping visualization")
+    
+    # Check if tensors match within tolerance
+    matched = np.allclose(golden_flat, ref_flat, rtol=tolerance_rtol, atol=tolerance_atol)
+    if matched:
+        print(f"\n✓ 匹配成功 (Match successful) - rtol={tolerance_rtol}, atol={tolerance_atol}")
+    else:
+        print(f"\n✗ 匹配失败 (Match failed) - rtol={tolerance_rtol}, atol={tolerance_atol}")
+    
+    return {
+        'matched': matched,
+        'mean_diff': mean_diff,
+        'max_diff': max_diff,
+        'max_rel_diff': max_rel_diff,
+        'plot_path': plot_path if enable_plot else None
+    }
+
+
+
 def _run_single_op_quant_test(
     op_name: str,
     module: nn.Module,
@@ -117,6 +293,8 @@ def _run_single_op_quant_test(
     quant_config = get_vit_optimized_config()
     if run_compile:
         set_extra_compile_param_for_config(quant_config)
+    # for frontend validate lut
+    set_extra_compile_param_for_config(quant_config)
 
     qmodule = replace_module_with_quantized(module, config=quant_config)
     calibrator = Calibrator(qmodule, calib_inputs)
@@ -124,6 +302,8 @@ def _run_single_op_quant_test(
 
     if not run_compile:
         calibrator.enable_fakequant()
+        # for frontend validate lut. below is the same
+        calibrator.enable_lut_inference()
         with torch.no_grad():
             if isinstance(test_inputs, (list, tuple)):
                 golden = module(*test_inputs)
@@ -159,6 +339,7 @@ def _run_single_op_quant_test(
             mode='default',
         )
 
+        print("    Compilation completed!")
         return llvm_mod
 
     return None
@@ -199,6 +380,100 @@ def test_first_vit_linear(
         run_compile=run_compile,
         leaf_modules=[QLinear],
         project="pynq_vivado_first_linear.prj",
+    )
+
+
+def test_first_vit_layernorm_linear(
+    model_name: str = "deit-tiny",
+    sample_batch_size: int = 32,
+    test_batch_size: int = 200,
+    run_compile: bool = False,
+):
+    """Test first ViT LayerNorm + Linear chain with HF layer-0 weights."""
+    if model_name not in VIT_CONFIGS:
+        raise ValueError(f"Unknown model: {model_name}. Available: {list(VIT_CONFIGS.keys())}")
+
+    n_embd = VIT_CONFIGS[model_name]["n_embd"]
+    model_path = VIT_CONFIGS[model_name]["model_path"]
+    seq_len = 197
+
+    calib_inputs = torch.randn(sample_batch_size, seq_len, n_embd) * 1.20 + 0.10
+    test_inputs = torch.randn(test_batch_size, seq_len, n_embd) * 1.35 + 0.15
+    module = FirstLayerNormLinearModule(n_embd).eval()
+
+    # Load HF weights for layernorm_before + attention.query in first block.
+    from transformers import ViTForImageClassification
+    hf_vit = ViTForImageClassification.from_pretrained(model_path).eval()
+    first_block = hf_vit.vit.encoder.layer[0]
+
+    module.norm.weight.data = first_block.layernorm_before.weight.data
+    module.norm.bias.data = first_block.layernorm_before.bias.data
+    module.norm.eps = first_block.layernorm_before.eps
+
+    module.linear_q.weight.data = first_block.attention.attention.query.weight.data
+    module.linear_q.bias.data = first_block.attention.attention.query.bias.data
+
+    print("\n" + "=" * 60)
+    print(f"Testing First ViT LayerNorm+Linear ({model_name})")
+    print("=" * 60)
+    return _run_single_op_quant_test(
+        op_name="LayerNorm+Linear",
+        module=module,
+        calib_inputs=calib_inputs,
+        test_inputs=test_inputs,
+        run_compile=run_compile,
+        leaf_modules=[IntLayerNorm, QLinear],
+        project="pynq_vivado_first_layernorm_linear.prj",
+    )
+
+
+###############################################################################
+# NOTE: ln_qk currently not supported for compilation. For it's multi-head output
+###############################################################################
+def test_first_vit_ln_qk_matmul(
+    model_name: str = "deit-tiny",
+    sample_batch_size: int = 32,
+    test_batch_size: int = 200,
+    run_compile: bool = False,
+):
+    """Test first ViT LayerNorm + QLinear + KLinear + QK^T chain with HF layer-0 weights."""
+    if model_name not in VIT_CONFIGS:
+        raise ValueError(f"Unknown model: {model_name}. Available: {list(VIT_CONFIGS.keys())}")
+
+    n_embd = VIT_CONFIGS[model_name]["n_embd"]
+    n_head = VIT_CONFIGS[model_name]["n_head"]
+    model_path = VIT_CONFIGS[model_name]["model_path"]
+    seq_len = 197
+
+    calib_inputs = torch.randn(sample_batch_size, seq_len, n_embd) * 1.20 + 0.10
+    test_inputs = torch.randn(test_batch_size, seq_len, n_embd) * 1.35 + 0.15
+    module = FirstLayerNormQKMatMulModule(n_embd=n_embd, n_head=n_head).eval()
+
+    # Load HF weights for layernorm_before + attention.query/key in first block.
+    from transformers import ViTForImageClassification
+    hf_vit = ViTForImageClassification.from_pretrained(model_path).eval()
+    first_block = hf_vit.vit.encoder.layer[0]
+
+    module.norm.weight.data = first_block.layernorm_before.weight.data
+    module.norm.bias.data = first_block.layernorm_before.bias.data
+    module.norm.eps = first_block.layernorm_before.eps
+
+    module.linear_q.weight.data = first_block.attention.attention.query.weight.data
+    module.linear_q.bias.data = first_block.attention.attention.query.bias.data
+    module.linear_k.weight.data = first_block.attention.attention.key.weight.data
+    module.linear_k.bias.data = first_block.attention.attention.key.bias.data
+
+    print("\n" + "=" * 60)
+    print(f"Testing First ViT LN+QLinear+KLinear+QK^T ({model_name})")
+    print("=" * 60)
+    return _run_single_op_quant_test(
+        op_name="LN+QLinear+KLinear+QK^T",
+        module=module,
+        calib_inputs=calib_inputs,
+        test_inputs=test_inputs,
+        run_compile=run_compile,
+        leaf_modules=[IntLayerNorm, QLinear, QMatMul, QMatMulIsqrtD],
+        project="pynq_vivado_first_ln_qk_matmul.prj",
     )
 
 
@@ -375,6 +650,82 @@ def test_first_vit_add(
         project="pynq_vivado_first_add.prj",
     )
 
+
+def test_first_vit_attention(
+    model_name: str = "deit-tiny",
+    sample_batch_size: int = 32,
+    test_batch_size: int = 200,
+    run_compile: bool = False,
+):
+    """Test first Attention module in ViT block with HF layer-0 weights."""
+    if model_name not in VIT_CONFIGS:
+        raise ValueError(f"Unknown model: {model_name}. Available: {list(VIT_CONFIGS.keys())}")
+
+    n_embd = VIT_CONFIGS[model_name]["n_embd"]
+    n_head = VIT_CONFIGS[model_name]["n_head"]
+    model_path = VIT_CONFIGS[model_name]["model_path"]
+    seq_len = 197
+
+    calib_inputs = torch.randn(sample_batch_size, seq_len, n_embd) * 1.20 + 0.05
+    test_inputs = torch.randn(test_batch_size, seq_len, n_embd) * 1.35 + 0.08
+
+    blk = ViTBlock(n_embd=n_embd, num_heads=n_head, ffn_hidden_dim=n_embd * 4).eval()
+    from transformers import ViTForImageClassification
+    hf_vit = ViTForImageClassification.from_pretrained(model_path).eval()
+    load_vit_block_from_hf(blk, hf_vit, layer_idx=0)
+    module = SingleInputModule(blk.attention).eval()
+
+    print("\n" + "=" * 60)
+    print(f"Testing First ViT Attention ({model_name})")
+    print("=" * 60)
+    return _run_single_op_quant_test(
+        op_name="Attention",
+        module=module,
+        calib_inputs=calib_inputs,
+        test_inputs=test_inputs,
+        run_compile=run_compile,
+        leaf_modules=[QLinear, IntSoftmax, QMatMul, QMatMulIsqrtD],
+        project="pynq_vivado_first_attention.prj",
+    )
+
+
+def test_first_vit_ffn(
+    model_name: str = "deit-tiny",
+    sample_batch_size: int = 32,
+    test_batch_size: int = 200,
+    run_compile: bool = False,
+):
+    """Test first FFN module in ViT block with HF layer-0 weights."""
+    if model_name not in VIT_CONFIGS:
+        raise ValueError(f"Unknown model: {model_name}. Available: {list(VIT_CONFIGS.keys())}")
+
+    n_embd = VIT_CONFIGS[model_name]["n_embd"]
+    n_head = VIT_CONFIGS[model_name]["n_head"]
+    model_path = VIT_CONFIGS[model_name]["model_path"]
+    seq_len = 197
+
+    calib_inputs = torch.randn(sample_batch_size, seq_len, n_embd) * 1.00
+    test_inputs = torch.randn(test_batch_size, seq_len, n_embd) * 1.20
+
+    blk = ViTBlock(n_embd=n_embd, num_heads=n_head, ffn_hidden_dim=n_embd * 4).eval()
+    from transformers import ViTForImageClassification
+    hf_vit = ViTForImageClassification.from_pretrained(model_path).eval()
+    load_vit_block_from_hf(blk, hf_vit, layer_idx=0)
+    module = SingleInputModule(blk.ffn).eval()
+
+    print("\n" + "=" * 60)
+    print(f"Testing First ViT FFN ({model_name})")
+    print("=" * 60)
+    return _run_single_op_quant_test(
+        op_name="FFN",
+        module=module,
+        calib_inputs=calib_inputs,
+        test_inputs=test_inputs,
+        run_compile=run_compile,
+        leaf_modules=[QLinear, IntGELU],
+        project="pynq_vivado_first_ffn.prj",
+    )
+
 # ==============================================================================
 # Test Functions
 # ==============================================================================
@@ -429,6 +780,9 @@ def test_calibrate_vit_block(
         example_inputs = hf_vit.vit.embeddings(example_images)
         test_inputs = hf_vit.vit.embeddings(test_images)
 
+    # save the embedded input for backend test
+    test_inputs[0].numpy().tofile("in_1_197_192_float32.bin")
+
     # Build block and load HF weights
     print("\n[4] Loading first block weights...")
     blk = ViTBlock(n_embd=n_embd, num_heads=n_head, ffn_hidden_dim=n_embd * 4).eval()
@@ -439,6 +793,7 @@ def test_calibrate_vit_block(
     quant_config = get_vit_optimized_config()
     if run_compile:
         set_extra_compile_param_for_config(quant_config)
+    set_extra_compile_param_for_config(quant_config)
     qblk = replace_module_with_quantized(blk, config=quant_config)
 
     # Calibrate with embedding outputs
@@ -448,6 +803,7 @@ def test_calibrate_vit_block(
 
     if not run_compile:
         calibrator.enable_fakequant()
+        calibrator.enable_lut_inference()
         with torch.no_grad():
             golden = blk(test_inputs)
             res_fake = qblk(test_inputs)
@@ -459,6 +815,16 @@ def test_calibrate_vit_block(
         print("Results (float vs fakequant):")
         print(f"    Mean diff: {mean_diff:.6f}")
         print(f"    Max diff: {max_diff:.6f}")
+        # Use the new visualization comparison function
+        compare_result = compare_tensors_with_plot(
+            golden, 
+            res_fake,
+            name="ViT Block (Float vs FakeQuant)",
+            tolerance_rtol=1e-5,
+            tolerance_atol=1e-6,
+            enable_plot=True,
+            plot_filename="vit_block_comparison.png"
+        )
     else:
         # Compile mode
         batch = 1
@@ -545,6 +911,7 @@ def test_calibrate_vit(
     quant_config = get_vit_optimized_config()
     if run_compile:
         set_extra_compile_param_for_config(quant_config)
+    set_extra_compile_param_for_config(quant_config)
     vit = replace_module_with_quantized(vit, config=quant_config)
 
     # Calibrate
@@ -569,6 +936,7 @@ def test_calibrate_vit(
         return llvm_mod
     else:
         calibrator.enable_fakequant()
+        calibrator.enable_lut_inference()
         # Inference mode
         print("\n[6] Running inference test...")
         total = test_batch_size
@@ -661,7 +1029,7 @@ def main():
         "--test-op",
         type=str,
         default=None,
-        choices=["linear", "softmax", "layernorm", "gelu", "matmul", "add"],
+        choices=["linear", "ln_linear", "ln_qk", "softmax", "layernorm", "gelu", "matmul", "add", "attention", "ffn"],
         help="Test first occurrence of a single ViT operator type"
     )
     
@@ -674,6 +1042,20 @@ def main():
     if args.test_op is not None:
         if args.test_op == "linear":
             test_first_vit_linear(
+                model_name=args.model,
+                sample_batch_size=args.sample_batch,
+                test_batch_size=args.test_batch,
+                run_compile=args.compile,
+            )
+        elif args.test_op == "ln_linear":
+            test_first_vit_layernorm_linear(
+                model_name=args.model,
+                sample_batch_size=args.sample_batch,
+                test_batch_size=args.test_batch,
+                run_compile=args.compile,
+            )
+        elif args.test_op == "ln_qk":
+            test_first_vit_ln_qk_matmul(
                 model_name=args.model,
                 sample_batch_size=args.sample_batch,
                 test_batch_size=args.test_batch,
@@ -709,6 +1091,20 @@ def main():
             )
         elif args.test_op == "add":
             test_first_vit_add(
+                model_name=args.model,
+                sample_batch_size=args.sample_batch,
+                test_batch_size=args.test_batch,
+                run_compile=args.compile,
+            )
+        elif args.test_op == "attention":
+            test_first_vit_attention(
+                model_name=args.model,
+                sample_batch_size=args.sample_batch,
+                test_batch_size=args.test_batch,
+                run_compile=args.compile,
+            )
+        elif args.test_op == "ffn":
+            test_first_vit_ffn(
                 model_name=args.model,
                 sample_batch_size=args.sample_batch,
                 test_batch_size=args.test_batch,

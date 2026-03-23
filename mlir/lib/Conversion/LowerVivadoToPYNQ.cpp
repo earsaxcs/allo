@@ -38,6 +38,7 @@
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <string>
 
 using namespace mlir;
@@ -709,6 +710,17 @@ struct VivadoQMatMulToPYNQPattern
       const int64_t K = lhsShape[2]; // Lk (reduce)
       const int64_t M = lhsShape[3]; // Lq (non-reduce)
 
+      // Use module-level sequence length for runtime reduce_k.
+      auto module = op->getParentOfType<ModuleOp>();
+      if (!module)
+        return rewriter.notifyMatchFailure(op, "failed to get parent module for attn.SV");
+      auto seqlenAttr = module->getAttrOfType<IntegerAttr>("allo.seqlen");
+      if (!seqlenAttr)
+        return rewriter.notifyMatchFailure(op, "missing required module attribute 'allo.seqlen' for attn.SV reduce_k");
+      int64_t seqlen = seqlenAttr.getInt();
+      if (seqlen <= 0)
+        return rewriter.notifyMatchFailure(op, "allo.seqlen must be > 0 for attn.SV reduce_k");
+
       // Broadcast scalar/len-1 fused_scale along token (Lq) dimension.
       if (auto bcast = broadcastLen1ScaleTo(fusedScale, M, "qmatmul_attn_SV_fscl",
                                            op, rewriter);
@@ -872,7 +884,8 @@ struct VivadoQMatMulToPYNQPattern
 
       Value inputTileCountVal = createI32Const(static_cast<int32_t>(inputTileCountI64));
       Value weightTileCountVal = createI32Const(static_cast<int32_t>(weightTileCountI64));
-      Value reduceKVal = createI32Const(static_cast<int32_t>(reduceK));
+      // for SV, you should pick the true seqlen for reduceK for its arbitrariness
+      Value reduceKVal = createI32Const(static_cast<int32_t>(seqlen));
       Value headTileAxisVal = createI32Const(1); // per attn.SV rule
       Value enableBiasVal = createI32Const(0);
       Value enableTransposeVal = createI32Const(outIsTransposed ? 1 : 0);
@@ -1559,10 +1572,13 @@ struct VivadoQAddToPYNQPattern
     int64_t M = shape[rank - 2];
     int64_t N = shape[rank - 1];
 
+    // Wrong!:
     // Broadcast scalar/len-1 scales along token dimension.
     // When is_transposed=false, token dim is rank-2; when is_transposed=true,
-    // token dim is rank-1.
-    int64_t tokenLen = outIsTransposed ? N : M;
+    // token dim is rank-1. ×
+    // Correct!:
+    // Always broadcast scales along the last dim! Because hardware vector op is no transpose option, just do it along the last dim
+    int64_t tokenLen = N; // outIsTransposed ? N : M;
     if (auto bcast = broadcastLen1ScaleTo(xScale, tokenLen, "qadd_x_scale", op, rewriter);
         succeeded(bcast)) {
       xScale = *bcast;
@@ -2085,6 +2101,17 @@ struct VivadoIntSoftmaxToPYNQPattern
     int64_t axisLen = shape[rank - 2];
     int64_t M = shape[rank - 1];
 
+    // Use module-level sequence length for runtime reduce_k.
+    auto module = op->getParentOfType<ModuleOp>();
+    if (!module)
+      return rewriter.notifyMatchFailure(op, "failed to get parent module for softmax");
+    auto seqlenAttr = module->getAttrOfType<IntegerAttr>("allo.seqlen");
+    if (!seqlenAttr)
+      return rewriter.notifyMatchFailure(op, "missing required module attribute 'allo.seqlen' for softmax reduce_k");
+    int64_t seqlen = seqlenAttr.getInt();
+    if (seqlen <= 0)
+      return rewriter.notifyMatchFailure(op, "allo.seqlen must be > 0 for softmax reduce_k");
+
     // Broadcast scalar/len-1 scales along token (last dim) in transpose-mode.
     int64_t tokenLen = M;
     if (auto bcast = broadcastLen1ScaleTo(iscl, tokenLen, "softmax_iscl", op, rewriter);
@@ -2109,7 +2136,7 @@ struct VivadoIntSoftmaxToPYNQPattern
       return rewriter.notifyMatchFailure(op, "invalid tileN configuration");
     if (axisLen > tileN)
       return rewriter.notifyMatchFailure(op, "softmax axis exceeds tileN; reduce axis cannot be tiled");
-    if (axisLen > static_cast<int64_t>(pynq::InstrConfig::kMaxReduceK))
+    if (seqlen > static_cast<int64_t>(pynq::InstrConfig::kMaxReduceK))
       return rewriter.notifyMatchFailure(op, "reduce_k out of hardware range [1, 256]");
 
     // We may tile along the last dimension (M), similar to GELU.
@@ -2233,7 +2260,7 @@ struct VivadoIntSoftmaxToPYNQPattern
                            ".m" + std::to_string(mTile));
         Location computeLoc = makeTaggedLoc(tag);
         Value tileCountVal = createI32Const(static_cast<int32_t>(tileCountI64));
-        Value reduceKVal = createI32Const(static_cast<int32_t>(axisLen));
+        Value reduceKVal = createI32Const(static_cast<int32_t>(seqlen));
         rewriter.create<pynq_ops::SoftmaxOp>(
             computeLoc,
             iscl.cast<TypedValue<MemRefType>>(),

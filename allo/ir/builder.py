@@ -1701,6 +1701,12 @@ class ASTTransformer(ASTBuilder):
             module.operation.attributes["allo.hidden_dim"] = IntegerAttr.get(
                 IntegerType.get_signless(32), hidden_dim
             )
+        # Attach sequence length as a module attribute for downstream MLIR passes
+        if "__allo_seqlen__" in ctx.global_vars:
+            seqlen = int(ctx.global_vars["__allo_seqlen__"])
+            module.operation.attributes["allo.seqlen"] = IntegerAttr.get(
+                IntegerType.get_signless(32), seqlen
+            )
         # Attach target path as a module attribute for downstream MLIR passes
         if "__allo_target_path__" in ctx.global_vars:
             target_path = ctx.global_vars["__allo_target_path__"]

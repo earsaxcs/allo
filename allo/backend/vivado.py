@@ -306,6 +306,8 @@ class VivadoModule:
                 f"allo-lower-linalg-to-cstyle-scf,symbol-dce"
                 f")"
             )
+            # NOTE: if you met the problem that there are many collapse or subview ops and there are many data transfer from device to host.
+            # you should use ALLO_PYNQ_SIMPLIFY_HOST_TRANSFERS=1 to run compile! To enable the pynq-simplify-host-transfers pass!
 
             if self.debug_mode:
                 pm.enable_ir_printing(
