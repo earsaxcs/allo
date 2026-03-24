@@ -30,7 +30,7 @@ from typing import Dict, Any, Optional, Type, List, Union
 
 # Import quantization modules
 from .quant_modules import (
-    QLinear, QConv2d, IntGELU, IntSoftmax, IntLayerNorm,
+    QLinear, QConv2d, IntGELU, IntSoftmax, IntSoftmaxWithMask, IntLayerNorm,
     QAdd, QMatMul, QMatMulIsqrtD, QAct, QuantizableModule
 )
 
@@ -41,6 +41,11 @@ except ImportError:
     Add = None
     MatMul = None
     MatMulIsqrtD = None
+
+try:
+    from ..ops.bert import BertMaskedSoftmax
+except ImportError:
+    BertMaskedSoftmax = None
 
 # GLOBAL SETTINGS
 DEFAULT_ACT_BIT = 8
@@ -174,6 +179,8 @@ class QuantConfig:
             self.QUANT_MODULE_MAP[MatMul] = QMatMul
         if MatMulIsqrtD is not None:
             self.QUANT_MODULE_MAP[MatMulIsqrtD] = QMatMulIsqrtD
+        if BertMaskedSoftmax is not None:
+            self.QUANT_MODULE_MAP[BertMaskedSoftmax] = IntSoftmaxWithMask
     
     def set_default_config(self, **kwargs) -> 'QuantConfig':
         """
@@ -373,12 +380,15 @@ def get_vit_optimized_config() -> QuantConfig:
     config.set_layer_name_config("linear_k", wgt_per_channel=False, input_act_per_token=False, output_act_per_token=False)
     config.set_layer_name_config("linear_v", wgt_per_channel=False, input_act_per_token=False, output_act_per_token=False)
     config.set_layer_name_config("classifier.dense", wgt_per_channel=False, input_act_per_token=False, output_act_per_token=False)
+    config.set_layer_name_config("classifier", wgt_per_channel=False, input_act_per_token=False, output_act_per_token=False)
     
     # Conv2d: per-channel weights
     config.set_layer_type_config(nn.Conv2d, wgt_per_channel=False)
     
     # Softmax: per-token for attention scores
     config.set_layer_type_config(nn.Softmax, act_per_token=True)
+    if BertMaskedSoftmax is not None:
+        config.set_layer_type_config(BertMaskedSoftmax, act_per_token=True)
     
     # GELU: per-token
     config.set_layer_type_config(nn.GELU, act_per_token=True)
@@ -396,7 +406,9 @@ def get_vit_optimized_config() -> QuantConfig:
     if Add is not None:
         config.set_layer_type_config(Add, act_per_token=True)
         config.exclude_layer_name_config("embd_add")  # Example of excluding specific layer from replacement
-    
+        config.exclude_layer_name_config("embd_add1")
+        config.exclude_layer_name_config("embd_add2")
+
     return config
 
 def set_extra_compile_param_for_config(quant_config: QuantConfig) -> None:
@@ -451,6 +463,17 @@ def _create_quant_module(module: nn.Module, config: LayerQuantConfig, quant_cls:
     
     elif quant_cls == IntSoftmax:
         return IntSoftmax.struct_module(
+            module,
+            in_act_bit=cfg['in_act_bit'],
+            softmax_act_bit=cfg['softmax_act_bit'],
+            out_act_bit=cfg['out_act_bit'],
+            act_quant_mode=cfg['act_quant_mode'],
+            act_per_token=cfg['act_per_token'],
+            act_per_head=cfg['act_per_head'],
+        )
+
+    elif quant_cls == IntSoftmaxWithMask:
+        return IntSoftmaxWithMask.struct_module(
             module,
             in_act_bit=cfg['in_act_bit'],
             softmax_act_bit=cfg['softmax_act_bit'],

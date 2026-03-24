@@ -1266,6 +1266,255 @@ class IntSoftmax(QuantizableModule):
             act_per_head=act_per_head,
         ).copy_from(softmax)
 
+
+class IntSoftmaxWithMask(IntSoftmax):
+    def _view_param(self, param: torch.Tensor, x: torch.Tensor):
+        if param is None:
+            return None
+        if param.numel() == 1:
+            return param.view(*([1] * x.ndim))
+        if x.ndim == 4 and param.numel() == x.shape[2]:
+            return param[None, None, :, None]
+        if x.ndim == 3 and param.numel() == x.shape[1]:
+            return param[None, :, None]
+        return param.reshape(*([1] * (x.ndim - 1)), -1)
+
+    def _get_contiguous_boundary_len(self, attention_mask: torch.Tensor, seq_len: int):
+        if attention_mask is None:
+            return None
+        if attention_mask.shape[-1] != seq_len:
+            return None
+
+        flat = attention_mask.detach().reshape(-1, seq_len)
+        if flat.shape[0] == 0:
+            return None
+
+        row0 = flat[0]
+        valid_values = (row0 == 0) | torch.isneginf(row0)
+        if not bool(valid_values.all()):
+            return None
+
+        if flat.shape[0] > 1:
+            all_valid = ((flat == 0) | torch.isneginf(flat)).all()
+            if not bool(all_valid):
+                return None
+            if not bool((flat == row0.unsqueeze(0)).all()):
+                return None
+
+        neginf_mask = torch.isneginf(row0)
+        if not bool(neginf_mask.any()):
+            return seq_len
+
+        first_neginf = int(torch.argmax(neginf_mask.to(torch.int32)).item())
+        if first_neginf > 0 and bool(neginf_mask[:first_neginf].any()):
+            return None
+        if first_neginf < seq_len and bool((~neginf_mask[first_neginf:]).any()):
+            return None
+        return first_neginf
+
+    def _slice_params_by_boundary(self, valid_len: int, orig_len: int):
+        input_scale = self.input_scale
+        output_scale = self.output_scale
+        input_zero = self.input_zero
+        output_zero = self.output_zero
+
+        if input_scale is not None and input_scale.numel() == orig_len:
+            input_scale = input_scale[:valid_len]
+        if output_scale is not None and output_scale.numel() == orig_len:
+            output_scale = output_scale[:valid_len]
+        if input_zero is not None and input_zero.numel() == orig_len:
+            input_zero = input_zero[:valid_len]
+        if output_zero is not None and output_zero.numel() == orig_len:
+            output_zero = output_zero[:valid_len]
+        return input_scale, output_scale, input_zero, output_zero
+
+    def _forward_int_impl(self, x_int: torch.Tensor, input_scale, output_scale, input_zero, output_zero):
+        if self.act_quant_mode == "asym" and input_zero is not None:
+            x_int = x_int - self._view_param(input_zero, x_int)
+
+        x_int_max, _ = torch.max(x_int, dim=-1, keepdim=True)
+        x_int = x_int - x_int_max
+
+        exp_scale = self._view_param(input_scale, x_int)
+        exp_int = self._int_exp(x_int, exp_scale)
+        exp_int_sum = torch.sum(exp_int, dim=self.dim, keepdim=True)
+
+        exp_int_sum.clamp_max_(2**self.c - 1)
+
+        factor = torch.floor((2**self.c - 1) / exp_int_sum)
+        softmax_int = torch.floor(exp_int * factor / 2 ** (self.c - self.softmax_act_bit + 1))
+
+        if self.out_act_bit != self.softmax_act_bit:
+            fused_scale = self._view_param(self.fused_scale, softmax_int)
+            softmax_int = softmax_int * fused_scale
+
+        if self.act_quant_mode == "asym" and output_zero is not None:
+            softmax_int = softmax_int + self._view_param(output_zero, softmax_int)
+
+        return softmax_int
+
+    def _forward_int_lut_impl(self, x_int: torch.Tensor, input_scale, output_scale, input_zero, output_zero):
+        _init_vector_luts()
+
+        if self.act_quant_mode == "asym" and input_zero is not None:
+            x_int = x_int - self._view_param(input_zero, x_int)
+
+        x_int = x_int - torch.max(x_int, dim=self.dim, keepdim=True)[0]
+
+        input_scale_view = self._view_param(input_scale, x_int)
+        x_float = x_int.float() * input_scale_view
+        x_fix_q12 = torch.round(x_float * (2 ** 12)).to(torch.int32)
+        x_fix_q12 = _clip_i16(x_fix_q12)
+
+        idx1 = _extract_bits_i16(x_fix_q12, 5, 10).long()
+        ex_rev_lut_i32 = _g_softmax_ex_rev_lut.to(torch.int32)
+        ex_val = ex_rev_lut_i32[idx1]
+        ex_sum = torch.sum(ex_val, dim=self.dim, keepdim=True)
+
+        loge_idx = torch.clamp((ex_sum >> 14).to(torch.long), 0, len(_g_softmax_loge_lut) - 1)
+        loge_val = _g_softmax_loge_lut[loge_idx].to(torch.int32)
+
+        minus_loge = _clip_i16(x_fix_q12 - loge_val)
+        idx2 = _extract_bits_i16(minus_loge, 5, 10).long()
+        out_fix_q16 = ex_rev_lut_i32[idx2]
+
+        out_float = out_fix_q16.float() / (2 ** 16)
+        output_scale_view = self._view_param(output_scale, out_float)
+        softmax_int_lut = torch.round(_safe_scale_div(out_float, output_scale_view))
+        softmax_int_lut = torch.clamp(softmax_int_lut, -2 ** (self.out_act_bit - 1), 2 ** (self.out_act_bit - 1) - 1)
+
+        if self.act_quant_mode == "asym" and output_zero is not None:
+            softmax_int_lut = softmax_int_lut + self._view_param(output_zero, softmax_int_lut)
+
+        return softmax_int_lut
+
+    def calibrate(self, x_float, attention_mask=None):
+        y = self.forward_float(x_float, attention_mask)
+
+        if attention_mask is not None:
+            neginf_mask = torch.isneginf(attention_mask)
+            x_stat = torch.where(neginf_mask, torch.zeros_like(x_float), x_float)
+        else:
+            x_stat = x_float
+
+        x_scale, x_zero = max_min_quantize_params(
+            input_tensor=x_stat,
+            bitwidth=self.in_act_bit,
+            quant_mode=self.act_quant_mode,
+            per_channel=self.act_per_token or self.act_per_head,
+            is_weight=False,
+            is_seq_x=self.act_per_token,
+        )
+
+        y_scale, y_zero = max_min_quantize_params(
+            input_tensor=y,
+            bitwidth=self.out_act_bit,
+            quant_mode=self.act_quant_mode,
+            per_channel=self.act_per_token or self.act_per_head,
+            is_weight=False,
+            is_seq_x=self.act_per_token,
+        )
+
+        self.input_scale.data = x_scale
+        self.output_scale.data = y_scale
+        self.softmax_scale.data = torch.Tensor([1 / 2 ** (self.softmax_act_bit - 1)])
+        if self.softmax_act_bit != self.out_act_bit:
+            self.fused_scale.data = self.softmax_scale / self.output_scale
+        else:
+            self.output_scale.data = self.softmax_scale
+
+        if self.act_quant_mode == "asym":
+            self.input_zero.data = x_zero
+            self.output_zero.data = y_zero
+
+        return y
+
+    def forward_int(self, x_int, attention_mask=None):
+        seq_len = x_int.shape[-1]
+        valid_len = self._get_contiguous_boundary_len(attention_mask, seq_len)
+
+        input_scale = self.input_scale
+        output_scale = self.output_scale
+        input_zero = self.input_zero
+        output_zero = self.output_zero
+
+        if x_int.ndim == 4 and valid_len is not None and 0 < valid_len < seq_len:
+            x_crop = x_int[:, :, :valid_len, :valid_len]
+            input_scale, output_scale, input_zero, output_zero = self._slice_params_by_boundary(valid_len, seq_len)
+            y_crop = self._forward_int_impl(x_crop, input_scale, output_scale, input_zero, output_zero)
+            y_full = torch.zeros_like(x_int)
+            y_full[:, :, :valid_len, :valid_len] = y_crop
+            return y_full
+
+        return self._forward_int_impl(x_int, input_scale, output_scale, input_zero, output_zero)
+
+    def forward_int_lut(self, x_int, attention_mask=None):
+        seq_len = x_int.shape[-1]
+        valid_len = self._get_contiguous_boundary_len(attention_mask, seq_len)
+
+        input_scale = self.input_scale
+        output_scale = self.output_scale
+        input_zero = self.input_zero
+        output_zero = self.output_zero
+
+        if x_int.ndim == 4 and valid_len is not None and 0 < valid_len < seq_len:
+            x_crop = x_int[:, :, :valid_len, :valid_len]
+            input_scale, output_scale, input_zero, output_zero = self._slice_params_by_boundary(valid_len, seq_len)
+            y_crop = self._forward_int_lut_impl(x_crop, input_scale, output_scale, input_zero, output_zero)
+            y_full = torch.zeros_like(x_int)
+            y_full[:, :, :valid_len, :valid_len] = y_crop
+            return y_full
+
+        return self._forward_int_lut_impl(x_int, input_scale, output_scale, input_zero, output_zero)
+
+    def forward_float(self, x_float, attention_mask=None):
+        if attention_mask is not None:
+            x_float = x_float + attention_mask
+        return F.softmax(x_float, dim=-1)
+
+    def forward(self, x_float, attention_mask=None):
+        if self.calibrate_mode:
+            return self.calibrate(x_float, attention_mask)
+        elif self.fakequant_mode:
+            x_scale_view = self._view_param(self.input_scale, x_float)
+            x_int = torch.clamp(
+                torch.round(x_float / x_scale_view),
+                -2 ** (self.in_act_bit - 1),
+                2 ** (self.in_act_bit - 1) - 1,
+            )
+            if self.use_lut_inference:
+                y_int = self.forward_int_lut(x_int=x_int, attention_mask=attention_mask)
+            else:
+                y_int = self.forward_int(x_int=x_int, attention_mask=attention_mask)
+            return y_int * self._view_param(self.output_scale, y_int)
+        else:
+            return self.forward_float(x_float, attention_mask)
+
+    def copy_from(self, softmax):
+        return self
+
+    @classmethod
+    def struct_module(
+        cls,
+        softmax: nn.Module,
+        dim: int = -1,
+        in_act_bit: int = 8,
+        softmax_act_bit: int = 16,
+        out_act_bit: int = 8,
+        act_quant_mode: str = "sym",
+        act_per_token: bool = False,
+        act_per_head: bool = False,
+    ):
+        return cls(
+            dim=dim,
+            in_act_bit=in_act_bit,
+            softmax_act_bit=softmax_act_bit,
+            out_act_bit=out_act_bit,
+            act_quant_mode=act_quant_mode,
+            act_per_token=act_per_token,
+            act_per_head=act_per_head,
+        ).copy_from(softmax)
+
 # ----- IntLayerNorm -----
 
 class IntLayerNorm(QuantizableModule):
