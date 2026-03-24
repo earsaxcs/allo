@@ -1495,7 +1495,11 @@ struct VivadoQLinearToPYNQPattern
 
 struct VivadoQAddToPYNQPattern 
     : public OpRewritePattern<vivado_ops::QAddOp> {
-  using OpRewritePattern<vivado_ops::QAddOp>::OpRewritePattern;
+  VivadoQAddToPYNQPattern(MLIRContext *context, bool qaddOverwriteX)
+      : OpRewritePattern<vivado_ops::QAddOp>(context),
+        qaddOverwriteX(qaddOverwriteX) {}
+
+  bool qaddOverwriteX;
 
   LogicalResult matchAndRewrite(vivado_ops::QAddOp op,
                                  PatternRewriter &rewriter) const override {
@@ -1635,16 +1639,30 @@ struct VivadoQAddToPYNQPattern
     auto bufferType = pynq_ops::BufferType::getVirtual(
         rewriter.getContext(), i8Type, pynq::BufferConfig::kDefaultCapacityBytes);
 
-    // Allocate one primary buffer (lhs/output, in-place) and one extra buffer
-    // (rhs, read-only) per tile.
-    SmallVector<Value, 4> lhsBufs;
-    SmallVector<Value, 4> rhsBufs;
-    lhsBufs.reserve(bufCount);
-    rhsBufs.reserve(bufCount);
+    // Mapping to new vector semantics:
+    // - buffer       : input #1
+    // - extra_buffer : output (and input #2 for qadd)
+    // qaddOverwriteX controls whether the overwritten input is x or y.
+    Value primaryInput = lhs;
+    Value secondaryInput = rhs;
+    Value primaryScale = xScale;
+    Value secondaryScale = yScale;
+    if (qaddOverwriteX) {
+      // overwrite x -> put x on extra_buffer side
+      primaryInput = rhs;
+      secondaryInput = lhs;
+      primaryScale = yScale;
+      secondaryScale = xScale;
+    }
+
+    SmallVector<Value, 4> primaryBufs;
+    SmallVector<Value, 4> extraBufs;
+    primaryBufs.reserve(bufCount);
+    extraBufs.reserve(bufCount);
     for (int64_t i = 0; i < bufCount; ++i) {
-      lhsBufs.push_back(rewriter.create<pynq_ops::BufferAllocOp>(
+      primaryBufs.push_back(rewriter.create<pynq_ops::BufferAllocOp>(
           loweredLoc, bufferType, rewriter.getStringAttr("activation")));
-      rhsBufs.push_back(rewriter.create<pynq_ops::BufferAllocOp>(
+      extraBufs.push_back(rewriter.create<pynq_ops::BufferAllocOp>(
           loweredLoc, bufferType, rewriter.getStringAttr("activation")));
     }
 
@@ -1735,15 +1753,19 @@ struct VivadoQAddToPYNQPattern
           sizes.push_back(mLen);
           sizes.push_back(nLen);
 
-          Location copyLhsLoc = makeTaggedLoc("pynq.qadd.copy_lhs");
-          Value lhsSubview = makeRankReducedSubview(
-              lhs, /*resultShape=*/{mLen, nLen}, offsets, sizes, copyLhsLoc);
-          rewriter.create<pynq_ops::CopyOp>(copyLhsLoc, lhsSubview, lhsBufs[linear]);
+            Location copyInLoc = makeTaggedLoc("pynq.qadd.copy_in_primary");
+            Value primarySubview = makeRankReducedSubview(
+              primaryInput, /*resultShape=*/{mLen, nLen}, offsets, sizes,
+              copyInLoc);
+            rewriter.create<pynq_ops::CopyOp>(copyInLoc, primarySubview,
+                            primaryBufs[linear]);
 
-          Location copyRhsLoc = makeTaggedLoc("pynq.qadd.copy_rhs");
-          Value rhsSubview = makeRankReducedSubview(
-              rhs, /*resultShape=*/{mLen, nLen}, offsets, sizes, copyRhsLoc);
-          rewriter.create<pynq_ops::CopyOp>(copyRhsLoc, rhsSubview, rhsBufs[linear]);
+            Location copyExtraLoc = makeTaggedLoc("pynq.qadd.copy_in_extra");
+            Value secondarySubview = makeRankReducedSubview(
+              secondaryInput, /*resultShape=*/{mLen, nLen}, offsets, sizes,
+              copyExtraLoc);
+            rewriter.create<pynq_ops::CopyOp>(copyExtraLoc, secondarySubview,
+                            extraBufs[linear]);
 
           std::string tag = ("pynq.qadd.compute.b" + std::to_string(b) +
                              ".m" + std::to_string(mTile) +
@@ -1752,23 +1774,24 @@ struct VivadoQAddToPYNQPattern
           Value tileCountVal = createI32Const(static_cast<int32_t>(tileCountI64));
           Value reduceKVal = createI32Const(static_cast<int32_t>(mLen));
 
-          // In-place: primary buffer (lhsBufs[linear]) is both input and output.
-          // rhsBufs[linear] is read-only and wired to extra_buffer.
+            // New qadd semantics:
+            // - buffer is input #1
+            // - extra_buffer is input #2 + output (overwritten)
           rewriter.create<pynq_ops::QAddOp>(
               computeLoc,
-              xScale.cast<TypedValue<MemRefType>>(),
-              yScale.cast<TypedValue<MemRefType>>(),
+              primaryScale.cast<TypedValue<MemRefType>>(),
+              secondaryScale.cast<TypedValue<MemRefType>>(),
               oScaleInv.cast<TypedValue<MemRefType>>(),
-              lhsBufs[linear],
+              primaryBufs[linear],
               tileCountVal,
               reduceKVal,
-              rhsBufs[linear]);
+              extraBufs[linear]);
           rewriter.create<pynq_ops::SyncOp>(makeTaggedLoc("pynq.qadd.sync"));
 
           Location copyOutLoc = makeTaggedLoc("pynq.qadd.copy_out");
           Value outSubview = makeRankReducedSubview(
               output, /*resultShape=*/{mLen, nLen}, offsets, sizes, copyOutLoc);
-          rewriter.create<pynq_ops::CopyOp>(copyOutLoc, lhsBufs[linear], outSubview);
+          rewriter.create<pynq_ops::CopyOp>(copyOutLoc, extraBufs[linear], outSubview);
         }
       }
     }
@@ -1900,10 +1923,14 @@ struct VivadoIntGELUToPYNQPattern
     auto bufferType = pynq_ops::BufferType::getVirtual(
         rewriter.getContext(), i8Type, pynq::BufferConfig::kDefaultCapacityBytes);
 
-    SmallVector<Value, 4> bufs;
-    bufs.reserve(bufCount);
+    SmallVector<Value, 4> inBufs;
+    SmallVector<Value, 4> outBufs;
+    inBufs.reserve(bufCount);
+    outBufs.reserve(bufCount);
     for (int64_t i = 0; i < bufCount; ++i) {
-      bufs.push_back(rewriter.create<pynq_ops::BufferAllocOp>(
+      inBufs.push_back(rewriter.create<pynq_ops::BufferAllocOp>(
+          loweredLoc, bufferType, rewriter.getStringAttr("activation")));
+      outBufs.push_back(rewriter.create<pynq_ops::BufferAllocOp>(
           loweredLoc, bufferType, rewriter.getStringAttr("activation")));
     }
 
@@ -1995,7 +2022,7 @@ struct VivadoIntGELUToPYNQPattern
           Location copyInLoc = makeTaggedLoc("pynq.int_gelu.copy_in");
           Value inSubview = makeRankReducedSubview(
               input, /*resultShape=*/{mLen, nLen}, offsets, sizes, copyInLoc);
-          rewriter.create<pynq_ops::CopyOp>(copyInLoc, inSubview, bufs[linear]);
+            rewriter.create<pynq_ops::CopyOp>(copyInLoc, inSubview, inBufs[linear]);
 
             std::string tag = ("pynq.int_gelu.compute.b" + std::to_string(b) +
                      ".m" + std::to_string(mTile) +
@@ -2003,16 +2030,20 @@ struct VivadoIntGELUToPYNQPattern
             Location computeLoc = makeTaggedLoc(tag);
           Value tileCountVal = createI32Const(static_cast<int32_t>(tileCountI64));
           Value reduceKVal = createI32Const(static_cast<int32_t>(mLen));
-          rewriter.create<pynq_ops::GELUOp>(computeLoc,
-                                           iscl.cast<TypedValue<MemRefType>>(),
-                                           osclInv.cast<TypedValue<MemRefType>>(),
-                                           bufs[linear], tileCountVal, reduceKVal);
+            rewriter.create<pynq_ops::GELUOp>(
+              computeLoc,
+              iscl.cast<TypedValue<MemRefType>>(),
+              osclInv.cast<TypedValue<MemRefType>>(),
+              inBufs[linear],
+              tileCountVal,
+              reduceKVal,
+              outBufs[linear]);
           rewriter.create<pynq_ops::SyncOp>(makeTaggedLoc("pynq.int_gelu.sync"));
 
           Location copyOutLoc = makeTaggedLoc("pynq.int_gelu.copy_out");
           Value outSubview = makeRankReducedSubview(
               output, /*resultShape=*/{mLen, nLen}, offsets, sizes, copyOutLoc);
-          rewriter.create<pynq_ops::CopyOp>(copyOutLoc, bufs[linear], outSubview);
+          rewriter.create<pynq_ops::CopyOp>(copyOutLoc, outBufs[linear], outSubview);
         }
       }
     }
@@ -2162,10 +2193,14 @@ struct VivadoIntSoftmaxToPYNQPattern
     auto bufferType = pynq_ops::BufferType::getVirtual(
         rewriter.getContext(), i8Type, pynq::BufferConfig::kDefaultCapacityBytes);
 
-    SmallVector<Value, 4> bufs;
-    bufs.reserve(bufCount);
+    SmallVector<Value, 4> inBufs;
+    SmallVector<Value, 4> outBufs;
+    inBufs.reserve(bufCount);
+    outBufs.reserve(bufCount);
     for (int64_t i = 0; i < bufCount; ++i) {
-      bufs.push_back(rewriter.create<pynq_ops::BufferAllocOp>(
+      inBufs.push_back(rewriter.create<pynq_ops::BufferAllocOp>(
+          loweredLoc, bufferType, rewriter.getStringAttr("activation")));
+      outBufs.push_back(rewriter.create<pynq_ops::BufferAllocOp>(
           loweredLoc, bufferType, rewriter.getStringAttr("activation")));
     }
 
@@ -2254,7 +2289,7 @@ struct VivadoIntSoftmaxToPYNQPattern
         Location copyInLoc = makeTaggedLoc("pynq.int_softmax.copy_in");
         Value inSubview = makeRankReducedSubview(
             input, /*resultShape=*/{axisLen, mLen}, offsets, sizes, copyInLoc);
-        rewriter.create<pynq_ops::CopyOp>(copyInLoc, inSubview, bufs[linear]);
+        rewriter.create<pynq_ops::CopyOp>(copyInLoc, inSubview, inBufs[linear]);
 
         std::string tag = ("pynq.int_softmax.compute.b" + std::to_string(b) +
                            ".m" + std::to_string(mTile));
@@ -2262,18 +2297,19 @@ struct VivadoIntSoftmaxToPYNQPattern
         Value tileCountVal = createI32Const(static_cast<int32_t>(tileCountI64));
         Value reduceKVal = createI32Const(static_cast<int32_t>(seqlen));
         rewriter.create<pynq_ops::SoftmaxOp>(
-            computeLoc,
-            iscl.cast<TypedValue<MemRefType>>(),
-            osclInv.cast<TypedValue<MemRefType>>(),
-            bufs[linear],
-            tileCountVal,
-            reduceKVal);
+          computeLoc,
+          iscl.cast<TypedValue<MemRefType>>(),
+          osclInv.cast<TypedValue<MemRefType>>(),
+          inBufs[linear],
+          tileCountVal,
+          reduceKVal,
+          outBufs[linear]);
         rewriter.create<pynq_ops::SyncOp>(makeTaggedLoc("pynq.int_softmax.sync"));
 
         Location copyOutLoc = makeTaggedLoc("pynq.int_softmax.copy_out");
         Value outSubview = makeRankReducedSubview(
             output, /*resultShape=*/{axisLen, mLen}, offsets, sizes, copyOutLoc);
-        rewriter.create<pynq_ops::CopyOp>(copyOutLoc, bufs[linear], outSubview);
+        rewriter.create<pynq_ops::CopyOp>(copyOutLoc, outBufs[linear], outSubview);
       }
     }
 
@@ -2410,10 +2446,14 @@ struct VivadoIntLayerNormToPYNQPattern
     auto bufferType = pynq_ops::BufferType::getVirtual(
         rewriter.getContext(), i8Type, pynq::BufferConfig::kDefaultCapacityBytes);
 
-    SmallVector<Value, 4> bufs;
-    bufs.reserve(bufCount);
+    SmallVector<Value, 4> inBufs;
+    SmallVector<Value, 4> outBufs;
+    inBufs.reserve(bufCount);
+    outBufs.reserve(bufCount);
     for (int64_t i = 0; i < bufCount; ++i) {
-      bufs.push_back(rewriter.create<pynq_ops::BufferAllocOp>(
+      inBufs.push_back(rewriter.create<pynq_ops::BufferAllocOp>(
+          loweredLoc, bufferType, rewriter.getStringAttr("activation")));
+      outBufs.push_back(rewriter.create<pynq_ops::BufferAllocOp>(
           loweredLoc, bufferType, rewriter.getStringAttr("activation")));
     }
 
@@ -2502,7 +2542,7 @@ struct VivadoIntLayerNormToPYNQPattern
         Location copyInLoc = makeTaggedLoc("pynq.int_layernorm.copy_in");
         Value inSubview = makeRankReducedSubview(
             input, /*resultShape=*/{reduceLen, mLen}, offsets, sizes, copyInLoc);
-        rewriter.create<pynq_ops::CopyOp>(copyInLoc, inSubview, bufs[linear]);
+        rewriter.create<pynq_ops::CopyOp>(copyInLoc, inSubview, inBufs[linear]);
 
         std::string tag = ("pynq.int_layernorm.compute.b" + std::to_string(b) +
                            ".m" + std::to_string(mTile));
@@ -2512,16 +2552,17 @@ struct VivadoIntLayerNormToPYNQPattern
         rewriter.create<pynq_ops::LayerNormOp>(
             computeLoc,
             fusedScale.cast<TypedValue<MemRefType>>(),
-          biasInt.cast<TypedValue<MemRefType>>(),
-            bufs[linear],
+            biasInt.cast<TypedValue<MemRefType>>(),
+            inBufs[linear],
             tileCountVal,
-            reduceKVal);
+            reduceKVal,
+            outBufs[linear]);
         rewriter.create<pynq_ops::SyncOp>(makeTaggedLoc("pynq.int_layernorm.sync"));
 
         Location copyOutLoc = makeTaggedLoc("pynq.int_layernorm.copy_out");
         Value outSubview = makeRankReducedSubview(
             output, /*resultShape=*/{reduceLen, mLen}, offsets, sizes, copyOutLoc);
-        rewriter.create<pynq_ops::CopyOp>(copyOutLoc, bufs[linear], outSubview);
+        rewriter.create<pynq_ops::CopyOp>(copyOutLoc, outBufs[linear], outSubview);
       }
     }
 
@@ -2893,14 +2934,15 @@ struct VivadoViTGetFirstTokenToPYNQPattern
 // Pass Implementation
 //===----------------------------------------------------------------------===//
 
-bool applyLowerVivadoToPYNQ(ModuleOp &module, MLIRContext *context) {
+bool applyLowerVivadoToPYNQ(ModuleOp &module, MLIRContext *context,
+                            bool qaddOverwriteX) {
   // Setup rewrite patterns
   RewritePatternSet patterns(context);
   
   // Add all lowering patterns
   patterns.add<VivadoQMatMulToPYNQPattern>(context);
   patterns.add<VivadoQLinearToPYNQPattern>(context);
-  patterns.add<VivadoQAddToPYNQPattern>(context);
+  patterns.add<VivadoQAddToPYNQPattern>(context, qaddOverwriteX);
   patterns.add<VivadoIntGELUToPYNQPattern>(context);
   patterns.add<VivadoIntSoftmaxToPYNQPattern>(context);
   patterns.add<VivadoIntLayerNormToPYNQPattern>(context);
@@ -2922,6 +2964,15 @@ bool applyLowerVivadoToPYNQ(ModuleOp &module, MLIRContext *context) {
 
 struct LowerVivadoToPYNQPass
     : public PassWrapper<LowerVivadoToPYNQPass, OperationPass<ModuleOp>> {
+  LowerVivadoToPYNQPass() = default;
+  LowerVivadoToPYNQPass(const LowerVivadoToPYNQPass &pass)
+    : PassWrapper(pass) {}
+
+    Option<bool> qaddOverwriteX{
+        *this, "qadd-overwrite-x",
+        llvm::cl::desc("If true, qadd overwrites x (maps x->extra_buffer). If false, overwrites y."),
+        llvm::cl::init(true)};
+
   
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(LowerVivadoToPYNQPass)
 
@@ -2945,7 +2996,7 @@ struct LowerVivadoToPYNQPass
     MLIRContext *context = &getContext();
 
     // Apply patterns using greedy rewrite
-    if (!applyLowerVivadoToPYNQ(module, context)) {
+    if (!applyLowerVivadoToPYNQ(module, context, qaddOverwriteX)) {
       signalPassFailure();
       return;
     }

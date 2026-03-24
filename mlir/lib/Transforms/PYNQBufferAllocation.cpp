@@ -231,6 +231,10 @@ private:
   
   std::optional<unsigned> tryAllocateBalancedUtilization(LiveSegment &segment);
 
+  bool tryVectorOutputHandoff(LiveSegment &segment,
+                              unsigned currentIndex,
+                              Operation *currentOp);
+
   LiveSegment *selectSpillVictim(Operation *currentOp,
                                 ArrayRef<Value> currentOpBuffers) const;
   
@@ -576,6 +580,71 @@ void LinearScanAllocator::allocateBuffer(unsigned bufferId,
   bufferUsageCount[bufferId]++;
 }
 
+bool LinearScanAllocator::tryVectorOutputHandoff(LiveSegment &segment,
+                                                 unsigned currentIndex,
+                                                 Operation *currentOp) {
+  if (!currentOp)
+    return false;
+
+  Value inBuf;
+  Value outBuf;
+
+  if (auto gelu = llvm::dyn_cast<pynq::GELUOp>(currentOp)) {
+    inBuf = gelu.getBuffer();
+    outBuf = gelu.getExtraBuffer();
+  } else if (auto sm = llvm::dyn_cast<pynq::SoftmaxOp>(currentOp)) {
+    inBuf = sm.getBuffer();
+    outBuf = sm.getExtraBuffer();
+  } else if (auto ln = llvm::dyn_cast<pynq::LayerNormOp>(currentOp)) {
+    inBuf = ln.getBuffer();
+    outBuf = ln.getExtraBuffer();
+  } else if (auto vo = llvm::dyn_cast<pynq::VectorOp>(currentOp)) {
+    // For generic vector ops, assume buffer=input and extra_buffer=output.
+    // (qadd-like behavior can still be represented when extra is also read.)
+    inBuf = vo.getBuffer();
+    outBuf = vo.getExtraBuffer();
+  } else {
+    return false;
+  }
+
+  if (!inBuf || !outBuf || inBuf == outBuf)
+    return false;
+  if (segment.virtualBuffer != outBuf)
+    return false;
+
+  LiveSegment *inputSeg = nullptr;
+  for (LiveSegment *seg : active) {
+    if (!seg || !seg->assignedBufferId)
+      continue;
+    if (seg->virtualBuffer != inBuf)
+      continue;
+    // Require input to be dead right after this op.
+    if (seg->endIndex != currentIndex)
+      continue;
+    inputSeg = seg;
+    break;
+  }
+
+  if (!inputSeg || !inputSeg->assignedBufferId)
+    return false;
+
+  unsigned handoffId = *inputSeg->assignedBufferId;
+
+  // Transfer ownership at this op boundary: remove input segment from active,
+  // then keep the same physical ID for output segment.
+  for (auto it = active.begin(); it != active.end(); ++it) {
+    if (*it == inputSeg) {
+      active.erase(it);
+      break;
+    }
+  }
+
+  segment.assignedBufferId = handoffId;
+  active.push_back(&segment);
+  bufferUsageCount[handoffId]++;
+  return true;
+}
+
 static SmallVector<Value, 8> collectPynqBufferOperands(Operation *op) {
   SmallVector<Value, 8> bufs;
   if (!op)
@@ -639,6 +708,14 @@ LogicalResult LinearScanAllocator::allocate(
   for (size_t i = 0; i < segments.size(); ++i) {
     LiveSegment &seg = segments[i];
     expireOld(seg.startIndex);
+
+    // Prefer vector IO handoff when possible:
+    // if a vector input dies at this op and current segment is the vector
+    // output, reuse the same physical buffer ID.
+    if (Operation *currentOp = analysis.getOpAt(seg.startIndex)) {
+      if (tryVectorOutputHandoff(seg, seg.startIndex, currentOp))
+        continue;
+    }
 
     auto bufferId = tryAllocate(seg);
     if (bufferId)

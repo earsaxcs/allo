@@ -40,8 +40,10 @@
 #include "allo/Dialect/PYNQDialect.h"
 #include "allo/Dialect/PYNQOps.h"
 #include "allo/Dialect/PYNQTypes.h"
+#include "allo/Dialect/PYNQConfig.h"
 #include "allo/Transforms/Passes.h"
 
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/IRMapping.h"
@@ -105,34 +107,67 @@ struct BufferEffectModel {
       return BufferAccessKind::None;
     }
 
-    // Vector ops.
+    // Vector ops (buffer is input, extra_buffer is output).
     if (auto gelu = llvm::dyn_cast<pynq::GELUOp>(op)) {
-      if (gelu.getBuffer() == buf)
+      bool r = (gelu.getBuffer() == buf);
+      bool w = (gelu.getExtraBuffer() == buf);
+      if (r && w)
         return BufferAccessKind::ReadWrite;
+      if (r)
+        return BufferAccessKind::Read;
+      if (w)
+        return BufferAccessKind::Write;
       return BufferAccessKind::None;
     }
     if (auto sm = llvm::dyn_cast<pynq::SoftmaxOp>(op)) {
-      if (sm.getBuffer() == buf)
+      bool r = (sm.getBuffer() == buf);
+      bool w = (sm.getExtraBuffer() == buf);
+      if (r && w)
         return BufferAccessKind::ReadWrite;
+      if (r)
+        return BufferAccessKind::Read;
+      if (w)
+        return BufferAccessKind::Write;
       return BufferAccessKind::None;
     }
     if (auto ln = llvm::dyn_cast<pynq::LayerNormOp>(op)) {
-      if (ln.getBuffer() == buf)
+      bool r = (ln.getBuffer() == buf);
+      bool w = (ln.getExtraBuffer() == buf);
+      if (r && w)
         return BufferAccessKind::ReadWrite;
+      if (r)
+        return BufferAccessKind::Read;
+      if (w)
+        return BufferAccessKind::Write;
       return BufferAccessKind::None;
     }
     if (auto qa = llvm::dyn_cast<pynq::QAddOp>(op)) {
-      if (qa.getBuffer() == buf)
-        return BufferAccessKind::ReadWrite; // in-place add
-      if (qa.getExtraBuffer() == buf)
+      bool r = (qa.getBuffer() == buf) || (qa.getExtraBuffer() == buf);
+      bool w = (qa.getExtraBuffer() == buf);
+      if (r && w)
+        return BufferAccessKind::ReadWrite;
+      if (r)
         return BufferAccessKind::Read;
+      if (w)
+        return BufferAccessKind::Write;
       return BufferAccessKind::None;
     }
     if (auto vo = llvm::dyn_cast<pynq::VectorOp>(op)) {
-      if (vo.getBuffer() == buf)
+      bool r = (vo.getBuffer() == buf);
+      bool w = (vo.getExtraBuffer() == buf);
+      if (auto opConst = vo.getOp().getDefiningOp<arith::ConstantIntOp>()) {
+        if (opConst.value() == static_cast<int64_t>(pynq::VectorOpCode::kQAdd))
+          r = r || (vo.getExtraBuffer() == buf);
+      } else {
+        // Unknown op code: conservatively assume extra_buffer might also be read.
+        r = r || (vo.getExtraBuffer() == buf);
+      }
+      if (r && w)
         return BufferAccessKind::ReadWrite;
-      if (vo.getExtraBuffer() == buf)
+      if (r)
         return BufferAccessKind::Read;
+      if (w)
+        return BufferAccessKind::Write;
       return BufferAccessKind::None;
     }
 

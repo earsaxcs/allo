@@ -60,7 +60,8 @@ bool applyLowerCompositeType(ModuleOp &module);
 bool applyLowerBitOps(ModuleOp &module);
 bool applyLowerPrintOps(ModuleOp &module);
 bool applyLowerAlloQuantToVivado(ModuleOp &module, MLIRContext *context);
-bool applyLowerVivadoToPYNQ(ModuleOp &module, MLIRContext *context);
+bool applyLowerVivadoToPYNQ(ModuleOp &module, MLIRContext *context,
+							bool qaddOverwriteX = true);
 bool applyLowerLinalgToCStyleSCF(ModuleOp &module);
 
 /// Registers all Allo conversion passes

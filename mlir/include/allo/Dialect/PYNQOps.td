@@ -436,11 +436,11 @@ def PYNQ_ViewOp : PYNQ_Op<"view", []> {
 //===----------------------------------------------------------------------===//
 // 
 // Vector instructions share a common encoding format - gen_vector_instr():
-//   bits[0:2]   - buffer_id (3 bits, primary buffer ID)
+//   bits[0:2]   - buffer_id (3 bits, input buffer ID)
 //   bits[3:5]   - tile_count (3 bits, value 1-8)
 //   bits[6:13]  - reduce_k (8 bits, 1-256)
 //   bits[14:15] - op (2 bits, operation type)
-//   bits[16:18] - extra_buffer_id (3 bits, secondary buffer for some ops)
+//   bits[16:18] - extra_buffer_id (3 bits, output buffer ID; for qadd it's also input2)
 //   bits[19:31] - reserved (13 bits)
 //
 // Operation types (op field):
@@ -465,20 +465,20 @@ def PYNQ_VectorInstrOp : PYNQ_Op<"vector_instr", []> {
     This is a low-level reference op mirroring gen_vector_instr() in instr.h.
 
     Instruction format (32 bits) - gen_vector_instr():
-      bits[0:2]   - buffer_id (3 bits, primary buffer ID)
+      bits[0:2]   - buffer_id (3 bits, input buffer ID)
       bits[3:5]   - tile_count (3 bits, value 1-8)
       bits[6:13]  - reduce_k (8 bits, 1-256)
       bits[14:15] - op (2 bits, operation type)
-      bits[16:18] - extra_buffer_id (3 bits, secondary buffer ID)
+      bits[16:18] - extra_buffer_id (3 bits, output buffer ID; for qadd it's also input2)
       bits[19:31] - reserved (13 bits)
   }];
 
   let arguments = (ins
-    I32:$buffer_id,           // Primary buffer ID (0-7)
+    I32:$buffer_id,           // Input buffer ID (0-7)
     I32:$tile_count,          // Tile count (1-8)
     I32:$reduce_k,            // Reduce dimension size (1-256)
     I32:$op,                  // Operation type (0-3)
-    I32:$extra_buffer_id      // Secondary buffer ID (0-7)
+    I32:$extra_buffer_id      // Output buffer ID (0-7); qadd also uses it as input2
   );
 
   let results = (outs);
@@ -504,20 +504,20 @@ class PYNQ_VectorOpBase<string mnemonic, string opSummary, int opCode>
     Vector operation mapped to gen_vector_instr() in instr.h.
     
     Instruction format (32 bits):
-      bits[0:2]   - buffer_id (3 bits, primary buffer ID)
+      bits[0:2]   - buffer_id (3 bits, input buffer ID)
       bits[3:5]   - tile_count (3 bits, value 1-8)
       bits[6:13]  - reduce_k (8 bits, 1-256)
       bits[14:15] - op (2 bits, operation type)
-      bits[16:18] - extra_buffer_id (3 bits, secondary buffer ID)
+      bits[16:18] - extra_buffer_id (3 bits, output buffer ID; for qadd it's also input2)
       bits[19:31] - reserved (13 bits)
   }];
   
   // Common arguments for vector ops.
   let arguments = (ins
-    AnyPYNQBuffer:$buffer, // Primary buffer (pynq.buffer)
+    AnyPYNQBuffer:$buffer, // Input buffer (pynq.buffer)
     I32:$tile_count,          // Tile count (1-8)
     I32:$reduce_k,            // Reduce dimension size (1-256)
-    AnyPYNQBuffer:$extra_buffer // Secondary buffer (pynq.buffer), for ops that need it
+    AnyPYNQBuffer:$extra_buffer // Output buffer (pynq.buffer); for qadd it's also input2
   );
   
   let results = (outs);
@@ -547,38 +547,21 @@ class PYNQ_SimpleVectorOpBase<string mnemonic, string opSummary, int opCode>
   
   let description = [{
     Simple vector operation mapped to gen_vector_instr() in instr.h.
-    extra_buffer_id is not used and will be set to 0 during codegen.
+    `buffer` is the input buffer and `extra_buffer` is the output buffer.
+    If in-place execution is desired, they can reference the same `pynq.buffer`.
     
     Instruction format (32 bits):
-      bits[0:2]   - buffer_id (3 bits, primary buffer ID)
+      bits[0:2]   - buffer_id (3 bits, input buffer ID)
       bits[3:5]   - tile_count (3 bits, 1-8)
       bits[6:13]  - reduce_k (8 bits, 1-256)
       bits[14:15] - op (2 bits, operation type)
-      bits[16:18] - extra_buffer_id = 0 (unused, 3 bits)
+      bits[16:18] - extra_buffer_id (3 bits, output buffer ID)
       bits[19:31] - reserved (13 bits)
   }];
-  
-  // Override: Arguments without extra_buffer_id
-  let arguments = (ins
-    AnyPYNQBuffer:$buffer, // Primary buffer (pynq.buffer)
-    I32:$tile_count,          // Tile count (1-8)
-    I32:$reduce_k             // Reduce dimension size (1-256)
-  );
-  
-  // Override: Simplified assembly format
-  let assemblyFormat = [{
-    `buffer` `=` $buffer `:` type($buffer) `,`
-    `tiles` `=` $tile_count `,`
-    `reduce_k` `=` $reduce_k
-    attr-dict
-  }];
-  
+
   let extraClassDeclaration = [{
     /// Get the operation code for this vector op
     static constexpr unsigned getOpCode() { return }] # opCode # [{; }
-    
-    /// Get extra_buffer_id (always 0 for simple ops)
-    static constexpr unsigned getExtraBufferId() { return 0; }
   }];
 }
 
@@ -593,11 +576,11 @@ def PYNQ_GELUOp : PYNQ_SimpleVectorOpBase<"gelu",
     Maps to gen_vector_instr() with op = 0.
     
     Instruction format (32 bits) - gen_vector_instr():
-      bits[0:2]   - buffer_id (3 bits, input/output buffer ID)
+      bits[0:2]   - buffer_id (3 bits, input buffer ID)
       bits[3:5]   - tile_count (3 bits, 1-8)
       bits[6:13]  - reduce_k (8 bits, 1-256)
       bits[14:15] - op = 0 (2 bits, GELU operation)
-      bits[16:18] - extra_buffer_id (3 bits, unused, set to 0)
+      bits[16:18] - extra_buffer_id (3 bits, output buffer ID)
       bits[19:31] - reserved (13 bits)
     
     GELU is applied element-wise: GELU(x) = x * Φ(x)
@@ -610,9 +593,10 @@ def PYNQ_GELUOp : PYNQ_SimpleVectorOpBase<"gelu",
   let arguments = (ins
     AnyMemRef:$in_scale,        // Host-side input scale binding
     AnyMemRef:$out_scale_inv,   // Host-side output inverse scale binding
-    AnyPYNQBuffer:$buffer,      // Primary buffer (pynq.buffer)
+    AnyPYNQBuffer:$buffer,      // Input buffer (pynq.buffer)
     I32:$tile_count,            // Tile count (1-8)
-    I32:$reduce_k               // Reduce dimension size (1-256)
+    I32:$reduce_k,              // Reduce dimension size (1-256)
+    AnyPYNQBuffer:$extra_buffer // Output buffer (pynq.buffer)
   );
 
   let assemblyFormat = [{
@@ -620,7 +604,8 @@ def PYNQ_GELUOp : PYNQ_SimpleVectorOpBase<"gelu",
     `out_scale_inv` `=` $out_scale_inv `:` type($out_scale_inv) `,`
     `buffer` `=` $buffer `:` type($buffer) `,`
     `tiles` `=` $tile_count `,`
-    `reduce_k` `=` $reduce_k
+    `reduce_k` `=` $reduce_k `,`
+    `extra_buffer` `=` $extra_buffer `:` type($extra_buffer)
     attr-dict
   }];
 }
@@ -636,30 +621,30 @@ def PYNQ_QAddOp : PYNQ_VectorOpBase<"qadd",
     Maps to gen_vector_instr() with op = 1.
     
     Instruction format (32 bits) - gen_vector_instr():
-      bits[0:2]   - buffer_id (3 bits, first input and output buffer ID)
+      bits[0:2]   - buffer_id (3 bits, first input buffer ID)
       bits[3:5]   - tile_count (3 bits, value 1-8)
       bits[6:13]  - reduce_k (8 bits, number of elements, 1-256)
       bits[14:15] - op = 1 (2 bits, QAdd operation)
-      bits[16:18] - extra_buffer_id (3 bits, second input buffer ID)
+      bits[16:18] - extra_buffer_id (3 bits, output buffer ID; also second input)
       bits[19:31] - reserved (13 bits)
-    
-    The operation performs: buffer[buffer_id] += buffer[extra_buffer_id]
-    Result is stored in buffer_id (in-place addition).
+
+    The operation performs: buffer[extra_buffer_id] += buffer[buffer_id]
+    Result is stored in extra_buffer_id.
     
     Example:
-      // Add buffer 1 to buffer 0: buf0 = buf0 + buf1
+      // Add buffer 0 to buffer 1: buf1 = buf1 + buf0
       pynq.qadd buffer = %buf0 : !pynq.buffer<i8, ?, 4096>, tiles = %c4, reduce_k = %c128,
-                extra_buffer = %buf1 : !pynq.buffer<i8, ?, 4096>
+            extra_buffer = %buf1 : !pynq.buffer<i8, ?, 4096>
   }];
 
   let arguments = (ins
     AnyMemRef:$x_scale,         // Host-side scale for primary input (buffer_id)
     AnyMemRef:$y_scale,         // Host-side scale for secondary input (extra_buffer_id)
     AnyMemRef:$o_scale_inv,     // Host-side inverse scale for output
-    AnyPYNQBuffer:$buffer,      // Primary buffer (pynq.buffer)
+    AnyPYNQBuffer:$buffer,      // Input #1 buffer (pynq.buffer)
     I32:$tile_count,            // Tile count (1-8)
     I32:$reduce_k,              // Reduce dimension size (1-256)
-    AnyPYNQBuffer:$extra_buffer // Secondary buffer (pynq.buffer)
+    AnyPYNQBuffer:$extra_buffer // Input #2 + output buffer (pynq.buffer)
   );
 
   let assemblyFormat = [{
@@ -685,14 +670,15 @@ def PYNQ_SoftmaxOp : PYNQ_SimpleVectorOpBase<"softmax",
     Maps to gen_vector_instr() with op = 2.
     
     Instruction format (32 bits) - gen_vector_instr():
-      bits[0:2]   - buffer_id (3 bits, input/output buffer ID)
+      bits[0:2]   - buffer_id (3 bits, input buffer ID)
       bits[3:5]   - tile_count (3 bits, value 1-8)
       bits[6:13]  - reduce_k (8 bits, softmax dimension size, 1-256)
       bits[14:15] - op = 2 (2 bits, softmax operation)
-      bits[16:18] - extra_buffer_id (3 bits, unused, set to 0)
+      bits[16:18] - extra_buffer_id (3 bits, output buffer ID)
       bits[19:31] - reserved (13 bits)
-    
-    The operation is performed in-place on the specified buffer.
+
+    The operation writes to `extra_buffer`; in-place is achieved when
+    `extra_buffer == buffer`.
     reduce_k specifies the dimension size for softmax normalization.
     
     Example:
@@ -702,9 +688,10 @@ def PYNQ_SoftmaxOp : PYNQ_SimpleVectorOpBase<"softmax",
   let arguments = (ins
     AnyMemRef:$in_scale,        // Host-side input scale binding
     AnyMemRef:$out_scale_inv,   // Host-side output inverse scale binding
-    AnyPYNQBuffer:$buffer,      // Primary buffer (pynq.buffer)
+    AnyPYNQBuffer:$buffer,      // Input buffer (pynq.buffer)
     I32:$tile_count,            // Tile count (1-8)
-    I32:$reduce_k               // Reduce dimension size (1-256)
+    I32:$reduce_k,              // Reduce dimension size (1-256)
+    AnyPYNQBuffer:$extra_buffer // Output buffer (pynq.buffer)
   );
 
   let assemblyFormat = [{
@@ -712,7 +699,8 @@ def PYNQ_SoftmaxOp : PYNQ_SimpleVectorOpBase<"softmax",
     `out_scale_inv` `=` $out_scale_inv `:` type($out_scale_inv) `,`
     `buffer` `=` $buffer `:` type($buffer) `,`
     `tiles` `=` $tile_count `,`
-    `reduce_k` `=` $reduce_k
+    `reduce_k` `=` $reduce_k `,`
+    `extra_buffer` `=` $extra_buffer `:` type($extra_buffer)
     attr-dict
   }];
 }
@@ -728,14 +716,15 @@ def PYNQ_LayerNormOp : PYNQ_SimpleVectorOpBase<"layernorm",
     Maps to gen_vector_instr() with op = 3.
     
     Instruction format (32 bits) - gen_vector_instr():
-      bits[0:2]   - buffer_id (3 bits, input/output buffer ID)
+      bits[0:2]   - buffer_id (3 bits, input buffer ID)
       bits[3:5]   - tile_count (3 bits, value 1-8)
       bits[6:13]  - reduce_k (8 bits, normalization dimension size, 1-256)
       bits[14:15] - op = 3 (2 bits, layernorm operation)
-      bits[16:18] - extra_buffer_id (3 bits, unused, set to 0)
+      bits[16:18] - extra_buffer_id (3 bits, output buffer ID)
       bits[19:31] - reserved (13 bits)
-    
-    The operation normalizes the data in-place on the specified buffer.
+
+    The operation writes normalized data to `extra_buffer`; in-place is
+    achieved when `extra_buffer == buffer`.
     
     Example:
       pynq.layernorm fused_scale = %fs : memref<256xi32>, bias_int = %bias : memref<256xi16>, buffer = %buf0 : !pynq.buffer<i8, ?, 4096>, tiles = %c4, reduce_k = %c64
@@ -744,9 +733,10 @@ def PYNQ_LayerNormOp : PYNQ_SimpleVectorOpBase<"layernorm",
   let arguments = (ins
     AnyMemRef:$fused_scale,     // Host-side fused_scale binding
     AnyMemRef:$bias_int,        // Host-side bias_int binding
-    AnyPYNQBuffer:$buffer,      // Primary buffer (pynq.buffer)
+    AnyPYNQBuffer:$buffer,      // Input buffer (pynq.buffer)
     I32:$tile_count,            // Tile count (1-8)
-    I32:$reduce_k               // Reduce dimension size (1-256)
+    I32:$reduce_k,              // Reduce dimension size (1-256)
+    AnyPYNQBuffer:$extra_buffer // Output buffer (pynq.buffer)
   );
 
   let assemblyFormat = [{
@@ -754,7 +744,8 @@ def PYNQ_LayerNormOp : PYNQ_SimpleVectorOpBase<"layernorm",
     `bias_int` `=` $bias_int `:` type($bias_int) `,`
     `buffer` `=` $buffer `:` type($buffer) `,`
     `tiles` `=` $tile_count `,`
-    `reduce_k` `=` $reduce_k
+    `reduce_k` `=` $reduce_k `,`
+    `extra_buffer` `=` $extra_buffer `:` type($extra_buffer)
     attr-dict
   }];
 }
@@ -771,11 +762,11 @@ def PYNQ_VectorOp : PYNQ_Op<"vector_op", []> {
     Maps to gen_vector_instr() with configurable op field.
     
     Instruction format (32 bits) - gen_vector_instr():
-      bits[0:2]   - buffer_id (3 bits, primary buffer ID)
+      bits[0:2]   - buffer_id (3 bits, input buffer ID)
       bits[3:5]   - tile_count (3 bits, value 1-8)
       bits[6:13]  - reduce_k (8 bits, 1-256)
       bits[14:15] - op (2 bits, operation type 0-3)
-      bits[16:18] - extra_buffer_id (3 bits, secondary buffer ID)
+      bits[16:18] - extra_buffer_id (3 bits, output buffer ID; qadd uses it as input2 too)
       bits[19:31] - reserved (13 bits)
     
     Use this op when:
@@ -794,11 +785,11 @@ def PYNQ_VectorOp : PYNQ_Op<"vector_op", []> {
   }];
   
   let arguments = (ins
-    AnyPYNQBuffer:$buffer, // Primary buffer (pynq.buffer)
+    AnyPYNQBuffer:$buffer, // Input buffer (pynq.buffer)
     I32:$tile_count,          // Tile count (1-8)
     I32:$reduce_k,            // Operation parameter (1-256)
     I32:$op,                  // Operation type (0-3)
-    AnyPYNQBuffer:$extra_buffer // Secondary buffer (pynq.buffer)
+    AnyPYNQBuffer:$extra_buffer // Output buffer (pynq.buffer); qadd uses it as input2 too
   );
   
   let results = (outs);

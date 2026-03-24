@@ -1270,13 +1270,15 @@ void PYNQCEmitter::emitSetMagic(pynq::SetMagicOp op) {
 void PYNQCEmitter::emitGELU(pynq::GELUOp op) {
   indent();
   os << "exec_gelu(";
-  
-  // GELU operation parameters
+
+  // GELU operation parameters (op = 0)
   emitBufferId(op.getBuffer());
   os << ", ";
   emitValue(op.getTileCount());
   os << ", ";
   emitValue(op.getReduceK());
+  os << ", 0, ";
+  emitBufferId(op.getExtraBuffer());
   os << ");";
   emitInfoAndNewLine(op);
 }
@@ -1300,13 +1302,15 @@ void PYNQCEmitter::emitQAdd(pynq::QAddOp op) {
 void PYNQCEmitter::emitSoftmax(pynq::SoftmaxOp op) {
   indent();
   os << "exec_softmax(";
-  
-  // Softmax operation parameters
+
+  // Softmax operation parameters (op = 2)
   emitBufferId(op.getBuffer());
   os << ", ";
   emitValue(op.getTileCount());
   os << ", ";
   emitValue(op.getReduceK());
+  os << ", 2, ";
+  emitBufferId(op.getExtraBuffer());
   os << ");";
   emitInfoAndNewLine(op);
 }
@@ -1314,13 +1318,15 @@ void PYNQCEmitter::emitSoftmax(pynq::SoftmaxOp op) {
 void PYNQCEmitter::emitLayerNorm(pynq::LayerNormOp op) {
   indent();
   os << "exec_layernorm(";
-  
-  // LayerNorm operation parameters
+
+  // LayerNorm operation parameters (op = 3)
   emitBufferId(op.getBuffer());
   os << ", ";
   emitValue(op.getTileCount());
   os << ", ";
   emitValue(op.getReduceK());
+  os << ", 3, ";
+  emitBufferId(op.getExtraBuffer());
   os << ");";
   emitInfoAndNewLine(op);
 }

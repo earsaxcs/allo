@@ -70,6 +70,10 @@ def LowerVivadoToPYNQ : Pass<"lower-vivado-to-pynq", "ModuleOp"> {
     - vivado.qconv2d -> lowered to tiled loops + pynq ops
     - vivado.qmatmul_isqrtd -> pynq.matmul_instr with scaling
   }];
+  let options = [
+    Option<"qaddOverwriteX", "qadd-overwrite-x", "bool", "true",
+           "If true, qadd overwrites x (maps x to extra_buffer); if false, overwrites y">,
+  ];
   let constructor = "mlir::allo::createLowerVivadoToPYNQPass()";
   let dependentDialects = ["mlir::allo::pynq::PYNQDialect"];
 }

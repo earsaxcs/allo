@@ -990,7 +990,8 @@ void PYNQMidLowerPass::runOnOperation() {
 
       auto lowerSimpleVector = [&](auto concreteOp, int32_t opCode) {
         auto bufIdOr = getAllocatedBufferId(concreteOp.getBuffer(), &op);
-        if (failed(bufIdOr)) {
+        auto extraIdOr = getAllocatedBufferId(concreteOp.getExtraBuffer(), &op);
+        if (failed(bufIdOr) || failed(extraIdOr)) {
           failedAny = true;
           return;
         }
@@ -998,7 +999,9 @@ void PYNQMidLowerPass::runOnOperation() {
           llvm::errs() << "[pynq-mid-lower][convert] VectorOp code=" << opCode
                        << " ";
           op.getLoc().print(llvm::errs());
-          llvm::errs() << " buffer=" << *bufIdOr << " tile_count=";
+          llvm::errs() << " buffer=" << *bufIdOr
+                       << " extra=" << *extraIdOr
+                       << " tile_count=";
           debugPrintValueOrConst(llvm::errs(), concreteOp.getTileCount());
           llvm::errs() << " reduceK=";
           debugPrintValueOrConst(llvm::errs(), concreteOp.getReduceK());
@@ -1007,7 +1010,7 @@ void PYNQMidLowerPass::runOnOperation() {
         b.create<pynq::VectorInstrOp>(
             loc, i32c(static_cast<int32_t>(*bufIdOr)),
             concreteOp.getTileCount(), concreteOp.getReduceK(), i32c(opCode),
-            i32c(0));
+            i32c(static_cast<int32_t>(*extraIdOr)));
         toErase.push_back(&op);
       };
 
