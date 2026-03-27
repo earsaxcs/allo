@@ -269,9 +269,9 @@ def Vivado_QLinearOp : Vivado_Op<"qlinear", [AttrSizedOperandSegments]> {
     `(` $output `,` $input `,` $weight `,`
         $fscl `,` $iscl `,` $oscl `,` $oscl_inv `,` $wscl
         (`,` $bscl^)?
-        (`input_zero` `=` $input_zero^ `:` type($input_zero))?
-        (`output_zero` `=` $output_zero^ `:` type($output_zero))?
-        (`bias` `=` $bias^ `:` type($bias))? `)` attr-dict `:` 
+        (`,` `input_zero` `=` $input_zero^ `:` type($input_zero))?
+        (`,` `output_zero` `=` $output_zero^ `:` type($output_zero))?
+        (`,` `bias` `=` $bias^ `:` type($bias))? `)` attr-dict `:` 
         type($output) `,` type($input) `,` type($weight) `,`
         type($fscl) `,` type($iscl) `,` type($oscl) `,` type($oscl_inv) `,` type($wscl)
         (`,` type($bscl)^)?
@@ -330,9 +330,9 @@ def Vivado_QAddOp : Vivado_Op<"qadd", [AttrSizedOperandSegments]> {
   let assemblyFormat = [{
     `(` $output `,` $lhs `,` $rhs `,`
         $x_scale `,` $y_scale `,` $o_scale `,` $o_scale_inv
-        (`x_zero` `=` $x_zero^ `:` type($x_zero))?
-        (`y_zero` `=` $y_zero^ `:` type($y_zero))?
-        (`o_zero` `=` $o_zero^ `:` type($o_zero))? `)`
+        (`,` `x_zero` `=` $x_zero^ `:` type($x_zero))?
+        (`,` `y_zero` `=` $y_zero^ `:` type($y_zero))?
+        (`,` `o_zero` `=` $o_zero^ `:` type($o_zero))? `)`
         attr-dict `:` 
         type($output) `,` type($lhs) `,` type($rhs) `,`
         type($x_scale) `,` type($y_scale) `,` type($o_scale) `,` type($o_scale_inv)
@@ -390,8 +390,8 @@ def Vivado_IntGELUOp : Vivado_Op<"int_gelu", [AttrSizedOperandSegments]> {
   let assemblyFormat = [{
     `(` $output `,` $input `,`
         $iscl `,` $gscl `,` $fscl `,` $oscl `,` $oscl_inv
-        (`input_zero` `=` $input_zero^ `:` type($input_zero))?
-        (`output_zero` `=` $output_zero^ `:` type($output_zero))? `)`
+        (`,` `input_zero` `=` $input_zero^ `:` type($input_zero))?
+        (`,` `output_zero` `=` $output_zero^ `:` type($output_zero))? `)`
         attr-dict `:` type($output) `,` type($input) `,`
         type($iscl) `,` type($gscl) `,` type($fscl) `,` type($oscl) `,` type($oscl_inv)
   }];
@@ -434,8 +434,8 @@ def Vivado_IntSoftmaxOp : Vivado_Op<"int_softmax", [AttrSizedOperandSegments]> {
     `(` $output `,` $input `,`
         $iscl `,` $sscl `,` $oscl `,` $oscl_inv
         (`,` $fscl^)?
-        (`input_zero` `=` $input_zero^ `:` type($input_zero))?
-        (`output_zero` `=` $output_zero^ `:` type($output_zero))? `)` attr-dict `:` 
+        (`,` `input_zero` `=` $input_zero^ `:` type($input_zero))?
+        (`,` `output_zero` `=` $output_zero^ `:` type($output_zero))? `)` attr-dict `:` 
         type($output) `,` type($input) `,`
         type($iscl) `,` type($sscl) `,` type($oscl) `,` type($oscl_inv)
         (`,` type($fscl)^)?
@@ -481,8 +481,8 @@ def Vivado_IntLayerNormOp : Vivado_Op<"int_layernorm", [AttrSizedOperandSegments
   let assemblyFormat = [{
     `(` $output `,` $input `,` $bias_int `,`
         $iscl `,` $lscl `,` $bscl `,` $fscl `,` $oscl `,` $oscl_inv
-        (`input_zero` `=` $input_zero^ `:` type($input_zero))?
-        (`output_zero` `=` $output_zero^ `:` type($output_zero))? `)`
+        (`,` `input_zero` `=` $input_zero^ `:` type($input_zero))?
+        (`,` `output_zero` `=` $output_zero^ `:` type($output_zero))? `)`
         `eps` `=` $eps attr-dict `:` 
         type($output) `,` type($input) `,` type($bias_int) `,`
         type($iscl) `,` type($lscl) `,` type($bscl) `,` type($fscl) `,` type($oscl) `,` type($oscl_inv)
@@ -547,9 +547,9 @@ def Vivado_QConv2dOp : Vivado_Op<"qconv2d", [AttrSizedOperandSegments]> {
     `(` $output `,` $input `,` $filter `,`
         $fscl `,` $iscl `,` $oscl `,` $oscl_inv `,` $wscl
         (`,` $bscl^)?
-        (`input_zero` `=` $input_zero^ `:` type($input_zero))?
-        (`output_zero` `=` $output_zero^ `:` type($output_zero))?
-        (`bias` `=` $bias^ `:` type($bias))? `)`
+        (`,` `input_zero` `=` $input_zero^ `:` type($input_zero))?
+        (`,` `output_zero` `=` $output_zero^ `:` type($output_zero))?
+        (`,` `bias` `=` $bias^ `:` type($bias))? `)`
         `stride` `=` $stride attr-dict `:` 
         type($output) `,` type($input) `,` type($filter) `,`
         type($fscl) `,` type($iscl) `,` type($oscl) `,` type($oscl_inv) `,` type($wscl)

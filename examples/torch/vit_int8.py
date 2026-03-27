@@ -12,6 +12,7 @@ import torch
 import torch.nn as nn
 import numpy as np
 import os
+import time
 from datetime import datetime
 
 # Use allo.ops.vit structures to ensure compatibility
@@ -329,6 +330,7 @@ def _run_single_op_quant_test(
             compile_inputs = [calib_inputs[:batch]]
 
         print(f"\nCompiling {op_name} with allo...")
+        compile_start = time.perf_counter()
         llvm_mod = allo.frontend.from_pytorch_vivado(
             qmodule,
             example_inputs=compile_inputs,
@@ -338,8 +340,10 @@ def _run_single_op_quant_test(
             project=project,
             mode='default',
         )
+        compile_elapsed = time.perf_counter() - compile_start
 
         print("    Compilation completed!")
+        print(f"    Compile time: {compile_elapsed:.3f}s")
         return llvm_mod
 
     return None
@@ -829,6 +833,7 @@ def test_calibrate_vit_block(
         # Compile mode
         batch = 1
         print("\n[7] Compiling first block with allo...")
+        compile_start = time.perf_counter()
         llvm_mod = allo.frontend.from_pytorch_vivado(
             qblk,
             example_inputs=[example_inputs[:batch]],
@@ -838,6 +843,8 @@ def test_calibrate_vit_block(
             project='pynq_vivado_block.prj',
             mode='default',
         )
+        compile_elapsed = time.perf_counter() - compile_start
+        print(f"    Compile time: {compile_elapsed:.3f}s")
 
         return llvm_mod
 
@@ -923,6 +930,7 @@ def test_calibrate_vit(
         # Compile mode
         batch = 1
         print("\n[6] Compiling with allo...")
+        compile_start = time.perf_counter()
         llvm_mod = allo.frontend.from_pytorch_vivado(
             vit,
             example_inputs=[example_inputs[:batch]],
@@ -932,7 +940,9 @@ def test_calibrate_vit(
             project='pynq_vivado.prj',
             mode='default',
         )
+        compile_elapsed = time.perf_counter() - compile_start
         print("    Compilation completed!")
+        print(f"    Compile time: {compile_elapsed:.3f}s")
         return llvm_mod
     else:
         calibrator.enable_fakequant()
