@@ -192,6 +192,7 @@ def mean_std_quantize_params(
     quant_mode: str = 'sym', # 'sym' or 'asym'
     per_channel: bool = False,
     is_weight: bool = False,      # Indicate if the tensor is a weight (helps infer channel_dim)
+    is_seq_x: bool = False,       # For 4D activation: False=conv feature, True=Transformer attention score
     channel_dim: int | None = None, # Optional: Manually specify channel dimension. If None and per_channel is True, infer based on ndim and is_weight.
     n_sigmas: float = 3.0,        # Number of standard deviations to consider for the range
     dtype: torch.dtype = torch.float32 # Dtype for scale and zero_point
@@ -246,6 +247,7 @@ def mean_std_quantize_params(
     # 确定 Per-Channel 量化维度和 Reduction 维度
     actual_channel_dim = None
     _per_channel_effective = per_channel # Use an internal flag for effective per_channel state
+    _is_seq_x_effective = is_seq_x
 
     if ndim == 1:
         # 1D 张量 (Bias, Norm Weight) 不支持 Per-Channel
@@ -276,28 +278,43 @@ def mean_std_quantize_params(
                     if DEBUG_QUANT:
                         print("Info: Assuming 3D tensor is activation-like for per-channel inference. If it's a 3D weight, manually set channel_dim.")
             elif ndim == 4:
-                # Conv Weight [O, I, K, K] (dim 0) vs Conv Activation [B, C, H, W] (dim 1)
-                actual_channel_dim = 0 if is_weight else 1
-                if DEBUG_QUANT:
-                    print(f"Info: Inferring channel_dim={actual_channel_dim} for {ndim}D tensor based on is_weight={is_weight} (assuming channels-first for activations). For channels-last activation ([B, H, W, C]), manually set channel_dim=3.")
+                if _is_seq_x_effective and not is_weight:
+                    # Transformer Attention Score [B, H, L, L]
+                    actual_channel_dim = 2
+                    if DEBUG_QUANT:
+                        print(f"Info: Inferring channel_dim={actual_channel_dim} for {ndim}D tensor based on is_weight={is_weight}. It's Transformer Attention Score")
+                else:
+                    # Conv Weight [O, I, K, K] (dim 0) vs Conv Activation [B, C, H, W] (dim 1)
+                    actual_channel_dim = 0 if is_weight else 1
+                    if DEBUG_QUANT:
+                        print(f"Info: Inferring channel_dim={actual_channel_dim} for {ndim}D tensor based on is_weight={is_weight} (assuming channels-first for activations). For channels-last activation ([B, H, W, C]), manually set channel_dim=3.")
 
         # 验证确定的维度是否有效
         if actual_channel_dim < 0 or actual_channel_dim >= ndim:
              raise ValueError(f"Invalid channel_dim {actual_channel_dim} determined for a {ndim}D tensor (is_weight={is_weight}).")
 
-        # 找出需要 reduction 的维度（除了 channel_dim）
-        reduction_dims = tuple(d for d in range(ndim) if d != actual_channel_dim)
+        # 对齐 max_min：先把 channel 维移到最后，再展平到 2D，最后按列统计。
+        permute_list = list(range(ndim))
+        try:
+            permute_list.remove(actual_channel_dim)
+        except:
+            raise ValueError(f"Invalid channel_dim {actual_channel_dim} determined for a {ndim}D tensor (is_weight={is_weight}).")
+        permute_list.append(actual_channel_dim)
+
+        input_tensor = input_tensor.permute(permute_list)
+        input_tensor = input_tensor.reshape(-1, input_tensor.shape[-1])
 
         # 计算每个通道的 Mean 和 Std Dev
         # 使用 detach() 避免梯度计算的影响
         # unbiased=False 计算的是总体标准差
-        mean_val = torch.mean(input_tensor.detach(), dim=reduction_dims, keepdim=False)
-        std_val = torch.std(input_tensor.detach(), dim=reduction_dims, keepdim=False, unbiased=False)
+        mean_val = torch.mean(input_tensor.detach(), dim=0, keepdim=False)
+        std_val = torch.std(input_tensor.detach(), dim=0, keepdim=False, unbiased=False)
 
     else: # Per-tensor quantization
         # 计算整个张量的 Mean 和 Std Dev (Scalar)
-        mean_val = torch.mean(input_tensor.detach())
-        std_val = torch.std(input_tensor.detach(), unbiased=False)
+        # Keep per-tensor stats as 1D tensors for API consistency with max_min path.
+        mean_val = torch.mean(input_tensor.detach()).unsqueeze(0)
+        std_val = torch.std(input_tensor.detach(), unbiased=False).unsqueeze(0)
         reduction_dims = None # No reduction needed
 
     # 将 mean_val 和 std_val 转换为目标 dtype
@@ -377,7 +394,43 @@ def mean_std_quantize_params(
         zero_point = torch.clamp(zero_point, int_min_q, int_max_q)
         # zero_point is returned as float dtype
 
+    # Keep output shape consistent: per-tensor returns length-1 1D tensors instead of 0D scalars.
+    if scale is not None and scale.ndim == 0:
+        scale = scale.unsqueeze(0)
+    if zero_point is not None and zero_point.ndim == 0:
+        zero_point = zero_point.unsqueeze(0)
+
     return scale, zero_point
+
+
+def compute_quantize_params(
+    stat_method: str,
+    n_sigmas: float = 3.0,
+    **kwargs,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Dispatch quantization statistics method for calibration.
+
+    Supported methods:
+    - "max_min": min/max based range
+    - "mean_std": mean +/- n_sigmas * std based range
+    """
+    method = (stat_method or "max_min").lower()
+    if method == "max_min":
+        return max_min_quantize_params(**kwargs)
+    if method == "mean_std":
+        allowed = {
+            "input_tensor",
+            "bitwidth",
+            "quant_mode",
+            "per_channel",
+            "is_weight",
+            "is_seq_x",
+            "channel_dim",
+            "dtype",
+        }
+        filtered_kwargs = {k: v for k, v in kwargs.items() if k in allowed}
+        return mean_std_quantize_params(n_sigmas=n_sigmas, **filtered_kwargs)
+    raise ValueError(f"Unsupported calibration statistic method: {stat_method}")
 
 def linear_quantize(input, scale, zero_point, is_weight):
     """

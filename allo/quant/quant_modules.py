@@ -138,6 +138,8 @@ class QuantizableModule(nn.Module):
         self.calibrate_mode = False
         self.fakequant_mode = False
         self.use_lut_inference = False
+        self.calib_stat_method = "max_min"
+        self.calib_n_sigmas = 3.0
 
     def stop_calibrate(self):
         self.calibrate_mode = False
@@ -156,6 +158,14 @@ class QuantizableModule(nn.Module):
 
     def disable_lut_inference(self):
         self.use_lut_inference = False
+
+
+def _compute_quant_params(stat_method: str, n_sigmas: float = 3.0, **kwargs):
+    return compute_quantize_params(
+        stat_method=stat_method,
+        n_sigmas=n_sigmas,
+        **kwargs,
+    )
 
 # ----- Linear -----
 
@@ -254,7 +264,9 @@ class QLinear(QuantizableModule):
     def calibrate(self, x_float):
         y = self.forward_float(x_float)
 
-        w_scale, _ = max_min_quantize_params(
+        w_scale, _ = _compute_quant_params(
+            stat_method=self.calib_stat_method,
+            n_sigmas=self.calib_n_sigmas,
             input_tensor=self.weight.data,
             bitwidth=self.weight_bit,
             quant_mode="sym", # weight强制sym
@@ -262,7 +274,9 @@ class QLinear(QuantizableModule):
             is_weight=True,
         )
 
-        x_scale, x_zero = max_min_quantize_params(
+        x_scale, x_zero = _compute_quant_params(
+            stat_method=self.calib_stat_method,
+            n_sigmas=self.calib_n_sigmas,
             input_tensor=x_float,
             bitwidth=self.act_bit,
             quant_mode=self.act_quant_mode,
@@ -270,7 +284,9 @@ class QLinear(QuantizableModule):
             is_weight=False,
         )
 
-        y_scale, y_zero = max_min_quantize_params(
+        y_scale, y_zero = _compute_quant_params(
+            stat_method=self.calib_stat_method,
+            n_sigmas=self.calib_n_sigmas,
             input_tensor=y,
             bitwidth=self.act_bit,
             quant_mode=self.act_quant_mode,
@@ -283,7 +299,9 @@ class QLinear(QuantizableModule):
         # TODO: bias per_token need duplicate and vary in token dimension???
         
         # b_scale = x_scale * w_scale
-        b_scale, _ = max_min_quantize_params(
+        b_scale, _ = _compute_quant_params(
+            stat_method=self.calib_stat_method,
+            n_sigmas=self.calib_n_sigmas,
             input_tensor=self.bias.data,
             bitwidth=self.bias_bit,
             quant_mode="sym",
@@ -584,7 +602,9 @@ class QConv2d(QuantizableModule):
     def calibrate(self, x_float):
         y = self.forward_float(x_float)
 
-        w_scale, _ = max_min_quantize_params(
+        w_scale, _ = _compute_quant_params(
+            stat_method=self.calib_stat_method,
+            n_sigmas=self.calib_n_sigmas,
             input_tensor=self.weight.data,
             bitwidth=self.weight_bit,
             quant_mode="sym", # weight强制sym
@@ -592,7 +612,9 @@ class QConv2d(QuantizableModule):
             is_weight=True,
         )
 
-        x_scale, x_zero = max_min_quantize_params(
+        x_scale, x_zero = _compute_quant_params(
+            stat_method=self.calib_stat_method,
+            n_sigmas=self.calib_n_sigmas,
             input_tensor=x_float,
             bitwidth=self.act_bit,
             quant_mode=self.act_quant_mode,
@@ -600,7 +622,9 @@ class QConv2d(QuantizableModule):
             is_weight=False,
         )
 
-        y_scale, y_zero = max_min_quantize_params(
+        y_scale, y_zero = _compute_quant_params(
+            stat_method=self.calib_stat_method,
+            n_sigmas=self.calib_n_sigmas,
             input_tensor=y,
             bitwidth=self.act_bit,
             quant_mode=self.act_quant_mode,
@@ -894,7 +918,9 @@ class IntGELU(QuantizableModule):
     def calibrate(self, x_float):
         y = self.forward_float(x_float)
 
-        x_scale, x_zero = max_min_quantize_params(
+        x_scale, x_zero = _compute_quant_params(
+            stat_method=self.calib_stat_method,
+            n_sigmas=self.calib_n_sigmas,
             input_tensor=x_float,
             bitwidth=self.act_bit,
             quant_mode=self.act_quant_mode,
@@ -902,7 +928,9 @@ class IntGELU(QuantizableModule):
             is_weight=False,
         )
 
-        y_scale, y_zero = max_min_quantize_params(
+        y_scale, y_zero = _compute_quant_params(
+            stat_method=self.calib_stat_method,
+            n_sigmas=self.calib_n_sigmas,
             input_tensor=y,
             bitwidth=self.act_bit,
             quant_mode=self.act_quant_mode,
@@ -1108,7 +1136,9 @@ class IntSoftmax(QuantizableModule):
     def calibrate(self, x_float):
         y = self.forward_float(x_float)
 
-        x_scale, x_zero = max_min_quantize_params(
+        x_scale, x_zero = _compute_quant_params(
+            stat_method=self.calib_stat_method,
+            n_sigmas=self.calib_n_sigmas,
             input_tensor=x_float,
             bitwidth=self.in_act_bit,
             quant_mode=self.act_quant_mode,
@@ -1117,7 +1147,9 @@ class IntSoftmax(QuantizableModule):
             is_seq_x=self.act_per_token, # per-channel must be True to use this, act_per_token means it reduces on dim=2, otherwise is act_per_head which reduces on dim = 1
         )
 
-        y_scale, y_zero = max_min_quantize_params(
+        y_scale, y_zero = _compute_quant_params(
+            stat_method=self.calib_stat_method,
+            n_sigmas=self.calib_n_sigmas,
             input_tensor=y,
             bitwidth=self.out_act_bit,
             quant_mode=self.act_quant_mode,
@@ -1397,7 +1429,9 @@ class IntSoftmaxWithMask(IntSoftmax):
         else:
             x_stat = x_float
 
-        x_scale, x_zero = max_min_quantize_params(
+        x_scale, x_zero = _compute_quant_params(
+            stat_method=self.calib_stat_method,
+            n_sigmas=self.calib_n_sigmas,
             input_tensor=x_stat,
             bitwidth=self.in_act_bit,
             quant_mode=self.act_quant_mode,
@@ -1406,7 +1440,9 @@ class IntSoftmaxWithMask(IntSoftmax):
             is_seq_x=self.act_per_token,
         )
 
-        y_scale, y_zero = max_min_quantize_params(
+        y_scale, y_zero = _compute_quant_params(
+            stat_method=self.calib_stat_method,
+            n_sigmas=self.calib_n_sigmas,
             input_tensor=y,
             bitwidth=self.out_act_bit,
             quant_mode=self.act_quant_mode,
@@ -1625,7 +1661,9 @@ class IntLayerNorm(QuantizableModule):
     def calibrate(self, x_float):
         y = self.forward_float(x_float)
 
-        x_scale, x_zero = max_min_quantize_params(
+        x_scale, x_zero = _compute_quant_params(
+            stat_method=self.calib_stat_method,
+            n_sigmas=self.calib_n_sigmas,
             input_tensor=x_float,
             bitwidth=self.in_act_bit,
             quant_mode=self.act_quant_mode,
@@ -1634,7 +1672,9 @@ class IntLayerNorm(QuantizableModule):
             is_weight=False,
         )
 
-        y_scale, y_zero = max_min_quantize_params(
+        y_scale, y_zero = _compute_quant_params(
+            stat_method=self.calib_stat_method,
+            n_sigmas=self.calib_n_sigmas,
             input_tensor=y,
             bitwidth=self.out_act_bit,
             quant_mode=self.act_quant_mode,
@@ -1965,14 +2005,18 @@ class QAdd(QuantizableModule):
     def calibrate(self, x1_float, x2_float):
         y = self.forward_float(x1_float, x2_float)
 
-        x1_scale, x1_zero = max_min_quantize_params(
+        x1_scale, x1_zero = _compute_quant_params(
+            stat_method=self.calib_stat_method,
+            n_sigmas=self.calib_n_sigmas,
             input_tensor=x1_float,
             bitwidth=self.act_bit,
             quant_mode=self.act_quant_mode,
             per_channel=self.act_per_token,
             is_weight=False,
         )
-        x2_scale, x2_zero = max_min_quantize_params(
+        x2_scale, x2_zero = _compute_quant_params(
+            stat_method=self.calib_stat_method,
+            n_sigmas=self.calib_n_sigmas,
             input_tensor=x2_float,
             bitwidth=self.act_bit,
             quant_mode=self.act_quant_mode,
@@ -1980,7 +2024,9 @@ class QAdd(QuantizableModule):
             is_weight=False,
         )
 
-        y_scale, y_zero = max_min_quantize_params(
+        y_scale, y_zero = _compute_quant_params(
+            stat_method=self.calib_stat_method,
+            n_sigmas=self.calib_n_sigmas,
             input_tensor=y,
             bitwidth=self.act_bit,
             quant_mode=self.act_quant_mode,
@@ -2101,7 +2147,9 @@ class QMatMul(QuantizableModule):
         # if it's ISqrtD version, the forward_float will point to the children
         y = self.forward_float(x1_float, x2_float)
 
-        x1_scale, x1_zero = max_min_quantize_params(
+        x1_scale, x1_zero = _compute_quant_params(
+            stat_method=self.calib_stat_method,
+            n_sigmas=self.calib_n_sigmas,
             input_tensor=x1_float,
             bitwidth=self.act_bit,
             quant_mode=self.act_quant_mode,
@@ -2109,7 +2157,9 @@ class QMatMul(QuantizableModule):
             is_weight=False,
             is_seq_x=self.act_per_token, # per-channel must be True to use this, act_per_token means it reduces on dim=2, otherwise is act_per_head which reduces on dim = 1
         )
-        x2_scale, x2_zero = max_min_quantize_params(
+        x2_scale, x2_zero = _compute_quant_params(
+            stat_method=self.calib_stat_method,
+            n_sigmas=self.calib_n_sigmas,
             input_tensor=x2_float,
             bitwidth=self.act_bit,
             quant_mode=self.act_quant_mode,
@@ -2117,7 +2167,9 @@ class QMatMul(QuantizableModule):
             is_weight=False,
         )
 
-        y_scale, y_zero = max_min_quantize_params(
+        y_scale, y_zero = _compute_quant_params(
+            stat_method=self.calib_stat_method,
+            n_sigmas=self.calib_n_sigmas,
             input_tensor=y,
             bitwidth=self.act_bit,
             quant_mode=self.act_quant_mode,

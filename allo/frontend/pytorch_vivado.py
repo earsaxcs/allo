@@ -150,6 +150,9 @@ def from_pytorch_vivado(
             except Exception:
                 seqlen = None
 
+    # NOTE TODO: seqlen automatically infer
+    seqlen = 197 # Currently hard-coded to 197 for ViT.
+
     if seqlen is not None and seqlen > 0:
         global_vars.update({"__allo_seqlen__": int(seqlen)})
 

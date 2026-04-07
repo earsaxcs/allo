@@ -105,6 +105,10 @@ class LayerQuantConfig:
     # - output_act_per_channel: if None, falls back to act_per_channel
     output_act_per_channel: Optional[bool] = None
     int_cal_mode: str = "I-ViT"
+
+    # Calibration statistic method
+    calib_stat_method: str = "max_min"  # "max_min" | "mean_std"
+    calib_n_sigmas: float = 3.0
     
     # MatMul specific (inherits act_* params)
     
@@ -126,6 +130,8 @@ class LayerQuantConfig:
             'act_per_channel': self.act_per_channel,
             'output_act_per_channel': self.output_act_per_channel,
             'int_cal_mode': self.int_cal_mode,
+            'calib_stat_method': self.calib_stat_method,
+            'calib_n_sigmas': self.calib_n_sigmas,
         }
     
     def copy(self) -> 'LayerQuantConfig':
@@ -430,8 +436,10 @@ def _create_quant_module(module: nn.Module, config: LayerQuantConfig, quant_cls:
     """
     cfg = config.to_dict()
     
+    qmodule = None
+
     if quant_cls == QLinear:
-        return QLinear.struct_module(
+        qmodule = QLinear.struct_module(
             module,
             weight_bit=cfg['weight_bit'],
             bias_bit=cfg['bias_bit'],
@@ -444,7 +452,7 @@ def _create_quant_module(module: nn.Module, config: LayerQuantConfig, quant_cls:
         )
     
     elif quant_cls == QConv2d:
-        return QConv2d.struct_module(
+        qmodule = QConv2d.struct_module(
             module,
             weight_bit=cfg['weight_bit'],
             bias_bit=cfg['bias_bit'],
@@ -454,7 +462,7 @@ def _create_quant_module(module: nn.Module, config: LayerQuantConfig, quant_cls:
         )
     
     elif quant_cls == IntGELU:
-        return IntGELU.struct_module(
+        qmodule = IntGELU.struct_module(
             module,
             act_bit=cfg['act_bit'],
             act_quant_mode=cfg['act_quant_mode'],
@@ -462,7 +470,7 @@ def _create_quant_module(module: nn.Module, config: LayerQuantConfig, quant_cls:
         )
     
     elif quant_cls == IntSoftmax:
-        return IntSoftmax.struct_module(
+        qmodule = IntSoftmax.struct_module(
             module,
             in_act_bit=cfg['in_act_bit'],
             softmax_act_bit=cfg['softmax_act_bit'],
@@ -473,7 +481,7 @@ def _create_quant_module(module: nn.Module, config: LayerQuantConfig, quant_cls:
         )
 
     elif quant_cls == IntSoftmaxWithMask:
-        return IntSoftmaxWithMask.struct_module(
+        qmodule = IntSoftmaxWithMask.struct_module(
             module,
             in_act_bit=cfg['in_act_bit'],
             softmax_act_bit=cfg['softmax_act_bit'],
@@ -484,7 +492,7 @@ def _create_quant_module(module: nn.Module, config: LayerQuantConfig, quant_cls:
         )
     
     elif quant_cls == IntLayerNorm:
-        return IntLayerNorm.struct_module(
+        qmodule = IntLayerNorm.struct_module(
             module,
             in_act_bit=cfg['act_bit'],
             out_act_bit=cfg['act_bit'],
@@ -496,7 +504,7 @@ def _create_quant_module(module: nn.Module, config: LayerQuantConfig, quant_cls:
         )
     
     elif quant_cls == QAdd:
-        return QAdd.struct_module(
+        qmodule = QAdd.struct_module(
             module,
             act_bit=cfg['act_bit'],
             act_quant_mode=cfg['act_quant_mode'],
@@ -504,7 +512,7 @@ def _create_quant_module(module: nn.Module, config: LayerQuantConfig, quant_cls:
         )
     
     elif quant_cls == QMatMul:
-        return QMatMul.struct_module(
+        qmodule = QMatMul.struct_module(
             module,
             act_bit=cfg['act_bit'],
             act_quant_mode=cfg['act_quant_mode'],
@@ -512,7 +520,7 @@ def _create_quant_module(module: nn.Module, config: LayerQuantConfig, quant_cls:
         )
     
     elif quant_cls == QMatMulIsqrtD:
-        return QMatMulIsqrtD.struct_module(
+        qmodule = QMatMulIsqrtD.struct_module(
             module,
             act_bit=cfg['act_bit'],
             act_quant_mode=cfg['act_quant_mode'],
@@ -521,6 +529,11 @@ def _create_quant_module(module: nn.Module, config: LayerQuantConfig, quant_cls:
     
     else:
         raise ValueError(f"Unsupported quantized module class: {quant_cls}")
+
+    if isinstance(qmodule, QuantizableModule):
+        qmodule.calib_stat_method = cfg.get('calib_stat_method', 'max_min')
+        qmodule.calib_n_sigmas = float(cfg.get('calib_n_sigmas', 3.0))
+    return qmodule
 
 
 def replace_module_with_quantized(
