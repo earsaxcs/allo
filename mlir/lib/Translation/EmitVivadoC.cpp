@@ -154,6 +154,20 @@ static bool getStaticStridesAndOffset(MemRefType type,
   return true;
 }
 
+static bool getStaticStridesAllowDynamicOffset(MemRefType type,
+                                               SmallVector<int64_t, 4> &strides,
+                                               int64_t &offset,
+                                               bool &hasDynamicOffset) {
+  if (failed(getStridesAndOffset(type, strides, offset)))
+    return false;
+  for (auto stride : strides) {
+    if (stride == ShapedType::kDynamic)
+      return false;
+  }
+  hasDynamicOffset = (offset == ShapedType::kDynamic);
+  return true;
+}
+
 static bool isRowMajorContiguous(ArrayRef<int64_t> shape,
                                  ArrayRef<int64_t> strides) {
   if (shape.size() != strides.size())
@@ -1461,10 +1475,20 @@ void PYNQCEmitter::emitActivationLayoutTranspose(
     return baseName + "_shared";
   };
 
+  auto resolveHostName = [&](Value v) -> std::string {
+    std::string direct = getName(v).str().str();
+    if (!direct.empty())
+      return direct;
+    Value base = stripViews(v);
+    return getName(base).str().str();
+  };
+
+  Value inputBase = stripViews(input);
+  Value outputBase = stripViews(output);
   auto inShared = resolveSharedName(input);
   auto outShared = resolveSharedName(output);
-  bool inputIsArg = input.isa<BlockArgument>();
-  bool outputIsArg = output.isa<BlockArgument>();
+  bool inputIsArg = inputBase.isa<BlockArgument>();
+  bool outputIsArg = outputBase.isa<BlockArgument>();
   if (!outShared && !outputIsArg) {
     emitError(op,
               "pynq.activation_layout_transpose requires output backed by PYNQ_SHARED_MEMORY (memref.alloc or memref.get_global) or a function argument");
@@ -1482,7 +1506,7 @@ void PYNQCEmitter::emitActivationLayoutTranspose(
       os << "PYNQ_transpose_int8(&" << *outShared << ", &" << *inShared
          << ", " << rows << ", " << cols << ");";
     } else if (!inShared && outShared) {
-      auto inName = getName(input).str().str();
+      auto inName = resolveHostName(input);
       if (inName.empty()) {
         emitError(op, "pynq.activation_layout_transpose requires a named input argument");
         return;
@@ -1490,7 +1514,7 @@ void PYNQCEmitter::emitActivationLayoutTranspose(
         os << "PYNQ_transpose_int8_from_host(&" << *outShared << ", " << inName
          << ", " << rows << ", " << cols << ");";
     } else if (inShared && !outShared) {
-      auto outName = getName(output).str().str();
+      auto outName = resolveHostName(output);
       if (outName.empty()) {
         emitError(op, "pynq.activation_layout_transpose requires a named output argument");
         return;
@@ -1498,8 +1522,8 @@ void PYNQCEmitter::emitActivationLayoutTranspose(
         os << "PYNQ_transpose_int8_to_host(" << outName << ", &" << *inShared
          << ", " << rows << ", " << cols << ");";
     } else {
-      auto inName = getName(input).str().str();
-      auto outName = getName(output).str().str();
+      auto inName = resolveHostName(input);
+      auto outName = resolveHostName(output);
       if (inName.empty() || outName.empty()) {
         emitError(op, "pynq.activation_layout_transpose requires named input/output arguments");
         return;
@@ -1512,7 +1536,7 @@ void PYNQCEmitter::emitActivationLayoutTranspose(
       os << "PYNQ_transpose_fp32(&" << *outShared << ", &" << *inShared
          << ", " << rows << ", " << cols << ");";
     } else if (!inShared && outShared) {
-      auto inName = getName(input).str().str();
+      auto inName = resolveHostName(input);
       if (inName.empty()) {
         emitError(op, "pynq.activation_layout_transpose requires a named input argument");
         return;
@@ -1520,7 +1544,7 @@ void PYNQCEmitter::emitActivationLayoutTranspose(
         os << "PYNQ_transpose_fp32_from_host(&" << *outShared << ", " << inName
          << ", " << rows << ", " << cols << ");";
     } else if (inShared && !outShared) {
-      auto outName = getName(output).str().str();
+      auto outName = resolveHostName(output);
       if (outName.empty()) {
         emitError(op, "pynq.activation_layout_transpose requires a named output argument");
         return;
@@ -1528,8 +1552,8 @@ void PYNQCEmitter::emitActivationLayoutTranspose(
         os << "PYNQ_transpose_fp32_to_host(" << outName << ", &" << *inShared
          << ", " << rows << ", " << cols << ");";
     } else {
-      auto inName = getName(input).str().str();
-      auto outName = getName(output).str().str();
+      auto inName = resolveHostName(input);
+      auto outName = resolveHostName(output);
       if (inName.empty() || outName.empty()) {
         emitError(op, "pynq.activation_layout_transpose requires named input/output arguments");
         return;
@@ -2359,9 +2383,37 @@ void PYNQCEmitter::emitCast(memref::CastOp op) {
     return;
   }
 
+  auto ensureDeclared = [this](Value v) {
+    if (!getName(v).empty())
+      return true;
+    Operation *def = v.getDefiningOp();
+    if (!def)
+      return false;
+    if (auto subviewOp = dyn_cast<memref::SubViewOp>(def)) {
+      emitSubview(subviewOp);
+    } else if (auto castOp = dyn_cast<memref::CastOp>(def)) {
+      emitCast(castOp);
+    } else if (auto reinterpretOp = dyn_cast<memref::ReinterpretCastOp>(def)) {
+      emitReinterpretCast(reinterpretOp);
+    } else if (auto reshapeOp = dyn_cast<memref::ReshapeOp>(def)) {
+      emitReshape(reshapeOp);
+    }
+    return !getName(v).empty();
+  };
+
+  if (!ensureDeclared(op.getSource())) {
+    emitError(op, "memref.cast source must be declared before cast");
+    return;
+  }
+
   auto srcName = getName(op.getSource());
   if (srcName.empty()) {
     emitError(op, "memref.cast source must be declared before cast");
+    return;
+  }
+
+  if (resultType == sourceType) {
+    state.nameTable[op.getResult()] = srcName;
     return;
   }
 
@@ -2403,10 +2455,10 @@ void PYNQCEmitter::emitReinterpretCast(memref::ReinterpretCastOp op) {
     return;
   }
 
-  // The op carries an explicit offset operand/result; for our pointer-only
-  // lowering we require it to be a compile-time constant. (Most pipelines
-  // materialize it as `offset: [0]`.)
-  int64_t opOffset = 0;
+  // Build offset expression from op offset (preferred) with fallback to type
+  // offset when op offset is the literal zero.
+  std::string opOffsetExpr;
+  bool opOffsetIsLiteralZero = true;
   auto mixedOffsets = op.getMixedOffsets();
   if (mixedOffsets.size() != 1) {
     emitError(op, "memref.reinterpret_cast with non-scalar base offset not supported");
@@ -2414,7 +2466,10 @@ void PYNQCEmitter::emitReinterpretCast(memref::ReinterpretCastOp op) {
   }
   if (Attribute attr = mixedOffsets[0].dyn_cast<Attribute>()) {
     if (auto intAttr = dyn_cast<IntegerAttr>(attr)) {
-      opOffset = intAttr.getInt();
+      int64_t v = intAttr.getInt();
+      opOffsetIsLiteralZero = (v == 0);
+      if (v != 0)
+        opOffsetExpr = std::to_string(v);
     } else {
       emitError(op, "memref.reinterpret_cast offset attribute must be integer");
       return;
@@ -2422,25 +2477,33 @@ void PYNQCEmitter::emitReinterpretCast(memref::ReinterpretCastOp op) {
   } else if (Value val = mixedOffsets[0].dyn_cast<Value>()) {
     if (auto constOp = val.getDefiningOp<arith::ConstantOp>()) {
       if (auto intAttr = constOp.getValue().dyn_cast<IntegerAttr>())
-        opOffset = intAttr.getInt();
+      {
+        int64_t v = intAttr.getInt();
+        opOffsetIsLiteralZero = (v == 0);
+        if (v != 0)
+          opOffsetExpr = std::to_string(v);
+      }
       else {
         emitError(op, "memref.reinterpret_cast offset must be an integer constant");
         return;
       }
     } else {
-      emitError(op, "memref.reinterpret_cast offset must be constant");
-      return;
+      auto name = getName(val).str().str();
+      if (name.empty()) {
+        emitError(op, "memref.reinterpret_cast dynamic offset must be declared before reinterpret_cast");
+        return;
+      }
+      opOffsetExpr = name;
+      opOffsetIsLiteralZero = false;
     }
   } else {
     emitError(op, "memref.reinterpret_cast offset must be constant");
     return;
   }
 
-  // Prefer the explicit op offset; fall back to the type offset when present.
-  // (In well-formed IR these should agree.)
-  int64_t effectiveOffset = opOffset;
-  if (effectiveOffset == 0)
-    effectiveOffset = resOffsetFromType;
+  std::string effectiveOffsetExpr = opOffsetExpr;
+  if (opOffsetIsLiteralZero && resOffsetFromType != 0)
+    effectiveOffsetExpr = std::to_string(resOffsetFromType);
 
   auto srcName = getName(op.getSource());
   if (srcName.empty()) {
@@ -2448,17 +2511,18 @@ void PYNQCEmitter::emitReinterpretCast(memref::ReinterpretCastOp op) {
     return;
   }
 
-  // We only model memrefs as a base pointer in generated C. This is correct for
-  // the common case where reinterpret_cast is used as a view/reshape for DMA.
-  // If the resulting view is later indexed as a multi-dimensional array in C,
-  // the surrounding pipeline should lower those accesses before reaching here.
+  // Emit with the same array-pointer style as memref.cast so downstream users
+  // can keep consistent pointer-to-array declarations.
   indent();
-  os << "__attribute__((unused)) "
-     << getCTypeName(resultType.getElementType()) << "* "
-     << addName(op.getResult(), false) << " = ("
-     << getCTypeName(resultType.getElementType()) << "*)" << srcName;
-  if (effectiveOffset != 0)
-    os << " + " << effectiveOffset;
+  auto varName = addName(op.getResult(), false);
+  os << "__attribute__((unused)) ";
+  emitMemrefVarDecl(resultType, varName);
+  os << " = (";
+  emitMemrefPtrCastType(resultType);
+  os << ")((" << getCTypeName(resultType.getElementType()) << "*)" << srcName;
+  if (!effectiveOffsetExpr.empty())
+    os << " + (" << effectiveOffsetExpr << ")";
+  os << ")";
   os << ";";
   emitInfoAndNewLine(op);
 }
@@ -2506,19 +2570,63 @@ void PYNQCEmitter::emitSubview(memref::SubViewOp op) {
 
   SmallVector<int64_t, 4> resStrides;
   int64_t resOffset = 0;
-  if (!getStaticStridesAndOffset(resultType, resStrides, resOffset)) {
-    emitError(op, "dynamic subview stride/offset not supported");
+  bool resHasDynamicOffset = false;
+  if (!getStaticStridesAllowDynamicOffset(resultType, resStrides, resOffset,
+                                          resHasDynamicOffset)) {
+    emitError(op, "dynamic subview stride not supported");
     return;
   }
 
   SmallVector<int64_t, 4> srcStrides;
   int64_t srcOffset = 0;
-  if (!getStaticStridesAndOffset(sourceType, srcStrides, srcOffset)) {
-    emitError(op, "dynamic source stride/offset not supported for subview");
+  bool srcHasDynamicOffset = false;
+  if (!getStaticStridesAllowDynamicOffset(sourceType, srcStrides, srcOffset,
+                                          srcHasDynamicOffset)) {
+    emitError(op, "dynamic source stride not supported for subview");
+    return;
+  }
+  if (srcHasDynamicOffset) {
+    emitError(op, "dynamic source offset not supported for subview");
     return;
   }
 
+  auto mixedOffsets = op.getMixedOffsets();
+  if (mixedOffsets.size() != srcStrides.size()) {
+    emitError(op, "subview offset rank does not match source rank");
+    return;
+  }
+
+  bool hasDynamicOffset = false;
+  int64_t staticLinearOffset = 0;
+  SmallVector<std::string, 4> dynamicTerms;
+  for (size_t i = 0; i < mixedOffsets.size(); ++i) {
+    int64_t stride = srcStrides[i];
+    if (Attribute attr = mixedOffsets[i].dyn_cast<Attribute>()) {
+      auto intAttr = dyn_cast<IntegerAttr>(attr);
+      if (!intAttr) {
+        emitError(op, "subview static offset must be integer");
+        return;
+      }
+      staticLinearOffset += intAttr.getInt() * stride;
+      continue;
+    }
+
+    Value dynVal = mixedOffsets[i].dyn_cast<Value>();
+    auto dynName = getName(dynVal).str().str();
+    if (dynName.empty()) {
+      emitError(op, "dynamic subview offset must be declared before subview");
+      return;
+    }
+    hasDynamicOffset = true;
+    if (stride == 1) {
+      dynamicTerms.push_back(dynName);
+    } else {
+      dynamicTerms.push_back("(" + dynName + " * " + std::to_string(stride) + ")");
+    }
+  }
+
   bool identity = (resultType.getShape() == sourceType.getShape()) &&
+                  !hasDynamicOffset && !resHasDynamicOffset &&
                   (resOffset == srcOffset) && (resStrides == srcStrides);
 
   bool contiguous = isRowMajorContiguous(resultType.getShape(), resStrides);
@@ -2552,6 +2660,16 @@ void PYNQCEmitter::emitSubview(memref::SubViewOp op) {
     return;
   }
 
+  if (hasDynamicOffset) {
+    for (auto *user : op.getResult().getUsers()) {
+      if (isa<pynq::DataTransferInstrOp>(user)) {
+        emitError(op,
+                  "dynamic subview offset not supported for DMA data transfer");
+        return;
+      }
+    }
+  }
+
   auto srcName = getName(op.getSource());
   if (srcName.empty()) {
     emitError(op, "subview source must be declared before subview");
@@ -2563,8 +2681,19 @@ void PYNQCEmitter::emitSubview(memref::SubViewOp op) {
      << getCTypeName(resultType.getElementType()) << "* "
      << addName(op.getResult(), false) << " = ("
      << getCTypeName(resultType.getElementType()) << "*)" << srcName;
-  if (!identity && resOffset != 0)
-    os << " + " << resOffset;
+  if (!identity) {
+    bool emittedAnyOffset = false;
+    if (staticLinearOffset != 0) {
+      os << " + " << staticLinearOffset;
+      emittedAnyOffset = true;
+    }
+    for (const auto &term : dynamicTerms) {
+      os << (emittedAnyOffset ? " + " : " + ") << term;
+      emittedAnyOffset = true;
+    }
+    if (!emittedAnyOffset && !resHasDynamicOffset && resOffset != 0)
+      os << " + " << resOffset;
+  }
   os << ";";
   emitInfoAndNewLine(op);
 }

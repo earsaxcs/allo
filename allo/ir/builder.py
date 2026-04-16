@@ -1692,9 +1692,10 @@ class ASTTransformer(ASTBuilder):
         # Attach batch size as a module attribute for downstream MLIR passes
         if "__allo_batch__" in ctx.global_vars:
             batch = int(ctx.global_vars["__allo_batch__"])
-            module.operation.attributes["allo.batch"] = IntegerAttr.get(
-                IntegerType.get_signless(32), batch
-            )
+            if batch > 0:
+                module.operation.attributes["allo.batch"] = IntegerAttr.get(
+                    IntegerType.get_signless(32), batch
+                )
         # Attach hidden dimension as a module attribute for downstream MLIR passes
         if "__allo_hidden_dim__" in ctx.global_vars:
             hidden_dim = int(ctx.global_vars["__allo_hidden_dim__"])

@@ -90,3 +90,5 @@ _tmp
 
 *.mlir
 *.bin
+
+examples/torch/**/*.png

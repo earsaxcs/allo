@@ -282,6 +282,7 @@ class VivadoModule:
             pm = PassManager.parse(
                 f"builtin.module("
                 f"empty-tensor-to-alloc-tensor,"
+                f"allo-split-forward-batch-loop,"
                 f"lower-allo-quant-to-vivado,"
                 f"repack-vivado-scales,"
                 f"vivado-merge-redundant-quant-dequant,"
@@ -301,6 +302,8 @@ class VivadoModule:
                 f"pynq-optimize-subview-globals,hoist-get-global,symbol-dce,"
                 f"pynq-adjust-scale-rshift,"
                 f"pynq-mid-lower{{debug-scale-pack=false}},"
+                f"pynq-split-forward-inline-cleanup,"
+                f"pynq-hoist-get-global-late,"
                 f"pynq-optimize-sync,"
                 f"pynq-return-memref-to-out-param,symbol-dce,"
                 f"allo-lower-linalg-to-cstyle-scf,symbol-dce"

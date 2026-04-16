@@ -106,6 +106,39 @@ void rewriteFunctionToOutParam(FunctionRewriteState &state) {
     state.returnedAlloc.erase();
 }
 
+static Value materializeOutOperandFromResultCopyUse(func::CallOp call,
+                                                    OpBuilder &builder) {
+  Value callResult = call.getResult(0);
+  if (!callResult.hasOneUse())
+    return Value();
+
+  auto copy = dyn_cast<memref::CopyOp>(*callResult.user_begin());
+  if (!copy)
+    return Value();
+
+  // Canonical split-forward pattern: %tmp = call @inner(...)
+  // then memref.copy %tmp, %outerSubview. Reuse %outerSubview directly as out.
+  if (copy.getSource() != callResult)
+    return Value();
+
+  auto resultTy = dyn_cast<MemRefType>(callResult.getType());
+  auto outTy = dyn_cast<MemRefType>(copy.getTarget().getType());
+  if (!resultTy || !outTy)
+    return Value();
+
+  Value outOperand = copy.getTarget();
+  if (outTy != resultTy) {
+    if (!memref::CastOp::areCastCompatible(outTy, resultTy))
+      return Value();
+    outOperand =
+        builder.create<memref::CastOp>(call.getLoc(), resultTy, outOperand)
+            .getResult();
+  }
+
+  copy.erase();
+  return outOperand;
+}
+
 } // namespace
 
 namespace mlir {
@@ -157,17 +190,29 @@ bool applyPYNQReturnMemrefToOutParam(ModuleOp &module) {
     }
 
     OpBuilder builder(call);
-    Value outAlloc =
-        builder.create<memref::AllocOp>(call.getLoc(), memrefResultType);
+    Value outOperand = materializeOutOperandFromResultCopyUse(call, builder);
+    bool reusedExistingOut = static_cast<bool>(outOperand);
+    if (!reusedExistingOut) {
+      outOperand =
+          builder.create<memref::AllocOp>(call.getLoc(), memrefResultType);
+    }
 
     SmallVector<Value> newOperands(call.getOperands().begin(),
                                    call.getOperands().end());
-    newOperands.push_back(outAlloc);
+    newOperands.push_back(outOperand);
 
     builder.create<func::CallOp>(call.getLoc(), call.getCallee(), TypeRange{},
                                  newOperands);
 
-    call.getResult(0).replaceAllUsesWith(outAlloc);
+    if (!reusedExistingOut)
+      call.getResult(0).replaceAllUsesWith(outOperand);
+    else if (!call.getResult(0).use_empty()) {
+      call.emitError() << "[pynq-return-memref-to-out-param] call rewrite "
+                          "failed: expected result to become dead after "
+                          "reusing existing out operand";
+      hadError = true;
+      continue;
+    }
     call.erase();
   }
 

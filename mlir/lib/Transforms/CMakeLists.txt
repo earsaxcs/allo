@@ -13,6 +13,7 @@ add_mlir_library(MLIRAlloPasses
     UnifyKernels.cpp
     MergeSubviewAndCopy.cpp
     HoistGetGlobal.cpp
+    AlloSplitForwardBatchLoop.cpp
     PYNQHoistBufferAlloc.cpp
     PYNQSimplifyHostTransfers.cpp
     PYNQElideRedundantCopies.cpp
@@ -20,6 +21,8 @@ add_mlir_library(MLIRAlloPasses
     PYNQBufferAllocation.cpp
     PYNQAdjustScaleRShift.cpp
     PYNQMidLower.cpp
+    PYNQSplitForwardInlineCleanup.cpp
+    PYNQHoistGetGlobalLate.cpp
     PYNQReturnMemrefToOutParam.cpp
     PYNQOptimizeSync.cpp
     PYNQOptimizeSubviewGlobals.cpp

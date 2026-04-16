@@ -63,29 +63,42 @@ static void maybeInsertSetMagic(ModuleOp module) {
   auto i32Ty = IntegerType::get(ctx, 32);
   auto i32MagicAttr = IntegerAttr::get(i32Ty, magicAttr.getInt());
 
+  auto isOuterForwardCandidate = [](func::FuncOp f) {
+    if (f.isExternal())
+      return false;
+    if (f->hasAttr("allo.batch.split_forward"))
+      return false;
+    StringRef name = f.getSymName();
+    return name == "forward" || name.starts_with("forward_");
+  };
+
+  func::FuncOp target;
   for (auto func : module.getOps<func::FuncOp>()) {
-    if (func.isExternal())
+    if (!isOuterForwardCandidate(func))
       continue;
-
-    // Only inject into the top-level forward.
-    StringRef name = func.getSymName();
-    if (!(name == "forward" || name.starts_with("forward_")))
-      continue;
-
-    Block &entry = func.getBody().front();
-
-    // Avoid double insertion.
-    for (Operation &op : entry.getOperations()) {
-      if (isa<pynq_ops::SetMagicOp>(op))
-        return;
-      break; // only check the first op; we always insert at entry start
+    if (func.getSymName() == "forward") {
+      target = func;
+      break;
     }
-
-    OpBuilder builder(ctx);
-    builder.setInsertionPointToStart(&entry);
-    builder.create<pynq_ops::SetMagicOp>(func.getLoc(), i32MagicAttr);
-    return;
+    if (!target)
+      target = func;
   }
+
+  if (!target)
+    return;
+
+  Block &entry = target.getBody().front();
+
+  // Avoid double insertion at entry.
+  for (Operation &op : entry.getOperations()) {
+    if (isa<pynq_ops::SetMagicOp>(op))
+      return;
+    break; // only check the first op; we always insert at entry start
+  }
+
+  OpBuilder builder(ctx);
+  builder.setInsertionPointToStart(&entry);
+  builder.create<pynq_ops::SetMagicOp>(target.getLoc(), i32MagicAttr);
 }
 
 static Value stripCasts(Value v) {
@@ -1582,7 +1595,8 @@ struct VivadoQAddToPYNQPattern
     // token dim is rank-1. ×
     // Correct!:
     // Always broadcast scales along the last dim! Because hardware vector op is no transpose option, just do it along the last dim
-    int64_t tokenLen = N; // outIsTransposed ? N : M;
+    // it needs tile if columns > tileN
+    int64_t tokenLen = N < pynq::TileConfig::kDefaultTileN ? N : pynq::TileConfig::kDefaultTileN; // outIsTransposed ? N : M;
     if (auto bcast = broadcastLen1ScaleTo(xScale, tokenLen, "qadd_x_scale", op, rewriter);
         succeeded(bcast)) {
       xScale = *bcast;
@@ -1870,7 +1884,8 @@ struct VivadoIntGELUToPYNQPattern
     int64_t batchRank = rank - 2;
 
     // Broadcast scalar/len-1 scales along token (last dim) in transpose-mode.
-    int64_t tokenLen = shape[rank - 1];
+    // it needs tile if columns > tileN
+    int64_t tokenLen = shape[rank - 1] < pynq::TileConfig::kDefaultTileN ? shape[rank - 1] : pynq::TileConfig::kDefaultTileN;
     if (auto bcast = broadcastLen1ScaleTo(iscl, tokenLen, "gelu_iscl", op, rewriter);
         succeeded(bcast)) {
       iscl = *bcast;
@@ -2073,6 +2088,7 @@ struct VivadoIntSoftmaxToPYNQPattern
     // 1) transpose_mode must be enabled
     // 2) is_transposed must be enabled (backend does not accept output being
     //    transposed relative to input under transpose-mode lowering)
+    // and input must be transposed thus, for reduce just can be done along the rows
     bool transposeMode = op.getTransposeMode();
     bool isTransposed = op.getIsTransposed();
     if (!transposeMode)
@@ -2144,7 +2160,9 @@ struct VivadoIntSoftmaxToPYNQPattern
       return rewriter.notifyMatchFailure(op, "allo.seqlen must be > 0 for softmax reduce_k");
 
     // Broadcast scalar/len-1 scales along token (last dim) in transpose-mode.
-    int64_t tokenLen = M;
+    // it needs tile if columns > tileN
+    // NOTE: softmax requires output transposed, so that columns can be tiled, you need to ensure the former condition!
+    int64_t tokenLen = M < pynq::TileConfig::kDefaultTileN ? M : pynq::TileConfig::kDefaultTileN;
     if (auto bcast = broadcastLen1ScaleTo(iscl, tokenLen, "softmax_iscl", op, rewriter);
         succeeded(bcast)) {
       iscl = *bcast;

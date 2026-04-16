@@ -38,6 +38,7 @@
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/SymbolTable.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Pass/Pass.h"
 
@@ -53,7 +54,14 @@ namespace vivado_ops = mlir::allo::vivado;
 
 namespace {
 
-static int64_t getBatchFromModule(ModuleOp module) {
+static int64_t getBatchForOp(vivado_ops::QLinearOp op, ModuleOp module) {
+  if (auto func = op->getParentOfType<func::FuncOp>()) {
+    if (func->hasAttr("allo.batch.split_forward"))
+      return 1;
+  }
+  // Backward-compat fallback for old IR that used module-level marker.
+  if (module->hasAttr("allo.batch.split_forward"))
+    return 1;
   if (auto attr = module->getAttrOfType<IntegerAttr>("allo.batch"))
     return attr.getInt();
   return 1;
@@ -195,8 +203,6 @@ namespace mlir {
 namespace allo {
 
 bool applyVivadoSeparateBias(ModuleOp &module, MLIRContext *context) {
-  const int64_t batch = getBatchFromModule(module);
-
   // Collect QLinear ops with fused bias
   SmallVector<vivado_ops::QLinearOp, 8> opsToSeparate;
   
@@ -233,6 +239,7 @@ bool applyVivadoSeparateBias(ModuleOp &module, MLIRContext *context) {
     Value oscl = op.getOscl();
     Value osclInv = op.getOsclInv();
     Value outputZero = op.getOutputZero();
+    int64_t batch = getBatchForOp(op, module);
 
     // Ensure bias matches activation/output shape by broadcasting its global to batch.
     if (failed(ensureBiasGlobalBroadcastToBatch(module, bias, outputType, batch, context)))

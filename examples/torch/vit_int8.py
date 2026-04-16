@@ -1218,6 +1218,9 @@ def test_calibrate_vit(
     for i in range(25):
         test_inputs[i].detach().cpu().numpy().tofile(f"in_3_224_224_float32_{i}.img.bin")
 
+    # save the concated inputs
+    test_inputs[:25].detach().cpu().numpy().tofile("in_25_3_224_224_float32.img.bin")
+
     # Create model
     print("\n[2] Creating ViT model...")
     vit = ViTImgCls(n_embd, n_head, n_layers, n_channels, patch_size, img_size, n_cls).eval()

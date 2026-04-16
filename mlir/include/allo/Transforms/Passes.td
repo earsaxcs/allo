@@ -65,6 +65,34 @@ def HoistGetGlobal : Pass<"hoist-get-global", "ModuleOp"> {
   ];
 }
 
+def AlloSplitForwardBatchLoop : Pass<"allo-split-forward-batch-loop", "ModuleOp"> {
+  let summary = "Split forward into batch-1 inner function plus batch loop wrapper";
+  let description = [{
+    This pass is intended to run before `lower-allo-quant-to-vivado`.
+
+    If module attribute `allo.batch` is absent or <= 1, the pass is a no-op.
+
+    Otherwise, it transforms top-level `forward` (or `forward_*`) by:
+    1) cloning the original body into a private inner function whose memref
+       input/result batch dimension is rewritten to 1 when the leading dimension
+       equals `allo.batch`;
+    2) replacing outer `forward` body with an `scf.for` loop over batch index;
+    3) slicing batch-leading memrefs to size-1 subviews and invoking the inner
+       function per iteration;
+    4) accumulating per-iteration memref results into full-batch output buffers.
+
+    The outer function keeps the original signature (`B` remains visible at API
+    boundary), while internal execution becomes batch-serial over `B=1` calls.
+  }];
+  let constructor = "mlir::allo::createAlloSplitForwardBatchLoopPass()";
+  let dependentDialects = [
+    "mlir::func::FuncDialect",
+    "mlir::memref::MemRefDialect",
+    "mlir::scf::SCFDialect",
+    "mlir::arith::ArithDialect"
+  ];
+}
+
 //===----------------------------------------------------------------------===//
 // PYNQ Backend Passes
 //===----------------------------------------------------------------------===//
@@ -274,6 +302,52 @@ def PYNQMidLower : Pass<"pynq-mid-lower", "ModuleOp"> {
     "mlir::func::FuncDialect",
     "mlir::memref::MemRefDialect",
     "mlir::arith::ArithDialect"
+  ];
+}
+
+def PYNQSplitForwardInlineCleanup : Pass<"pynq-split-forward-inline-cleanup", "ModuleOp"> {
+  let summary = "Inline split-forward inner body back into wrapper and erase call+copy chains";
+  let description = [{
+    This pass targets the split-forward pattern created by
+    `allo-split-forward-batch-loop`.
+
+    For inner functions tagged with `allo.batch.split_forward`, it rewrites
+    wrapper call sites tagged by
+    `allo.batch.split_forward.wrapper` from:
+
+      %r = func.call @inner(...)
+      memref.copy %r, %outSubview
+
+    by inlining the inner body directly at the call site and mapping returned
+    allocation values to `%outSubview`, then erasing redundant
+    `func.call` and `memref.copy` operations.
+
+    This pass is intended to run immediately after `pynq-mid-lower`.
+  }];
+  let constructor = "mlir::allo::createPYNQSplitForwardInlineCleanupPass()";
+  let dependentDialects = [
+    "mlir::func::FuncDialect",
+    "mlir::memref::MemRefDialect"
+  ];
+}
+
+def PYNQHoistGetGlobalLate : Pass<"pynq-hoist-get-global-late", "ModuleOp"> {
+  let summary = "Hoist mid-lower-introduced memref.get_global ops to function entry";
+  let description = [{
+    This pass is intended to run after `pynq-mid-lower`.
+
+    It collects all `memref.get_global` ops in each non-declaration function,
+    moves them to the entry block to make global materialization happen up-front,
+    and deduplicates same-symbol loads by replacing uses with a canonical value.
+
+    Goal:
+    - avoid introducing global loads in the middle of compute logic,
+      so subsequent operations can reuse entry-materialized values.
+  }];
+  let constructor = "mlir::allo::createPYNQHoistGetGlobalLatePass()";
+  let dependentDialects = [
+    "mlir::func::FuncDialect",
+    "mlir::memref::MemRefDialect"
   ];
 }
 

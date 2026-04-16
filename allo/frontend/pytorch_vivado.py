@@ -28,6 +28,33 @@ def from_pytorch_vivado(
     mode="csim",
     project="top.prj",
 ):
+    def _infer_batch_from_example_inputs(inputs):
+        # Prefer the left-most dimension of the first tensor-like input.
+        if inputs is None or len(inputs) == 0:
+            return 1
+
+        def _walk_first_tensor_like(obj):
+            if hasattr(obj, "shape"):
+                return obj
+            if isinstance(obj, (list, tuple)):
+                for item in obj:
+                    found = _walk_first_tensor_like(item)
+                    if found is not None:
+                        return found
+            return None
+
+        first = _walk_first_tensor_like(inputs[0])
+        if first is None or not hasattr(first, "shape"):
+            return 1
+
+        try:
+            if len(first.shape) > 0:
+                batch_val = int(first.shape[0])
+                return batch_val if batch_val > 0 else 1
+        except Exception:
+            pass
+        return 1
+
     sig = inspect.signature(model.forward)
     input_names = [
         p.name for i, p in enumerate(sig.parameters.values()) if i < len(example_inputs)
@@ -61,13 +88,9 @@ def from_pytorch_vivado(
     # PATH
     global_vars.update({"__allo_target_path__": project})
 
-    # Assume batch size always comes from the left-most dimension of example_inputs[0]
-    # and propagate it through the compilation pipeline to MLIR as a module attribute.
-    batch = 1
-    if example_inputs is not None and len(example_inputs) > 0:
-        first_inp = example_inputs[0]
-        if hasattr(first_inp, "shape") and len(first_inp.shape) > 0:
-            batch = int(first_inp.shape[0])
+    # Propagate batch size through the compilation pipeline to MLIR as a
+    # module attribute (allo.batch).
+    batch = _infer_batch_from_example_inputs(example_inputs)
     global_vars.update({"__allo_batch__": batch})
 
     # Propagate hidden dimension (e.g., transformer embedding dim) through the

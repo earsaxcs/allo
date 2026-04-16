@@ -909,7 +909,7 @@ class Schedule:
                 configs=configs,
                 func_args=self.func_args,
                 wrap_io=wrap_io,
-                debug_mode=True,
+                debug_mode=True, # 如果出现core dump，请将debug_mode设置为False让错误栈打印在terminal中方便调试
             )
         raise NotImplementedError(f"Target {target} is not supported")
 
