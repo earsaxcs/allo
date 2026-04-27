@@ -304,6 +304,7 @@ class VivadoModule:
                 f"pynq-mid-lower{{debug-scale-pack=false}},"
                 f"pynq-split-forward-inline-cleanup,"
                 f"pynq-hoist-get-global-late,"
+                f"pynq-hoist-alloc-late,"
                 f"pynq-optimize-sync,"
                 f"pynq-return-memref-to-out-param,symbol-dce,"
                 f"allo-lower-linalg-to-cstyle-scf,symbol-dce"

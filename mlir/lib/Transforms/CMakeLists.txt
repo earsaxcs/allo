@@ -23,6 +23,7 @@ add_mlir_library(MLIRAlloPasses
     PYNQMidLower.cpp
     PYNQSplitForwardInlineCleanup.cpp
     PYNQHoistGetGlobalLate.cpp
+    PYNQHoistAllocLate.cpp
     PYNQReturnMemrefToOutParam.cpp
     PYNQOptimizeSync.cpp
     PYNQOptimizeSubviewGlobals.cpp

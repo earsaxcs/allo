@@ -27,6 +27,7 @@ def from_pytorch_vivado(
     target="llvm",
     mode="csim",
     project="top.prj",
+    pointed_batch=None,
 ):
     def _infer_batch_from_example_inputs(inputs):
         # Prefer the left-most dimension of the first tensor-like input.
@@ -90,7 +91,11 @@ def from_pytorch_vivado(
 
     # Propagate batch size through the compilation pipeline to MLIR as a
     # module attribute (allo.batch).
-    batch = _infer_batch_from_example_inputs(example_inputs)
+    if pointed_batch is not None:
+        batch = pointed_batch
+    else:
+        batch = _infer_batch_from_example_inputs(example_inputs)
+        
     global_vars.update({"__allo_batch__": batch})
 
     # Propagate hidden dimension (e.g., transformer embedding dim) through the

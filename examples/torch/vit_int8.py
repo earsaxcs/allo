@@ -1271,17 +1271,18 @@ def test_calibrate_vit(
 
     if run_compile:
         # Compile mode
-        batch = 1
+        batch = 200
         print("\n[6] Compiling with allo...")
         compile_start = time.perf_counter()
         llvm_mod = allo.frontend.from_pytorch_vivado(
             vit,
-            example_inputs=[example_inputs[:batch]],
+            example_inputs=[test_inputs[:batch]],
             leaf_modules=[ViTGetFirstToken, ViTTokenExpand, QLinear, QConv2d, IntLayerNorm, IntSoftmax, IntGELU, QAdd, QMatMul, QMatMulIsqrtD],
             quant_config=quant_config,
             verbose=False,
             project='pynq_vivado.prj',
             mode='default',
+            # pointed_batch=25,
         )
         compile_elapsed = time.perf_counter() - compile_start
         print("    Compilation completed!")

@@ -36,6 +36,7 @@ std::unique_ptr<OperationPass<ModuleOp>> createPYNQMidLowerPass();
 std::unique_ptr<OperationPass<ModuleOp>>
 createPYNQSplitForwardInlineCleanupPass();
 std::unique_ptr<OperationPass<ModuleOp>> createPYNQHoistGetGlobalLatePass();
+std::unique_ptr<OperationPass<ModuleOp>> createPYNQHoistAllocLatePass();
 std::unique_ptr<OperationPass<ModuleOp>> createPYNQReturnMemrefToOutParamPass();
 std::unique_ptr<OperationPass<ModuleOp>> createPYNQOptimizeSyncPass();
 std::unique_ptr<OperationPass<ModuleOp>> createPYNQOptimizeSubviewGlobalsPass();

@@ -351,6 +351,29 @@ def PYNQHoistGetGlobalLate : Pass<"pynq-hoist-get-global-late", "ModuleOp"> {
   ];
 }
 
+def PYNQHoistAllocLate : Pass<"pynq-hoist-alloc-late", "ModuleOp"> {
+  let summary = "Hoist memref.alloc ops to function entry after get_global hoisting";
+  let description = [{
+    This pass is intended to run after `pynq-hoist-get-global-late`.
+
+    It collects all `memref.alloc` ops in each non-declaration function,
+    then moves them to the function entry block.
+
+    Placement rule:
+    - all hoisted allocs are placed after the existing `memref.get_global`
+      prefix in the entry block, keeping allocs concentrated together.
+
+    Goal:
+    - avoid repeated allocations inside batch loops (e.g. batch > 1),
+      reducing runtime overhead.
+  }];
+  let constructor = "mlir::allo::createPYNQHoistAllocLatePass()";
+  let dependentDialects = [
+    "mlir::func::FuncDialect",
+    "mlir::memref::MemRefDialect"
+  ];
+}
+
 def PYNQReturnMemrefToOutParam : Pass<"pynq-return-memref-to-out-param", "ModuleOp"> {
   let summary = "Rewrite single-memref function returns into explicit output arguments";
   let description = [{
