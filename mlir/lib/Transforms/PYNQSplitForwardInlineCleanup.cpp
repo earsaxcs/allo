@@ -16,6 +16,7 @@
 
 #include "PassDetail.h"
 
+#include "allo/Dialect/PYNQOps.h"
 #include "allo/Transforms/Passes.h"
 
 #include "llvm/ADT/SmallVector.h"
@@ -33,6 +34,38 @@ namespace {
 static constexpr StringLiteral kInnerSplitAttr = "allo.batch.split_forward";
 static constexpr StringLiteral kOuterSplitAttr =
     "allo.batch.split_forward.wrapper";
+
+static bool isStaticRowMajorContiguous(MemRefType type,
+                                       bool requireZeroOffset) {
+  if (!type || !type.hasStaticShape())
+    return false;
+
+  SmallVector<int64_t, 4> strides;
+  int64_t offset = 0;
+  if (failed(getStridesAndOffset(type, strides, offset)))
+    return false;
+  if (requireZeroOffset) {
+    if (offset == ShapedType::kDynamic || offset != 0)
+      return false;
+  }
+  if (strides.size() != type.getRank())
+    return false;
+  for (int64_t stride : strides) {
+    if (stride == ShapedType::kDynamic)
+      return false;
+  }
+
+  int64_t expected = 1;
+  auto shape = type.getShape();
+  for (int64_t i = type.getRank(); i > 0; --i) {
+    int64_t idx = i - 1;
+    if (strides[idx] != expected)
+      return false;
+    expected *= shape[idx];
+  }
+
+  return true;
+}
 
 struct InnerRewriteState {
   func::FuncOp func;
@@ -174,11 +207,21 @@ bool inlineWrapperCall(func::CallOp call, InnerRewriteState &state,
         reason = "copy target type is not cast-compatible with call result";
         return false;
       }
+      if (!isStaticRowMajorContiguous(outTy, /*requireZeroOffset=*/false)) {
+        reason = "contiguous_cast requires statically row-major input";
+        return false;
+      }
+      if (!isStaticRowMajorContiguous(state.resultTypes[idx],
+                                      /*requireZeroOffset=*/true)) {
+        reason = "contiguous_cast requires zero-offset row-major output";
+        return false;
+      }
       OpBuilder castBuilder(copy);
-      outOperand =
-          castBuilder
-              .create<memref::CastOp>(call.getLoc(), state.resultTypes[idx], outOperand)
-              .getResult();
+      outOperand = castBuilder
+                       .create<pynq::ContiguousCastOp>(call.getLoc(),
+                                                       state.resultTypes[idx],
+                                                       outOperand)
+                       .getOutput();
     }
 
     outOperands.push_back(outOperand);
@@ -225,23 +268,23 @@ bool inlineWrapperCall(func::CallOp call, InnerRewriteState &state,
 
 static bool eliminateWrapperInputCopies(func::FuncOp wrapper) {
   // Currently no use, because it tests offset as well
-  auto isStaticRowMajorContiguous = [](MemRefType type) {
-    SmallVector<int64_t, 4> strides;
-    int64_t offset = 0;
-    if (failed(getStridesAndOffset(type, strides, offset)))
-      return false;
-    if (offset != 0)
-      return false;
-    if (strides.size() != type.getRank())
-      return false;
-    int64_t expected = 1;
-    for (int64_t i = type.getRank() - 1; i >= 0; --i) {
-      if (strides[i] != expected)
-        return false;
-      expected *= type.getShape()[i];
-    }
-    return true;
-  };
+  // auto isStaticRowMajorContiguous = [](MemRefType type) {
+  //   SmallVector<int64_t, 4> strides;
+  //   int64_t offset = 0;
+  //   if (failed(getStridesAndOffset(type, strides, offset)))
+  //     return false;
+  //   if (offset != 0)
+  //     return false;
+  //   if (strides.size() != type.getRank())
+  //     return false;
+  //   int64_t expected = 1;
+  //   for (int64_t i = type.getRank() - 1; i >= 0; --i) {
+  //     if (strides[i] != expected)
+  //       return false;
+  //     expected *= type.getShape()[i];
+  //   }
+  //   return true;
+  // };
 
   SmallVector<memref::CopyOp> copies;
   wrapper.walk([&](memref::CopyOp copy) { copies.push_back(copy); });
@@ -273,7 +316,8 @@ static bool eliminateWrapperInputCopies(func::FuncOp wrapper) {
         continue;
 
       auto linalgOp = dyn_cast<linalg::LinalgOp>(use.getOwner());
-      if (!linalgOp || !linalgOp.isDpsInput(&use)) {
+      auto transposeOp = dyn_cast<pynq::ActivationLayoutTransposeOp>(use.getOwner());
+      if ((!linalgOp || !linalgOp.isDpsInput(&use)) && (!transposeOp || transposeOp.getInputMutable() != use)) {
         readUses.clear();
         break;
       }
@@ -283,21 +327,15 @@ static bool eliminateWrapperInputCopies(func::FuncOp wrapper) {
     if (readUses.empty())
       continue;
 
-    SmallVector<int64_t, 4> dstStrides;
-    int64_t dstOffset = 0;
-    if (failed(getStridesAndOffset(dstTy, dstStrides, dstOffset)))
+    if (!isStaticRowMajorContiguous(srcTy, /*requireZeroOffset=*/false))
       continue;
-    if (llvm::any_of(dstTy.getShape(), ShapedType::isDynamic) ||
-        llvm::any_of(dstStrides, ShapedType::isDynamic) ||
-        dstOffset == ShapedType::kDynamic)
+    if (!isStaticRowMajorContiguous(dstTy, /*requireZeroOffset=*/true))
       continue;
 
     OpBuilder b(copy);
     Value castedSrc =
-        b.create<memref::ReinterpretCastOp>(copy.getLoc(), dstTy, src,
-                                            dstOffset, dstTy.getShape(),
-                                            dstStrides)
-            .getResult();
+        b.create<pynq::ContiguousCastOp>(copy.getLoc(), dstTy, src)
+            .getOutput();
 
     for (OpOperand *use : readUses)
       use->set(castedSrc);

@@ -18,7 +18,7 @@ from typing import List, Tuple
 
 # Use allo.ops.vit structures to ensure compatibility
 from allo.ops.vit import (
-    ViTImgCls, ViTBlock, ViTGetFirstToken, ViTTokenExpand, MatMulIsqrtD, Add,
+    ViTImgCls, ViTBlock, ViTGetFirstToken, ViTTokenExpand, MatMulIsqrtD, Add, ViTClassifier
 )
 
 # Import quantization utilities from quant_config (no duplicate definitions!)
@@ -190,6 +190,22 @@ class ViTTransformerStack(nn.Module):
     def forward(self, x):
         for blk in self.blocks:
             x = blk(x)
+        return x
+
+
+class ViTTransformerStackWithClassifier(nn.Module):
+    """ViT transformer blocks + final LayerNorm + classifier (no embedding)."""
+
+    def __init__(self, n_embd: int, n_head: int, n_layers: int, seq_len: int, n_cls: int):
+        super().__init__()
+        self.stack = ViTTransformerStack(n_embd=n_embd, n_head=n_head, n_layers=n_layers)
+        self.norm = nn.LayerNorm(n_embd)
+        self.classifier = ViTClassifier(n_embd, seq_len, n_cls)
+
+    def forward(self, x):
+        x = self.stack(x)
+        x = self.norm(x)
+        x = self.classifier(x)
         return x
 
 def load_vit_block_from_hf(blk: ViTBlock, hf_vit, layer_idx: int = 0) -> ViTBlock:
@@ -1518,6 +1534,193 @@ def test_calibrate_vit_transformer_stack(
     }
 
 
+def test_calibrate_vit_transformer_stack_classifier(
+    model_name: str = "deit-tiny",
+    sample_batch_size: int = 32,
+    test_batch_size: int = 200,
+    dataset_path: str = "/root/data/dataset/imagenet-1k-test",
+    run_compile: bool = False,
+    sq_const: float = 1.0,
+    sq_qk_const: float = 1.0,
+    scale_search: bool = False,
+    scale_search_min: float = 0.5,
+    scale_search_max: float = 1.5,
+    scale_search_steps: int = 11,
+    scale_search_eval_batch: int = 16,
+    device: str = "cpu",
+):
+    """Test quantization calibration for transformer stack + classifier only.
+
+    This test excludes embedding and uses embedding-processed image features
+    as calibration/test inputs.
+    """
+    print("\n" + "=" * 60)
+    print(f"Testing ViT Transformer Stack + Classifier Calibration: {model_name}")
+    print("=" * 60)
+
+    if model_name not in VIT_CONFIGS:
+        raise ValueError(f"Unknown model: {model_name}. Available: {list(VIT_CONFIGS.keys())}")
+
+    config = VIT_CONFIGS[model_name]
+    n_embd = config["n_embd"]
+    n_head = config["n_head"]
+    n_layers = config["n_layers"]
+    model_path = config["model_path"]
+
+    img_size = (224, 224)
+
+    print(f"\n[Config] n_embd={n_embd}, n_head={n_head}, n_layers={n_layers}")
+    print(f"[Config] model_path={model_path}")
+    print(f"[Config] dataset_path={dataset_path}")
+    runtime_device = _resolve_runtime_device(device=device, run_compile=run_compile)
+    print(f"[Config] device={runtime_device}")
+
+    print("\n[1] Loading ImageNet test data...")
+    example_val_data = get_imagenet_test_data(dataset_path, sample_batch_size, img_size[0], is_reverse_sample=True)
+    test_val_data = get_imagenet_test_data(dataset_path, test_batch_size, img_size[0])
+
+    example_images = torch.concat([x[0] for x in example_val_data])
+    test_images = torch.concat([x[0] for x in test_val_data])
+
+    print(f"    Calibration image samples: {example_images.shape}")
+    print(f"    Test image samples: {test_images.shape}")
+
+    print("\n[2] Loading HuggingFace model...")
+    from transformers import ViTForImageClassification
+    hf_vit = ViTForImageClassification.from_pretrained(model_path).eval()
+
+    print("\n[3] Preparing embedding inputs...")
+    with torch.no_grad():
+        example_inputs = hf_vit.vit.embeddings(example_images)
+        test_inputs = hf_vit.vit.embeddings(test_images)
+    example_inputs = example_inputs.to(runtime_device)
+    test_inputs = test_inputs.to(runtime_device)
+
+    # save the original input for backend test
+    for i in range(25):
+        test_inputs[i].detach().cpu().numpy().tofile(f"in_1_197_192_float32_{i}.embd.bin")
+
+    # save the concated inputs
+    test_inputs[:25].detach().cpu().numpy().tofile("in_25_197_192_float32.embd.bin")
+
+    print(f"    Calibration embedding samples: {example_inputs.shape}")
+    print(f"    Test embedding samples: {test_inputs.shape}")
+
+    seq_len = int(hf_vit.vit.embeddings.position_embeddings.shape[1] - 1)
+    n_cls = int(hf_vit.classifier.out_features)
+
+    print("\n[4] Building transformer stack + classifier and loading HF weights...")
+    stack_cls = ViTTransformerStackWithClassifier(
+        n_embd=n_embd,
+        n_head=n_head,
+        n_layers=n_layers,
+        seq_len=seq_len,
+        n_cls=n_cls,
+    ).eval()
+    for i in range(n_layers):
+        load_vit_block_from_hf(stack_cls.stack.blocks[i], hf_vit, layer_idx=i)
+    stack_cls.norm.weight.data = hf_vit.vit.layernorm.weight.data
+    stack_cls.norm.bias.data = hf_vit.vit.layernorm.bias.data
+    stack_cls.norm.eps = hf_vit.vit.layernorm.eps
+    stack_cls.classifier.dense.weight.data = hf_vit.classifier.weight.data
+    stack_cls.classifier.dense.bias.data = hf_vit.classifier.bias.data
+
+    stack_cls = stack_cls.to(runtime_device)
+    hf_vit = hf_vit.to(runtime_device)
+
+    if sq_const != 1.0 or sq_qk_const != 1.0:
+        print(f"[4.1] Applying fixed SmoothQuant: sq_const={sq_const}, sq_qk_const={sq_qk_const}")
+        transformed_blocks = 0
+        for blk in stack_cls.stack.blocks:
+            apply_fixed_smoothquant_vit_block(
+                blk,
+                ln_to_attn_scale=sq_const,
+                ln_to_ffn_scale=sq_const,
+                qk_scale=sq_qk_const,
+            )
+            transformed_blocks += 1
+        print(f"    SmoothQuant transformed blocks: {transformed_blocks}")
+
+    print("\n[5] Replacing modules with quantized versions...")
+    quant_config = _get_quant_config(run_compile)
+    qstack_cls = replace_module_with_quantized(stack_cls, config=quant_config)
+
+    print("\n[6] Calibrating...")
+    calibrator = Calibrator(qstack_cls, example_inputs)
+    calibrator.calibrate()
+
+    if scale_search:
+        eval_batch = min(scale_search_eval_batch, test_inputs.shape[0])
+        enable_fakequant(calibrator=calibrator)
+        best_ratio = _search_best_scale_ratio_for_block(
+            blk=stack_cls,
+            qblk=qstack_cls,
+            eval_inputs=test_inputs[:eval_batch],
+            grid_min=scale_search_min,
+            grid_max=scale_search_max,
+            grid_steps=scale_search_steps,
+        )
+        print(f"[6.1] Applied calibrated-scale best ratio: {best_ratio:.6f}")
+        if run_compile:
+            disable_fakequant(calibrator=calibrator)
+
+    if run_compile:
+        batch = 200
+        print("\n[7] Compiling transformer stack + classifier with allo...")
+        compile_start = time.perf_counter()
+        llvm_mod = allo.frontend.from_pytorch_vivado(
+            qstack_cls,
+            example_inputs=[test_inputs[:batch]],
+            leaf_modules=[ViTGetFirstToken, QLinear, IntLayerNorm, IntSoftmax, IntGELU, QAdd, QMatMul, QMatMulIsqrtD],
+            quant_config=quant_config,
+            verbose=False,
+            project='pynq_vivado_transformer_stack_classifier.prj',
+            mode='default',
+        )
+        compile_elapsed = time.perf_counter() - compile_start
+        print("    Compilation completed!")
+        print(f"    Compile time: {compile_elapsed:.3f}s")
+        return llvm_mod
+
+    enable_fakequant(calibrator=calibrator)
+    print("\n[7] Running inference test...")
+    total = test_batch_size
+    mean_diff = 0
+    max_diff = torch.tensor(0.0, device=runtime_device)
+    cos_sim_sum = 0.0
+    cos_sim_steps = 0
+    step = 20
+
+    with torch.no_grad():
+        for i in range(0, total, step):
+            inp = test_inputs[i:min(i + step, total)]
+            golden = hf_vit.vit.encoder(inp).last_hidden_state
+            golden = hf_vit.vit.layernorm(golden)
+            golden = hf_vit.classifier(golden[:, 0])
+            res = qstack_cls(inp).squeeze(1)
+
+            mean_diff += torch.mean(torch.abs(golden - res))
+            max_diff = torch.max(torch.abs(golden - res).max(), max_diff)
+            cos_sim_sum += tensor_cosine_similarity(golden, res)
+            cos_sim_steps += 1
+
+    mean_diff = mean_diff * step / total
+    cos_sim = cos_sim_sum / max(cos_sim_steps, 1)
+
+    print("\n" + "-" * 40)
+    print("Results (transformer stack + classifier logits):")
+    print(f"    Mean diff: {mean_diff:.6f}")
+    print(f"    Max diff: {max_diff:.6f}")
+    print(f"    Cos sim:  {cos_sim:.6f}")
+
+    return {
+        "mean_diff": mean_diff.item(),
+        "max_diff": max_diff.item(),
+        "cos_sim": float(cos_sim),
+        "total": total,
+    }
+
+
 # ==============================================================================
 # Main Entry Point
 # ==============================================================================
@@ -1573,6 +1776,11 @@ def main():
         "--test-transformer-stack",
         action="store_true",
         help="Only test all ViT transformer blocks in stack (exclude embedding/classifier)"
+    )
+    parser.add_argument(
+        "--test-transformer-stack-classifier",
+        action="store_true",
+        help="Test transformer stack + classifier only (exclude embedding)"
     )
     parser.add_argument(
         "--test-op",
@@ -1750,6 +1958,22 @@ def main():
         )
     elif args.test_transformer_stack:
         test_calibrate_vit_transformer_stack(
+            model_name=args.model,
+            sample_batch_size=args.sample_batch,
+            test_batch_size=args.test_batch,
+            dataset_path=args.dataset,
+            run_compile=args.compile,
+            sq_const=args.sq_const,
+            sq_qk_const=args.sq_qk_const,
+            scale_search=args.scale_search,
+            scale_search_min=args.scale_search_min,
+            scale_search_max=args.scale_search_max,
+            scale_search_steps=args.scale_search_steps,
+            scale_search_eval_batch=args.scale_search_eval_batch,
+            device=args.device,
+        )
+    elif args.test_transformer_stack_classifier:
+        test_calibrate_vit_transformer_stack_classifier(
             model_name=args.model,
             sample_batch_size=args.sample_batch,
             test_batch_size=args.test_batch,

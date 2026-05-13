@@ -280,6 +280,9 @@ public:
 
   /// Emit pynq.view operation (buffer logical view)
   void emitView(pynq::ViewOp op);
+
+  /// Emit pynq.contiguous_cast operation
+  void emitContiguousCast(pynq::ContiguousCastOp op);
   
   /// Emit pynq.buffer_alloc operation
   void emitBufferAlloc(pynq::BufferAllocOp op);
@@ -479,6 +482,10 @@ public:
     }
     if (auto viewOp = dyn_cast<pynq::ViewOp>(op)) {
       emitter.emitView(viewOp);
+      return true;
+    }
+    if (auto contiguousCastOp = dyn_cast<pynq::ContiguousCastOp>(op)) {
+      emitter.emitContiguousCast(contiguousCastOp);
       return true;
     }
     if (auto allocOp = dyn_cast<pynq::BufferAllocOp>(op)) {
@@ -1257,6 +1264,106 @@ void PYNQCEmitter::emitView(pynq::ViewOp op) {
   emitInfoAndNewLine(op);
 }
 
+void PYNQCEmitter::emitContiguousCast(pynq::ContiguousCastOp op) {
+  if (isDeclared(op.getOutput()))
+    return;
+
+  auto resultType = op.getOutput().getType().dyn_cast<MemRefType>();
+  auto sourceType = op.getInput().getType().dyn_cast<MemRefType>();
+  if (!resultType || !sourceType) {
+    emitError(op, "pynq.contiguous_cast requires memref types");
+    return;
+  }
+  if (resultType.getElementType() != sourceType.getElementType()) {
+    emitError(op,
+              "pynq.contiguous_cast with differing element types not supported");
+    return;
+  }
+
+  if (!sourceType.hasStaticShape() || !resultType.hasStaticShape()) {
+    emitError(op, "pynq.contiguous_cast requires static shapes");
+    return;
+  }
+
+  SmallVector<int64_t, 4> srcStrides;
+  int64_t srcOffset = 0;
+  if (failed(getStridesAndOffset(sourceType, srcStrides, srcOffset))) {
+    emitError(op, "pynq.contiguous_cast requires valid source strides");
+    return;
+  }
+  if (llvm::any_of(srcStrides, ShapedType::isDynamic)) {
+    emitError(op, "pynq.contiguous_cast requires static source strides");
+    return;
+  }
+  if (!isRowMajorContiguous(sourceType.getShape(), srcStrides)) {
+    emitError(op, "pynq.contiguous_cast requires row-major contiguous source");
+    return;
+  }
+
+  SmallVector<int64_t, 4> dstStrides;
+  int64_t dstOffset = 0;
+  if (failed(getStridesAndOffset(resultType, dstStrides, dstOffset))) {
+    emitError(op, "pynq.contiguous_cast requires valid destination strides");
+    return;
+  }
+  if (llvm::any_of(dstStrides, ShapedType::isDynamic)) {
+    emitError(op, "pynq.contiguous_cast requires static destination strides");
+    return;
+  }
+  if (dstOffset == ShapedType::kDynamic || dstOffset != 0 ||
+      !isRowMajorContiguous(resultType.getShape(), dstStrides)) {
+    emitError(op,
+              "pynq.contiguous_cast requires row-major destination with zero offset");
+    return;
+  }
+
+  auto ensureDeclared = [this](Value v) {
+    if (!getName(v).empty())
+      return true;
+    Operation *def = v.getDefiningOp();
+    if (!def)
+      return false;
+    if (auto subviewOp = dyn_cast<memref::SubViewOp>(def)) {
+      emitSubview(subviewOp);
+    } else if (auto castOp = dyn_cast<memref::CastOp>(def)) {
+      emitCast(castOp);
+    } else if (auto contiguousOp = dyn_cast<pynq::ContiguousCastOp>(def)) {
+      emitContiguousCast(contiguousOp);
+    } else if (auto reinterpretOp = dyn_cast<memref::ReinterpretCastOp>(def)) {
+      emitReinterpretCast(reinterpretOp);
+    } else if (auto reshapeOp = dyn_cast<memref::ReshapeOp>(def)) {
+      emitReshape(reshapeOp);
+    }
+    return !getName(v).empty();
+  };
+
+  if (!ensureDeclared(op.getInput())) {
+    emitError(op, "pynq.contiguous_cast source must be declared before cast");
+    return;
+  }
+
+  auto srcName = getName(op.getInput());
+  if (srcName.empty()) {
+    emitError(op, "pynq.contiguous_cast source must be declared before cast");
+    return;
+  }
+
+  if (resultType == sourceType) {
+    state.nameTable[op.getOutput()] = srcName;
+    return;
+  }
+
+  indent();
+  auto varName = addName(op.getOutput(), false);
+  os << "__attribute__((unused)) ";
+  emitMemrefVarDecl(resultType, varName);
+  os << " = (";
+  emitMemrefPtrCastType(resultType);
+  os << ")((" << getCTypeName(resultType.getElementType()) << "*)" << srcName
+     << ");";
+  emitInfoAndNewLine(op);
+}
+
 void PYNQCEmitter::emitBufferAlloc(pynq::BufferAllocOp op) {
   // Buffer allocation is typically resolved at compile time
   // Emit as a comment or placeholder for tracking
@@ -1444,6 +1551,10 @@ void PYNQCEmitter::emitActivationLayoutTranspose(
     while (auto *def = v.getDefiningOp()) {
       if (auto castOp = dyn_cast<memref::CastOp>(def)) {
         v = castOp.getSource();
+        continue;
+      }
+      if (auto contiguousOp = dyn_cast<pynq::ContiguousCastOp>(def)) {
+        v = contiguousOp.getInput();
         continue;
       }
       if (auto subviewOp = dyn_cast<memref::SubViewOp>(def)) {
@@ -1678,6 +1789,10 @@ void PYNQCEmitter::emitActivationDynamicPad(pynq::ActivationDynamicPadOp op) {
     while (auto *def = v.getDefiningOp()) {
       if (auto castOp = dyn_cast<memref::CastOp>(def)) {
         v = castOp.getSource();
+        continue;
+      }
+      if (auto contiguousOp = dyn_cast<pynq::ContiguousCastOp>(def)) {
+        v = contiguousOp.getInput();
         continue;
       }
       if (auto subviewOp = dyn_cast<memref::SubViewOp>(def)) {
@@ -2266,6 +2381,10 @@ void PYNQCEmitter::emitMemrefCopy(memref::CopyOp op) {
         base = castOp.getSource();
         continue;
       }
+      if (auto contiguousOp = dyn_cast<pynq::ContiguousCastOp>(def)) {
+        base = contiguousOp.getInput();
+        continue;
+      }
       if (auto reshapeOp = dyn_cast<memref::ReshapeOp>(def)) {
         base = reshapeOp.getSource();
         continue;
@@ -2393,6 +2512,8 @@ void PYNQCEmitter::emitCast(memref::CastOp op) {
       emitSubview(subviewOp);
     } else if (auto castOp = dyn_cast<memref::CastOp>(def)) {
       emitCast(castOp);
+    } else if (auto contiguousOp = dyn_cast<pynq::ContiguousCastOp>(def)) {
+      emitContiguousCast(contiguousOp);
     } else if (auto reinterpretOp = dyn_cast<memref::ReinterpretCastOp>(def)) {
       emitReinterpretCast(reinterpretOp);
     } else if (auto reshapeOp = dyn_cast<memref::ReshapeOp>(def)) {

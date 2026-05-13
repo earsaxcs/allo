@@ -479,6 +479,26 @@ def _safe_to_tensor(x):
     return x
 
 
+def _forward_model_in_batches(
+    model: nn.Module,
+    inputs: List[torch.Tensor],
+    batch_size: int = 1,
+) -> torch.Tensor:
+    if batch_size <= 0:
+        raise ValueError(f"batch_size must be positive, got {batch_size}")
+    if len(inputs) == 0:
+        raise ValueError("inputs must not be empty")
+
+    total = inputs[0].shape[0]
+    outputs = []
+    with torch.no_grad():
+        for start in range(0, total, batch_size):
+            end = min(start + batch_size, total)
+            batch_inputs = [x[start:end] for x in inputs]
+            outputs.append(model(*batch_inputs))
+    return torch.cat(outputs, dim=0)
+
+
 def analyze_quant_drop(
     float_model: nn.Module,
     quant_model: nn.Module,
@@ -487,6 +507,7 @@ def analyze_quant_drop(
     dataset: str,
     enable_plot: bool = True,
     plot_prefix: str = "bert_quant_drop",
+    eval_batch_size: int = 1,
 ):
     print("\n" + "=" * 80)
     print("Quantization Drop Analysis")
@@ -509,30 +530,40 @@ def analyze_quant_drop(
                 current = getattr(current, p)
         return current
 
-    float_acts: Dict[str, torch.Tensor] = {}
-    quant_acts: Dict[str, torch.Tensor] = {}
+    float_acts: Dict[str, List[torch.Tensor]] = {}
+    quant_acts: Dict[str, List[torch.Tensor]] = {}
     hooks = []
 
     for key, path in module_specs:
         float_mod = resolve_module(float_model, path)
         quant_mod = resolve_module(quant_model, path)
 
-        def make_hook(container: Dict[str, torch.Tensor], name: str):
+        def make_hook(container: Dict[str, List[torch.Tensor]], name: str):
             def _hook(_m, _inp, out):
                 out_t = _safe_to_tensor(out)
                 if out_t is not None:
-                    container[name] = out_t.detach().cpu()
+                    container.setdefault(name, []).append(out_t.detach().cpu())
             return _hook
 
         hooks.append(float_mod.register_forward_hook(make_hook(float_acts, key)))
         hooks.append(quant_mod.register_forward_hook(make_hook(quant_acts, key)))
 
-    with torch.no_grad():
-        float_logits = float_model(*test_inputs)
-        quant_logits = quant_model(*test_inputs)
+    float_logits = _forward_model_in_batches(float_model, test_inputs, batch_size=eval_batch_size)
+    quant_logits = _forward_model_in_batches(quant_model, test_inputs, batch_size=eval_batch_size)
 
     for h in hooks:
         h.remove()
+
+    float_acts_cat = {
+        name: torch.cat(chunks, dim=0)
+        for name, chunks in float_acts.items()
+        if len(chunks) > 0
+    }
+    quant_acts_cat = {
+        name: torch.cat(chunks, dim=0)
+        for name, chunks in quant_acts.items()
+        if len(chunks) > 0
+    }
 
     pred_float = float_logits.argmax(-1)
     pred_quant = quant_logits.argmax(-1)
@@ -555,10 +586,10 @@ def analyze_quant_drop(
     layer_mae = {}
     layer_max = {}
     for key, _ in module_specs:
-        if key not in float_acts or key not in quant_acts:
+        if key not in float_acts_cat or key not in quant_acts_cat:
             continue
-        f = float_acts[key]
-        q = quant_acts[key]
+        f = float_acts_cat[key]
+        q = quant_acts_cat[key]
         if f.shape != q.shape:
             continue
         d = torch.abs(f - q)
@@ -1038,6 +1069,7 @@ def test_calibrate_bert_model(
     analysis_plot: bool = True,
     analysis_prefix: str = "bert_quant_drop",
     float_module_paths: Optional[List[str]] = None,
+    eval_batch_size: int = 1,
 ):
     """Test quantization for full BERT sequence-classification model."""
     if model_name not in BERT_CONFIGS:
@@ -1066,6 +1098,12 @@ def test_calibrate_bert_model(
         )
         dataset_root_print = mnli_root
         dataset_split_print = mnli_split
+        calib_premises, calib_hypotheses, _ = _load_mnli_split(
+            mnli_root=mnli_root,
+            split="train",
+            limit=sample_batch_size,
+            label_to_id=label_to_id,
+        )
     elif dataset == "qnli":
         premises, hypotheses, true_labels = _load_qnli_split(
             qnli_root=qnli_root,
@@ -1075,10 +1113,15 @@ def test_calibrate_bert_model(
         )
         dataset_root_print = qnli_root
         dataset_split_print = qnli_split
+        calib_premises, calib_hypotheses, _ = _load_qnli_split(
+            qnli_root=qnli_root,
+            split="train",
+            limit=sample_batch_size,
+            label_to_id=label_to_id,
+        )
     else:
         raise ValueError(f"Unsupported dataset: {dataset}. Available: ['mnli', 'qnli']")
 
-    calib_texts = _build_calibration_text_samples(sample_batch_size, max_length)
     effective_eval_size = eval_size if eval_size > 0 else test_batch_size
     if effective_eval_size <= 0:
         effective_eval_size = len(true_labels)
@@ -1091,8 +1134,15 @@ def test_calibrate_bert_model(
     print(f"[{dataset.upper()}] root={dataset_root_print}")
     print(f"[{dataset.upper()}] split={dataset_split_print}")
     print(f"[{dataset.upper()}] loaded_samples={len(true_labels)}, eval_samples={eval_count}")
+    print(f"[{dataset.upper()}] calibration_split=train, calibration_samples={len(calib_premises)}")
+    print(f"[Eval] batch_size={eval_batch_size}")
 
-    calib_batch = _tokenize_batch(tokenizer, calib_texts, max_length=max_length)
+    calib_batch = _tokenize_batch(
+        tokenizer,
+        calib_premises,
+        max_length=max_length,
+        pair_texts=calib_hypotheses,
+    )
     test_batch = _tokenize_batch(
         tokenizer,
         test_premises,
@@ -1145,9 +1195,8 @@ def test_calibrate_bert_model(
     calibrator.enable_fakequant()
     calibrator.enable_lut_inference()
 
-    with torch.no_grad():
-        golden = module(*test_inputs)
-        res_fake = qmodule(*test_inputs)
+    golden = _forward_model_in_batches(module, test_inputs, batch_size=eval_batch_size)
+    res_fake = _forward_model_in_batches(qmodule, test_inputs, batch_size=eval_batch_size)
 
     _print_diff_stats("Full BERT Model", golden, res_fake)
 
@@ -1178,6 +1227,7 @@ def test_calibrate_bert_model(
             dataset=dataset,
             enable_plot=analysis_plot,
             plot_prefix=analysis_prefix,
+            eval_batch_size=eval_batch_size,
         )
 
     return {
@@ -1320,6 +1370,12 @@ def main():
         help="Number of MNLI samples to evaluate on full-model path",
     )
     parser.add_argument(
+        "--eval-batch",
+        type=int,
+        default=1,
+        help="Batch size for full-model evaluation. Default 1 avoids batch-varying attention-mask issues.",
+    )
+    parser.add_argument(
         "--analyze-drop",
         action="store_true",
         help="Run layer-wise float-vs-quant drop analysis after evaluation",
@@ -1449,6 +1505,7 @@ def main():
                 analysis_plot=args.analysis_plot,
                 analysis_prefix=args.analysis_prefix,
                 float_module_paths=args.float_modules,
+                eval_batch_size=args.eval_batch,
             )
 
 

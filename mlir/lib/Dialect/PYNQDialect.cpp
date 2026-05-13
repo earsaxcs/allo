@@ -9,8 +9,10 @@
 #include "allo/Dialect/PYNQAttrs.h"
 #include "allo/Dialect/PYNQConfig.h"
 
+#include "llvm/ADT/SmallVector.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/DialectImplementation.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "llvm/ADT/TypeSwitch.h"
 
 using namespace mlir;
@@ -161,6 +163,39 @@ LogicalResult BufferType::verify(
 // PYNQ Operations
 //===----------------------------------------------------------------------===//
 
+static bool isStaticRowMajorContiguous(MemRefType type,
+                                       bool requireZeroOffset) {
+  if (!type || !type.hasStaticShape())
+    return false;
+
+  SmallVector<int64_t, 4> strides;
+  int64_t offset = 0;
+  if (failed(getStridesAndOffset(type, strides, offset)))
+    return false;
+  if (requireZeroOffset) {
+    if (offset == ShapedType::kDynamic || offset != 0)
+      return false;
+  }
+  if (strides.size() != type.getRank())
+    return false;
+
+  for (int64_t stride : strides) {
+    if (stride == ShapedType::kDynamic)
+      return false;
+  }
+
+  int64_t expected = 1;
+  auto shape = type.getShape();
+  for (int64_t i = type.getRank(); i > 0; --i) {
+    int64_t idx = i - 1;
+    if (strides[idx] != expected)
+      return false;
+    expected *= shape[idx];
+  }
+
+  return true;
+}
+
 #define GET_OP_CLASSES
 #include "allo/Dialect/PYNQOps.cpp.inc"
 
@@ -205,6 +240,40 @@ LogicalResult DataTransferInstrOp::verify() {
 
 LogicalResult VectorInstrOp::verify() {
   // Low-level reference op (raw IDs).
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
+// ContiguousCastOp Verifier
+//===----------------------------------------------------------------------===//
+
+LogicalResult ContiguousCastOp::verify() {
+  auto inType = llvm::dyn_cast<MemRefType>(getInput().getType());
+  auto outType = llvm::dyn_cast<MemRefType>(getOutput().getType());
+  if (!inType || !outType)
+    return emitOpError() << "input/output must be memref types";
+
+  if (inType.getElementType() != outType.getElementType())
+    return emitOpError() << "input/output element types must match";
+
+  if (inType.getRank() != outType.getRank())
+    return emitOpError() << "input/output ranks must match";
+
+  if (inType.hasStaticShape() && outType.hasStaticShape() &&
+      inType.getShape() != outType.getShape()) {
+    return emitOpError() << "input/output shapes must match for contiguous cast";
+  }
+
+  if (!isStaticRowMajorContiguous(inType, /*requireZeroOffset=*/false)) {
+    return emitOpError()
+           << "input must be statically row-major contiguous (offset ignored)";
+  }
+
+  if (!isStaticRowMajorContiguous(outType, /*requireZeroOffset=*/true)) {
+    return emitOpError()
+           << "output must be statically row-major contiguous with zero offset";
+  }
+
   return success();
 }
 

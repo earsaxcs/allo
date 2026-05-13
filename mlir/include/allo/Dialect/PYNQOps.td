@@ -429,6 +429,35 @@ def PYNQ_ViewOp : PYNQ_Op<"view", []> {
   let hasVerifier = 1;
 }
 
+//===----------------------------------------------------------------------===//
+// PYNQ Contiguous Cast Op (Layout Strip)
+//===----------------------------------------------------------------------===//
+
+def PYNQ_ContiguousCastOp : PYNQ_Op<"contiguous_cast", []> {
+  let summary = "Strip offset/stride from a contiguous memref";
+  let description = [{
+    Converts a contiguous strided memref into a pure contiguous memref
+    by dropping offset/stride information. The input must be row-major
+    contiguous; offset is ignored and not validated.
+
+    The output type must be a row-major contiguous memref with zero offset.
+  }];
+
+  let arguments = (ins
+    AnyMemRef:$input
+  );
+
+  let results = (outs
+    AnyMemRef:$output
+  );
+
+  let assemblyFormat = [{
+    $input attr-dict `:` type($input) `to` type($output)
+  }];
+
+  let hasVerifier = 1;
+}
+
 // TODO: Add support for DDR to FIFO of Matrix/Vector
 
 //===----------------------------------------------------------------------===//
